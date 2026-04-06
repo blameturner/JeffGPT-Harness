@@ -1,0 +1,26 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# eventually rebuild from env variables to using dynamic from a db
+
+MODELS = {
+    key.replace("MODEL_", "").lower(): value
+    for key, value in os.environ.items()
+    if key.startswith("MODEL_")
+}
+
+EMBEDDER_URL = os.getenv("EMBEDDER_URL")
+RERANKER_URL = os.getenv("RERANKER_URL")
+
+CHROMA_URL = os.getenv("CHROMA_URL")
+FALKORDB_HOST = os.getenv("FALKORDB_HOST")
+FALKORDB_PORT = int(os.getenv("FALKORDB_PORT"))
+
+NOCODB_URL = os.getenv("NOCODB_URL")
+NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
+
+ENVIRONMENT = os.getenv("ENVIRONMENT")
+
+
