@@ -1,18 +1,22 @@
 import falkordb
 
-from config import FALKORDB_HOST, FALKORDB_PORT
+from config import FALKORDB_HOST, FALKORDB_PORT, scoped_graph
 
 client = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
 
-graph = client.select_graph("mst_ag")
+def get_graph(org_id: int):  # new helper function
+    return client.select_graph(scoped_graph(org_id))
 
 def write_relationship(
+        org_id: int,  # added org_id
         from_type: str,
         from_name: str,
         relationship: str,
         to_type: str,
         to_name: str,
 ) -> None:
+
+    graph = get_graph(org_id)
 
     query = """
     MERGE (a:{from_type} {{name: $from_name}})
@@ -22,7 +26,9 @@ def write_relationship(
 
     graph.query(query, {"from_name": from_name, "to_name": to_name})
 
-def get_connections(node_name: str) -> list[dict]:
+def get_connections(org_id: int, node_name: str) -> list[dict]:  
+    graph = get_graph(org_id)
+
     query = """
     MATCH (a {name: $name})-[r]->(b)
     RETURN a.name, type(r), b.name

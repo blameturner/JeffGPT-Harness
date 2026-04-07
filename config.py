@@ -23,4 +23,9 @@ NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
+def scoped_collection(org_id: int, collection_name: str) -> str:
+    return f"org_{org_id}_{collection_name}"
 
+
+def scoped_graph(org_id: int) -> str:
+    return f"org_{org_id}_mst_ag"
