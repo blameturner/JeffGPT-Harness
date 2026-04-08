@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from config import MODELS
 from rag import retrieve
 from memory import remember
-from nocodb_client import nocodbClient
+from nocodb_client import NocodbClient
 
 
 @dataclass
@@ -22,7 +22,7 @@ class Agent:
     def __init__(self, agent_name: str, org_id: int):
         self.agent_name = agent_name
         self.org_id = org_id
-        self.db = nocodbClient()
+        self.db = NocodbClient()
 
         self.config = self.db.get_agent(agent_name, org_id)
         if not self.config:

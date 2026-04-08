@@ -1,24 +1,43 @@
 import os
+import re
+import subprocess
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-# build for scanning llama.cpp models
-def _discover_models() -> dict:
+#gets docker for env variable
+def _get_host() -> str:
     host = os.getenv("MODEL_HOST")
-    port_start = int(os.getenv("MODEL_PORT_START"))
-    port_end = int(os.getenv("MODEL_PORT_END"))
+    if host:
+        return host
 
-    # exclude embedder and reranker ports from model discovery
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        gateway = result.stdout.split("via ")[1].split()[0]
+        print(f"Discovered Docker gateway: {gateway}")
+        return gateway
+    except Exception:
+        print("Could not discover gateway, check Docker Gateway")
+        return "0.0.0.0"
+
+
+def _discover_models(host: str) -> dict:
+    port_start = int(os.getenv("MODEL_PORT_START", "8080"))
+    port_end = int(os.getenv("MODEL_PORT_END", "8090"))
+
     exclude_ports = {
         int(os.getenv("EMBEDDER_PORT", "8083")),
         int(os.getenv("RERANKER_PORT", "8084"))
     }
 
     def _model_name(model_id: str) -> str:
-        import re
         name = model_id.replace(".gguf", "")
         name = re.sub(r'-Q\d+.*$', '', name, flags=re.IGNORECASE)
         return name
@@ -36,28 +55,30 @@ def _discover_models() -> dict:
                 model_id = data["data"][0]["id"]
                 name = _model_name(model_id)
                 models[name] = url
-                print(f"Discovered model: {model_id} on port {port}")
+                print(f"Discovered model: {name} on port {port}")
         except Exception:
             pass
 
     return models
 
 
-MODELS = _discover_models()
+_host = _get_host()
 
-_host = os.getenv("MODEL_HOST")
-EMBEDDER_URL = f"http://{_host}:{os.getenv('EMBEDDER_PORT')}"
-RERANKER_URL = f"http://{_host}:{os.getenv('RERANKER_PORT')}"
+MODELS = _discover_models(_host)
+
+EMBEDDER_URL = f"http://{_host}:{os.getenv('EMBEDDER_PORT', '8083')}"
+RERANKER_URL = f"http://{_host}:{os.getenv('RERANKER_PORT', '8084')}"
 
 CHROMA_URL = os.getenv("CHROMA_URL")
 FALKORDB_HOST = os.getenv("FALKORDB_HOST")
-FALKORDB_PORT = int(os.getenv("FALKORDB_PORT"))
+FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
 
 NOCODB_URL = os.getenv("NOCODB_URL")
 NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
 NOCODB_BASE_ID = os.getenv("NOCODB_BASE_ID")
 
-ENVIRONMENT = os.getenv("ENVIRONMENT")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
 
 def scoped_collection(org_id: int, collection_name: str) -> str:
     return f"org_{org_id}_{collection_name}"

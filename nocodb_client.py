@@ -3,7 +3,7 @@ import requests
 from config import NOCODB_URL, NOCODB_TOKEN, NOCODB_BASE_ID
 
 
-class NocoDBClient:
+class NocodbClient:
     def __init__(self):
         self.url = f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}"
         self.headers = {
