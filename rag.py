@@ -31,7 +31,7 @@ def retrieve(query: str, org_id: int, collection_name: str = "agent_outputs", n_
     if not candidates:
         return ""
 
-    texts = [c["text"] for c in candidates]
+    texts = [c["text"][:1500] for c in candidates] #roughly truncates to 400 tokens - batch size limit on reranker
 
     ranked_texts = rerank(query, texts)
     top_texts = ranked_texts[:top_k]
