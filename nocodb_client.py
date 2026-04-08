@@ -178,6 +178,40 @@ class NocodbClient:
             "tokens_output": tokens_output,
         })
 
+    def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:
+        """Generic helper: list rows from `table` filtered by conversation_id.
+
+        Returns [] if the column doesn't exist on that table yet.
+        """
+        try:
+            data = self._get(table, params={
+                "where": f"(conversation_id,eq,{conversation_id})",
+                "limit": limit,
+            })
+            return data.get("list", [])
+        except (requests.HTTPError, KeyError):
+            return []
+
+    def list_runs_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
+        return self._list_by_conversation("agent_runs", conversation_id, limit)
+
+    def list_outputs_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
+        return self._list_by_conversation("agent_outputs", conversation_id, limit)
+
+    def list_tasks_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
+        return self._list_by_conversation("tasks", conversation_id, limit)
+
+    def list_observations_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
+        try:
+            data = self._get("observations", params={
+                "where": f"(conversation_id,eq,{conversation_id})",
+                "limit": limit,
+            })
+            return data.get("list", [])
+        except requests.HTTPError:
+            # observations table may not have a conversation_id column yet
+            return []
+
     def save_observation(
         self,
         run: dict,
