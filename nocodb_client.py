@@ -127,11 +127,20 @@ class NocodbClient:
             "chroma_ids": chroma_ids
         })
 
-    def create_conversation(self, org_id: int, model: str, title: str = "") -> dict:
+    def create_conversation(
+        self,
+        org_id: int,
+        model: str,
+        title: str = "",
+        rag_enabled: bool = False,
+        rag_collection: str | None = None,
+    ) -> dict:
         return self._post("conversations", {
             "org_id": org_id,
             "model": model,
             "title": title or "New chat",
+            "rag_enabled": 1 if rag_enabled else 0,
+            "rag_collection": rag_collection or "",
         })
 
     def get_conversation(self, conversation_id: int) -> dict | None:

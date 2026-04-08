@@ -58,6 +58,11 @@ class ChatRequest(BaseModel):
     system: str | None = None
     temperature: float = 0.7
     max_tokens: int = 1024
+    # Only honoured on the first message of a conversation (when
+    # conversation_id is None). Subsequent turns inherit the setting
+    # from the conversation row in NocoDB.
+    rag_enabled: bool | None = None
+    rag_collection: str | None = None
 
 
 @app.get("/models")
@@ -91,6 +96,8 @@ async def chat(request: ChatRequest):
             system=request.system,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            rag_enabled=request.rag_enabled,
+            rag_collection=request.rag_collection,
         )
         return {
             "success": True,
@@ -100,6 +107,8 @@ async def chat(request: ChatRequest):
             "tokens_input": result.tokens_input,
             "tokens_output": result.tokens_output,
             "duration_seconds": result.duration_seconds,
+            "rag_enabled": result.rag_enabled,
+            "context_chars": result.context_chars,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
