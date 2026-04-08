@@ -28,7 +28,38 @@ def _get_host() -> str:
         return "0.0.0.0"
 
 
-def _discover_models(host: str) -> dict:
+def _model_name(model_id: str) -> str:
+    name = model_id.replace(".gguf", "")
+    name = re.sub(r'-Q\d+.*$', '', name, flags=re.IGNORECASE)
+    return name
+
+
+def _query_model(url: str) -> str | None:
+    try:
+        response = requests.get(f"{url}/v1/models", timeout=2)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("data"):
+            return _model_name(data["data"][0]["id"])
+    except Exception:
+        pass
+    return None
+
+
+def _discover_from_hosts(hosts: str) -> dict:
+    models = {}
+    for url in hosts.split(","):
+        url = url.strip()
+        if not url:
+            continue
+        name = _query_model(url)
+        if name:
+            models[name] = url
+            print(f"Discovered model: {name} at {url}")
+    return models
+
+
+def _discover_by_scan(host: str) -> dict:
     port_start = int(os.getenv("MODEL_PORT_START", "8080"))
     port_end = int(os.getenv("MODEL_PORT_END", "8090"))
 
@@ -37,37 +68,29 @@ def _discover_models(host: str) -> dict:
         int(os.getenv("RERANKER_PORT", "8084"))
     }
 
-    def _model_name(model_id: str) -> str:
-        name = model_id.replace(".gguf", "")
-        name = re.sub(r'-Q\d+.*$', '', name, flags=re.IGNORECASE)
-        return name
-
     models = {}
     for port in range(port_start, port_end + 1):
         if port in exclude_ports:
             continue
         url = f"http://{host}:{port}"
-        try:
-            response = requests.get(f"{url}/v1/models", timeout=2)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("data"):
-                model_id = data["data"][0]["id"]
-                name = _model_name(model_id)
-                models[name] = url
-                print(f"Discovered model: {name} on port {port}")
-        except Exception:
-            pass
+        name = _query_model(url)
+        if name:
+            models[name] = url
+            print(f"Discovered model: {name} on port {port}")
 
     return models
 
 
 _host = _get_host()
 
-MODELS = _discover_models(_host)
+_model_hosts_env = os.getenv("MODEL_HOSTS", "").strip()
+if _model_hosts_env:
+    MODELS = _discover_from_hosts(_model_hosts_env)
+else:
+    MODELS = _discover_by_scan(_host)
 
-EMBEDDER_URL = f"http://{_host}:{os.getenv('EMBEDDER_PORT', '8083')}"
-RERANKER_URL = f"http://{_host}:{os.getenv('RERANKER_PORT', '8084')}"
+EMBEDDER_URL = os.getenv("EMBEDDER_URL", f"http://{_host}:{os.getenv('EMBEDDER_PORT', '8083')}")
+RERANKER_URL = os.getenv("RERANKER_URL", f"http://{_host}:{os.getenv('RERANKER_PORT', '8084')}")
 
 CHROMA_URL = os.getenv("CHROMA_URL")
 FALKORDB_HOST = os.getenv("FALKORDB_HOST")
