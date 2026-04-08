@@ -22,10 +22,12 @@ class RunRequest(BaseModel):
 
 @app.get("/health")
 async def health():
+    # Stays async — pure, non-blocking, useful for liveness probes that
+    # need a response even if the threadpool is saturated.
     return {"status": "ok", "service": "MSTAG Harness"}
 
 @app.post("/run")
-async def run_agent(request: RunRequest):
+def run_agent(request: RunRequest):
     try:
         agent = GeneratorAgent(request.agent_name, request.org_id)
         result = agent.run(request.task, request.product)
@@ -66,7 +68,7 @@ class ChatRequest(BaseModel):
 
 
 @app.get("/models")
-async def list_models():
+def list_models():
     catalog = MODELS or refresh_models()
     seen: set[str] = set()
     models: list[dict] = []
@@ -87,7 +89,7 @@ async def list_models():
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+def chat(request: ChatRequest):
     try:
         agent = ChatAgent(model=request.model, org_id=request.org_id)
         result = agent.send(
@@ -117,7 +119,7 @@ async def chat(request: ChatRequest):
 
 
 @app.get("/agents")
-async def list_agents(org_id: int, limit: int = 200):
+def list_agents(org_id: int, limit: int = 200):
     try:
         db = NocodbClient()
         rows = db.list_agents(org_id=org_id, limit=limit)
@@ -138,7 +140,7 @@ async def list_agents(org_id: int, limit: int = 200):
 
 
 @app.get("/conversations")
-async def list_conversations(org_id: int, limit: int = 50):
+def list_conversations(org_id: int, limit: int = 50):
     try:
         db = NocodbClient()
         return {"conversations": db.list_conversations(org_id, limit)}
@@ -163,7 +165,7 @@ def _counter(rows: list[dict], field: str) -> dict:
 
 
 @app.get("/conversations/{conversation_id}/summary")
-async def conversation_summary(conversation_id: int):
+def conversation_summary(conversation_id: int):
     try:
         db = NocodbClient()
         convo = db.get_conversation(conversation_id)
@@ -275,7 +277,7 @@ async def conversation_summary(conversation_id: int):
 
 
 @app.get("/conversations/{conversation_id}/messages")
-async def get_messages(conversation_id: int):
+def get_messages(conversation_id: int):
     try:
         db = NocodbClient()
         convo = db.get_conversation(conversation_id)
