@@ -17,6 +17,12 @@ def _discover_models() -> dict:
         int(os.getenv("RERANKER_PORT", "8084"))
     }
 
+    def _model_name(model_id: str) -> str:
+        import re
+        name = model_id.replace(".gguf", "")
+        name = re.sub(r'-Q\d+.*$', '', name, flags=re.IGNORECASE)
+        return name
+
     models = {}
     for port in range(port_start, port_end + 1):
         if port in exclude_ports:
@@ -28,7 +34,8 @@ def _discover_models() -> dict:
             data = response.json()
             if data.get("data"):
                 model_id = data["data"][0]["id"]
-                models[model_id] = url
+                name = _model_name(model_id)
+                models[name] = url
                 print(f"Discovered model: {model_id} on port {port}")
         except Exception:
             pass
