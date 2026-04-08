@@ -1,16 +1,46 @@
 import os
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MODELS = {
-    key.replace("MODEL_", "").lower(): value
-    for key, value in os.environ.items()
-    if key.startswith("MODEL_")
-}
 
-EMBEDDER_URL = os.getenv("EMBEDDER_URL")
-RERANKER_URL = os.getenv("RERANKER_URL")
+# build for scanning llama.cpp models
+def _discover_models() -> dict:
+    host = os.getenv("MODEL_HOST")
+    port_start = int(os.getenv("MODEL_PORT_START"))
+    port_end = int(os.getenv("MODEL_PORT_END"))
+
+    # exclude embedder and reranker ports from model discovery
+    exclude_ports = {
+        int(os.getenv("EMBEDDER_PORT", "8083")),
+        int(os.getenv("RERANKER_PORT", "8084"))
+    }
+
+    models = {}
+    for port in range(port_start, port_end + 1):
+        if port in exclude_ports:
+            continue
+        url = f"http://{host}:{port}"
+        try:
+            response = requests.get(f"{url}/v1/models", timeout=2)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("data"):
+                model_id = data["data"][0]["id"]
+                models[model_id] = url
+                print(f"Discovered model: {model_id} on port {port}")
+        except Exception:
+            pass
+
+    return models
+
+
+MODELS = _discover_models()
+
+_host = os.getenv("MODEL_HOST")
+EMBEDDER_URL = f"http://{_host}:{os.getenv('EMBEDDER_PORT')}"
+RERANKER_URL = f"http://{_host}:{os.getenv('RERANKER_PORT')}"
 
 CHROMA_URL = os.getenv("CHROMA_URL")
 FALKORDB_HOST = os.getenv("FALKORDB_HOST")
