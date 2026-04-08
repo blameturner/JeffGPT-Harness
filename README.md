@@ -23,11 +23,12 @@ I made this mostly for myself, but also as a clean baseline I can reuse across f
 mst-ag-harness:
   image: ghcr.io/blameturner/mst-harness:latest
   container_name: mst-ag-harness
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   environment:
-    - MODEL_PORT_START=8080
-    - MODEL_PORT_END=8090
-    - EMBEDDER_PORT=8083
-    - RERANKER_PORT=8084
+    - MODEL_HOSTS=http://mst-ag-reasoner-gemma4-e4b:8080,http://mst-ag-fast-gemma4-e2b:8081,http://mst-ag-coder-qwen-14b:8082
+    - EMBEDDER_URL=http://mst-ag-embedder-nomic-embed-v1.5:8083
+    - RERANKER_URL=http://mst-ag-reranker-bge-reranker-v2-m3:8084
     - CHROMA_URL=http://chroma:8000
     - FALKORDB_HOST=falkordb
     - FALKORDB_PORT=6379
@@ -39,6 +40,13 @@ mst-ag-harness:
     - "3800:3800"
   restart: unless-stopped
   networks:
-    - mst-ag-01-network
+    - default
 ```
+
+Model containers are addressed explicitly via `MODEL_HOSTS` (comma-separated
+list of base URLs). On startup the harness calls `/v1/models` on each to
+discover the model ID and registers it under a friendly name. If
+`MODEL_HOSTS` is unset the harness falls back to scanning
+`MODEL_PORT_START`–`MODEL_PORT_END` on the Docker gateway, which is handy
+for running the harness on the host against containerised models.
 
