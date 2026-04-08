@@ -1,7 +1,7 @@
 import time
 import requests
 from dataclasses import dataclass
-from config import MODELS
+from config import MODELS, get_model_url, refresh_models
 from nocodb_client import NocodbClient
 
 
@@ -23,13 +23,21 @@ class ChatAgent:
     """
 
     def __init__(self, model: str, org_id: int):
-        if model not in MODELS:
+        url = get_model_url(model)
+        if not url:
+            # Lazy re-discover in case the model containers came up after the harness did.
+            refresh_models()
+            url = get_model_url(model)
+        if not url:
+            options = sorted({
+                v["role"] for v in MODELS.values() if isinstance(v, dict)
+            })
             raise ValueError(
-                f"Model '{model}' not available. Options: {list(MODELS.keys())}"
+                f"Model '{model}' not available. Options: {options}"
             )
         self.model = model
         self.org_id = org_id
-        self.url = MODELS[model]
+        self.url = url
         self.db = NocodbClient()
 
     def _call_model(self, messages: list[dict], temperature: float, max_tokens: int) -> dict:

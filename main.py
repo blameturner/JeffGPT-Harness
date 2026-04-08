@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from agents.generator_agent import GeneratorAgent
 from agents.chat_agent import ChatAgent
-from config import MODELS
+from config import MODELS, refresh_models
 from nocodb_client import NocodbClient
 from contextlib import asynccontextmanager
 
@@ -62,9 +62,23 @@ class ChatRequest(BaseModel):
 
 @app.get("/models")
 async def list_models():
-    return {
-        "models": [{"name": name, "url": url} for name, url in MODELS.items()]
-    }
+    catalog = MODELS or refresh_models()
+    seen: set[str] = set()
+    models: list[dict] = []
+    for entry in catalog.values():
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        if not role or role in seen:
+            continue
+        seen.add(role)
+        models.append({
+            "name": role,
+            "role": role,
+            "model_id": entry.get("model_id"),
+            "url": entry.get("url"),
+        })
+    return {"models": models}
 
 
 @app.post("/chat")

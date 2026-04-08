@@ -26,7 +26,9 @@ mst-ag-harness:
   extra_hosts:
     - "host.docker.internal:host-gateway"
   environment:
-    - MODEL_HOSTS=http://mst-ag-reasoner-gemma4-e4b:8080,http://mst-ag-fast-gemma4-e2b:8081,http://mst-ag-coder-qwen-14b:8082
+    - MODEL_REASONER_URL=http://mst-ag-reasoner-gemma4-e4b:8080
+    - MODEL_FAST_URL=http://mst-ag-fast-gemma4-e2b:8081
+    - MODEL_CODER_URL=http://mst-ag-coder-qwen-14b:8082
     - EMBEDDER_URL=http://mst-ag-embedder-nomic-embed-v1.5:8083
     - RERANKER_URL=http://mst-ag-reranker-bge-reranker-v2-m3:8084
     - CHROMA_URL=http://chroma:8000
@@ -43,10 +45,13 @@ mst-ag-harness:
     - default
 ```
 
-Model containers are addressed explicitly via `MODEL_HOSTS` (comma-separated
-list of base URLs). On startup the harness calls `/v1/models` on each to
-discover the model ID and registers it under a friendly name. If
-`MODEL_HOSTS` is unset the harness falls back to scanning
-`MODEL_PORT_START`–`MODEL_PORT_END` on the Docker gateway, which is handy
-for running the harness on the host against containerised models.
+Each chat model container is bound to a **role** via a `MODEL_<ROLE>_URL`
+environment variable. On startup the harness polls each URL's `/v1/models`
+endpoint for up to `MODEL_DISCOVERY_TIMEOUT_S` seconds (default 60) so it
+survives the docker-compose boot race, then registers the model under both
+its role (`reasoner`, `fast`, `coder`) and the cleaned underlying model ID.
+Either key can be used to select the model from the frontend or agents.
+Fallbacks: `MODEL_HOSTS` (comma-separated list, role inferred from
+hostname) and port-scanning `MODEL_PORT_START`–`MODEL_PORT_END` on the
+Docker gateway (dev mode).
 

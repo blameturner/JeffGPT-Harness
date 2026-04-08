@@ -2,7 +2,7 @@ import json
 import time
 import requests
 from dataclasses import dataclass
-from config import MODELS
+from config import get_model_url
 from rag import retrieve
 from memory import remember
 from nocodb_client import NocodbClient
@@ -31,9 +31,12 @@ class Agent:
 
     def _get_model_url(self) -> str:
         model_key = self.config["model"].lower()
-        url = MODELS.get(model_key)
+        url = get_model_url(model_key)
         if not url:
-            raise ValueError(f"Model {model_key} not found in variables - add MODEL_{model_key.upper()}=url")
+            raise ValueError(
+                f"Model '{model_key}' not found in catalog — "
+                f"set MODEL_{model_key.upper()}_URL in the environment"
+            )
         return url
 
     def _build_prompt(self, task: str, context: str) -> list[dict]:
