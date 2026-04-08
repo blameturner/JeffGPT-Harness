@@ -74,14 +74,14 @@ class ChatAgent:
         )
         response.raise_for_status()
         return response.json()
-
+# we will set these parameters as adjustable later.
     def send(
         self,
         user_message: str,
         conversation_id: int | None = None,
         system: str | None = None,
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         rag_enabled: bool | None = None,
         rag_collection: str | None = None,
     ) -> ChatResult:
