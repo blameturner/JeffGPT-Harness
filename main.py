@@ -1,16 +1,31 @@
+import json
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from agents.generator_agent import GeneratorAgent
-from agents.chat_agent import ChatAgent
+from workers.generator_agent import GeneratorAgent
+from workers.chat_agent import ChatAgent
+from workers.code_agent import CodeAgent
 from config import MODELS, refresh_models
 from nocodb_client import NocodbClient
 from contextlib import asynccontextmanager
 
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("mstag-harness starting...")
+    from scheduler import start_scheduler
+    sched = start_scheduler()
+    app.state.scheduler = sched
+    print("Scheduler running")
     print("ready")
-    yield
+    try:
+        yield
+    finally:
+        sched.shutdown(wait=False)
 
 app = FastAPI(title="MSTAG Harness", version="1.0.0", lifespan=lifespan)
 
@@ -52,6 +67,26 @@ def run_agent(request: RunRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/run/stream")
+def run_agent_stream(request: RunRequest):
+    """SSE: streams chunks from a GeneratorAgent, then a terminal `parsed` event."""
+    try:
+        agent = GeneratorAgent(request.agent_name, request.org_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    def gen():
+        try:
+            for event in agent.run_streaming(request.task, request.product):
+                yield _sse(event)
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 class ChatRequest(BaseModel):
     org_id: int
     model: str
@@ -59,12 +94,28 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     system: str | None = None
     temperature: float = 0.7
-    max_tokens: int = 1024
+    # Chunked streaming makes UX fast regardless of response length, so we
+    # no longer clip max_tokens aggressively on the server side.
+    max_tokens: int = 8192
     # Only honoured on the first message of a conversation (when
     # conversation_id is None). Subsequent turns inherit the setting
     # from the conversation row in NocoDB.
     rag_enabled: bool | None = None
     rag_collection: str | None = None
+    knowledge_enabled: bool | None = None
+    search_enabled: bool = False
+
+
+class CodeRequest(BaseModel):
+    org_id: int
+    model: str
+    message: str
+    mode: str = "plan"  # plan | execute | debug
+    approved_plan: str | None = None
+    files: list[dict] | None = None  # [{name, content_b64}]
+    conversation_id: int | None = None
+    temperature: float = 0.2
+    max_tokens: int = 8192
 
 
 @app.get("/models")
@@ -90,32 +141,64 @@ def list_models():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    """SSE streaming chat. Events: meta, summarised, chunk, done, error, searching, search_complete."""
     try:
-        agent = ChatAgent(model=request.model, org_id=request.org_id)
-        result = agent.send(
-            user_message=request.message,
-            conversation_id=request.conversation_id,
-            system=request.system,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            rag_enabled=request.rag_enabled,
-            rag_collection=request.rag_collection,
+        agent = ChatAgent(
+            model=request.model,
+            org_id=request.org_id,
+            search_enabled=request.search_enabled,
         )
-        return {
-            "success": True,
-            "conversation_id": result.conversation_id,
-            "model": result.model,
-            "output": result.output,
-            "tokens_input": result.tokens_input,
-            "tokens_output": result.tokens_output,
-            "duration_seconds": result.duration_seconds,
-            "rag_enabled": result.rag_enabled,
-            "context_chars": result.context_chars,
-        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    def gen():
+        try:
+            for event in agent.send_streaming(
+                user_message=request.message,
+                conversation_id=request.conversation_id,
+                system=request.system,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                rag_enabled=request.rag_enabled,
+                rag_collection=request.rag_collection,
+                knowledge_enabled=request.knowledge_enabled,
+            ):
+                yield _sse(event)
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/code")
+def code(request: CodeRequest):
+    """SSE streaming code agent. Events: meta, chunk, done, error."""
+    try:
+        agent = CodeAgent(
+            model=request.model,
+            org_id=request.org_id,
+            mode=request.mode,  # type: ignore[arg-type]
+            approved_plan=request.approved_plan,
+            files=request.files,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    def gen():
+        try:
+            for event in agent.run_streaming(
+                user_message=request.message,
+                conversation_id=request.conversation_id,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            ):
+                yield _sse(event)
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/agents")
@@ -291,6 +374,54 @@ def get_messages(conversation_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+WORKER_TYPES = [
+    {"id": "generator", "name": "Generator", "description": "Produces structured output for a task."},
+    {"id": "monitor", "name": "Monitor", "description": "Watches a data source and flags changes."},
+    {"id": "evaluator", "name": "Evaluator", "description": "Scores or critiques outputs against criteria."},
+    {"id": "researcher", "name": "Researcher", "description": "Performs multi-source web research."},
+    {"id": "memory", "name": "Memory", "description": "Writes and retrieves knowledge from ChromaDB / FalkorDB."},
+    {"id": "enrichment", "name": "Enrichment", "description": "Scrapes whitelisted sources and enriches the knowledge base."},
+    {"id": "code", "name": "Code", "description": "Plans, writes, and debugs code."},
+]
+
+
+@app.get("/workers/types")
+def worker_types():
+    return {"types": WORKER_TYPES}
+
+
+@app.post("/scheduler/reload")
+def scheduler_reload():
+    from scheduler import reload_agent_schedules
+    return reload_agent_schedules()
+
+
+@app.post("/scheduler/trigger")
+def scheduler_trigger():
+    """Manual enrichment cycle trigger (for UI 'Run now' button)."""
+    import threading
+    from workers.enrichment_agent import run_enrichment_cycle
+    threading.Thread(target=run_enrichment_cycle, daemon=True).start()
+    return {"status": "triggered"}
+
+
+@app.get("/scheduler/status")
+def scheduler_status():
+    from workers.enrichment_agent import sources_due_count
+    sched = getattr(app.state, "scheduler", None)
+    running = bool(sched and sched.running)
+    next_run = None
+    if sched:
+        job = sched.get_job("enrichment_cycle")
+        if job and job.next_run_time:
+            next_run = job.next_run_time.isoformat()
+    return {
+        "running": running,
+        "next_run": next_run,
+        "sources_due": sources_due_count(),
+    }
 
 
 if __name__ == "__main__":

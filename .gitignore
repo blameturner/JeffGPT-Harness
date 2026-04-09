@@ -1,16 +1,9 @@
-# Environment
 .env
 .env.local
 .env.*
-
-# Virtual environment
 .venv/
 venv/
-
-# PyCharm
 .idea/
-
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -19,6 +12,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
-# OS
 .DS_Store
+
+.idea/*
+*/.idea

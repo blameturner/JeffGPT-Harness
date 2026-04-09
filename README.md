@@ -2,6 +2,8 @@
 
 This is a personal project I built to make my local LLM workflow feel less scrappy and more reliable.
 
+You are welcome to fork this. It's probably crap, but feel free. I do not guarantee it will work.
+
 I wanted one place where I could:
 - run different agents behind a simple API,
 - keep outputs structured so they are actually reusable,

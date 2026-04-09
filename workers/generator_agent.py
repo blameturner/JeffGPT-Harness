@@ -1,4 +1,5 @@
 import json
+from typing import Iterator
 from pydantic import ValidationError
 from agent import Agent, RunResult
 from schemas.base import AgentOutput
@@ -51,3 +52,23 @@ class GeneratorAgent(Agent):
             return None
 
         return parsed
+
+    def run_streaming(self, task: str, product: str = "") -> Iterator[dict]:
+        accumulated: list[str] = []
+        for event in super().run_streaming(task, product):
+            etype = event.get("type")
+            if etype == "chunk":
+                accumulated.append(event["text"])
+                yield event
+            elif etype == "error":
+                yield event
+                return
+            elif etype == "done":
+                raw = event.get("output") or "".join(accumulated)
+                parsed = self._parse_response(raw)
+                yield event
+                yield {
+                    "type": "parsed",
+                    "output": parsed.model_dump() if parsed else None,
+                    "parse_ok": parsed is not None,
+                }

@@ -12,6 +12,7 @@ class AgentOutput(BaseModel):
     follow_up_questions: list[str] = Field(description="Questions the user should explore next, phrased as questions")
     tags: list[str] = Field(description="3-6 short keywords extracted from the output for filtering and search")
     confidence: Literal["high", "medium", "low"] = Field(description="Confidence level — must be exactly: high, medium, or low")
+    sources: list[str] = Field(default=[], description="Sources referenced — format as 'Title: URL' e.g. 'Hono Docs: https://hono.dev'. Empty list if no external sources used.")
 
 
     @classmethod

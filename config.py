@@ -186,6 +186,7 @@ EMBEDDER_URL = os.getenv("EMBEDDER_URL") or f"http://{_get_host()}:{os.getenv('E
 RERANKER_URL = os.getenv("RERANKER_URL") or f"http://{_get_host()}:{os.getenv('RERANKER_PORT', '8084')}"
 
 CHROMA_URL = os.getenv("CHROMA_URL")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://mst-ag-searxng:8080")
 FALKORDB_HOST = os.getenv("FALKORDB_HOST")
 FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
 
@@ -194,6 +195,21 @@ NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
 NOCODB_BASE_ID = os.getenv("NOCODB_BASE_ID")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+
+ENRICHMENT_TOKEN_BUDGET = int(os.getenv("ENRICHMENT_TOKEN_BUDGET", "50000"))
+ENRICHMENT_LOG_RETENTION_DAYS = int(os.getenv("ENRICHMENT_LOG_RETENTION_DAYS", "30"))
+MAX_SUMMARY_INPUT_CHARS = 15000
+PROACTIVE_BUDGET_THRESHOLD = 5000
+CATEGORY_COLLECTIONS = {
+    "documentation": "scraped_documentation",
+    "news": "scraped_news",
+    "competitive": "scraped_competitive",
+    "regulatory": "scraped_regulatory",
+    "research": "scraped_research",
+    "security": "scraped_security",
+    "model_releases": "scraped_model_releases",
+}
 
 
 def scoped_collection(org_id: int, collection_name: str) -> str:
