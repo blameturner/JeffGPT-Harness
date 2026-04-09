@@ -104,6 +104,11 @@ class ChatRequest(BaseModel):
     rag_collection: str | None = None
     knowledge_enabled: bool | None = None
     search_enabled: bool = False
+    search_consent_declined: bool = False
+
+
+class ConversationUpdate(BaseModel):
+    title: str | None = None
 
 
 class CodeRequest(BaseModel):
@@ -141,7 +146,7 @@ def list_models():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """SSE streaming chat. Events: meta, summarised, chunk, done, error, searching, search_complete."""
+    """SSE streaming chat. Events: meta, summarised, chunk, done, error, searching, search_complete, search_consent_required."""
     try:
         agent = ChatAgent(
             model=request.model,
@@ -162,6 +167,7 @@ def chat(request: ChatRequest):
                 rag_enabled=request.rag_enabled,
                 rag_collection=request.rag_collection,
                 knowledge_enabled=request.knowledge_enabled,
+                search_consent_declined=request.search_consent_declined,
             ):
                 yield _sse(event)
         except Exception as e:
@@ -245,6 +251,25 @@ def _counter(rows: list[dict], field: str) -> dict:
         key = (r.get(field) or "").strip() or "unknown"
         out[key] = out.get(key, 0) + 1
     return out
+
+
+@app.patch("/conversations/{conversation_id}")
+def update_conversation(conversation_id: int, body: ConversationUpdate):
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        updates: dict = {}
+        if body.title is not None:
+            updates["title"] = body.title.strip() or "Untitled"
+        if not updates:
+            return convo
+        return db.update_conversation(conversation_id, updates)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/conversations/{conversation_id}/summary")

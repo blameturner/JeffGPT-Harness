@@ -151,6 +151,10 @@ class NocodbClient:
         records = data.get("list", [])
         return records[0] if records else None
 
+    def update_conversation(self, conversation_id: int, data: dict) -> dict:
+        payload = {"Id": conversation_id, **data}
+        return self._patch("conversations", conversation_id, payload)
+
     def list_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
         data = self._get("conversations", params={
             "where": f"(org_id,eq,{org_id})",

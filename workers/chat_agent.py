@@ -12,7 +12,7 @@ from nocodb_client import NocodbClient
 from rag import retrieve
 from memory import remember
 from graph import write_relationship
-from workers.web_search import run_web_search
+from workers.web_search import run_web_search, needs_web_search
 
 
 # --- Summarisation constants -----------------------------------------------
@@ -252,6 +252,7 @@ class ChatAgent:
         rag_enabled: bool | None = None,
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
+        search_consent_declined: bool = False,
     ) -> Iterator[dict]:
         """Yield SSE-ready event dicts for a single chat turn.
 
@@ -291,6 +292,69 @@ class ChatAgent:
 
         yield {"type": "meta", "conversation_id": conversation_id}
 
+        search_context = ""
+        search_sources: list[str] = []
+        search_note = ""
+        search_errored = False
+        if self.search_enabled:
+            yield {"type": "searching"}
+            try:
+                search_context, search_sources = run_web_search(user_message, self.org_id)
+            except Exception as e:
+                print(f"[chat] web search failed: {e}")
+                search_context, search_sources = "", []
+                search_errored = True
+            yield {
+                "type": "search_complete",
+                "source_count": len(search_sources),
+                "sources": search_sources,
+                "ok": bool(search_sources),
+            }
+            if not search_sources:
+                search_note = (
+                    "SEARCH STATUS: You attempted a live web search for this "
+                    "question but it returned no usable results "
+                    + ("(the search backend errored)." if search_errored
+                       else "(all candidate pages failed to fetch or were irrelevant).")
+                    + " In your reply, clearly tell the user that you tried "
+                    "to search and couldn't retrieve live results, then "
+                    "answer from general knowledge with an explicit caveat "
+                    "about recency. Do NOT claim you lack the ability to "
+                    "search — you have it, it just failed this time."
+                )
+        elif not search_consent_declined:
+            try:
+                needs, reason = needs_web_search(user_message)
+            except Exception as e:
+                print(f"[chat] needs_web_search failed: {e}")
+                needs, reason = False, ""
+            if needs:
+                yield {
+                    "type": "search_consent_required",
+                    "query": user_message,
+                    "reason": reason or "question appears to need live information",
+                }
+                yield {
+                    "type": "done",
+                    "conversation_id": conversation_id,
+                    "awaiting": "search_consent",
+                    "model": self.model,
+                    "tokens_input": 0,
+                    "tokens_output": 0,
+                    "duration_seconds": 0.0,
+                    "rag_enabled": False,
+                    "context_chars": 0,
+                }
+                return
+        else:
+            search_note = (
+                "SEARCH STATUS: The user declined a live web search for this "
+                "question. Answer from general knowledge and explicitly flag "
+                "that anything time-sensitive may be out of date. Do NOT "
+                "claim you lack the ability to search — the user chose not "
+                "to allow it this turn."
+            )
+
         try:
             self.db.add_message(
                 conversation_id=conversation_id,
@@ -301,21 +365,6 @@ class ChatAgent:
             )
         except Exception as e:
             print(f"[chat] user message persist failed: {e}")
-
-        search_context = ""
-        search_sources: list[str] = []
-        if self.search_enabled:
-            yield {"type": "searching"}
-            try:
-                search_context, search_sources = run_web_search(user_message, self.org_id)
-            except Exception as e:
-                print(f"[chat] web search failed: {e}")
-                search_context, search_sources = "", []
-            yield {
-                "type": "search_complete",
-                "source_count": len(search_sources),
-                "sources": search_sources,
-            }
 
         rag_context = ""
         if convo_rag_enabled:
@@ -342,6 +391,11 @@ class ChatAgent:
             payload.append({
                 "role": "system",
                 "content": search_context,
+            })
+        if search_note:
+            payload.append({
+                "role": "system",
+                "content": search_note,
             })
         if rag_context:
             payload.append({
