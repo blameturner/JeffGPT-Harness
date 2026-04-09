@@ -211,7 +211,7 @@ class Agent:
         self.db.save_output(
             run=run,
             full_text=output,
-            chroma_ids=json.dumps(chroma_ids)
+            chroma_ids=chroma_ids,
         )
 
         return RunResult(
@@ -312,7 +312,7 @@ class Agent:
             self.db.save_output(
                 run=run,
                 full_text=output,
-                chroma_ids=json.dumps(chroma_ids),
+                chroma_ids=chroma_ids,
             )
         except Exception as e:
             print(f"[agent] run persistence failed: {e}")

@@ -109,6 +109,7 @@ class ChatRequest(BaseModel):
 
 class ConversationUpdate(BaseModel):
     title: str | None = None
+    code_checklist: list | None = None
 
 
 class CodeRequest(BaseModel):
@@ -119,6 +120,8 @@ class CodeRequest(BaseModel):
     approved_plan: str | None = None
     files: list[dict] | None = None  # [{name, content_b64}]
     conversation_id: int | None = None
+    title: str | None = None
+    codebase_collection: str | None = None
     temperature: float = 0.2
     max_tokens: int = 8192
 
@@ -179,7 +182,7 @@ def chat(request: ChatRequest):
 
 @app.post("/code")
 def code(request: CodeRequest):
-    """SSE streaming code agent. Events: meta, chunk, done, error."""
+    """SSE streaming code agent. Events: meta, chunk, plan_checklist, done, error."""
     try:
         agent = CodeAgent(
             model=request.model,
@@ -198,6 +201,8 @@ def code(request: CodeRequest):
                 conversation_id=request.conversation_id,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
+                title=request.title,
+                codebase_collection=request.codebase_collection,
             ):
                 yield _sse(event)
         except Exception as e:
@@ -205,6 +210,88 @@ def code(request: CodeRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/code/conversations")
+def list_code_conversations(org_id: int, limit: int = 50):
+    try:
+        db = NocodbClient()
+        return {"conversations": db.list_code_conversations(org_id, limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/code/conversations/{conversation_id}")
+def get_code_conversation(conversation_id: int):
+    try:
+        db = NocodbClient()
+        convo = db.get_code_conversation(conversation_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Code conversation not found")
+        return convo
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/code/conversations/{conversation_id}/messages")
+def get_code_messages(conversation_id: int, limit: int = 500):
+    try:
+        db = NocodbClient()
+        return {"messages": db.list_code_messages(conversation_id, limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/code/conversations/{conversation_id}/workspace")
+def get_code_workspace(conversation_id: int):
+    """Return the latest workspace (list of {name, content}) attached to
+    this code conversation, or [] if none. Lets the frontend re-render the
+    file chips when loading an existing session."""
+    try:
+        db = NocodbClient()
+        msgs = db.list_code_messages(conversation_id)
+        for m in reversed(msgs):
+            if m.get("role") != "user":
+                continue
+            raw = m.get("files_json")
+            if not raw:
+                continue
+            if isinstance(raw, list):
+                return {"files": raw}
+            if isinstance(raw, str):
+                try:
+                    import json as _json
+                    data = _json.loads(raw)
+                    if isinstance(data, list):
+                        return {"files": data}
+                except Exception:
+                    continue
+        return {"files": []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/code/conversations/{conversation_id}")
+def update_code_conversation(conversation_id: int, body: ConversationUpdate):
+    try:
+        db = NocodbClient()
+        convo = db.get_code_conversation(conversation_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Code conversation not found")
+        updates: dict = {}
+        if body.title is not None:
+            updates["title"] = body.title.strip() or "Untitled"
+        if body.code_checklist is not None:
+            updates["code_checklist"] = body.code_checklist
+        if not updates:
+            return convo
+        return db.update_code_conversation(conversation_id, updates)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/agents")

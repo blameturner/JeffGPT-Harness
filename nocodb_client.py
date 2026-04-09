@@ -116,7 +116,7 @@ class NocodbClient:
             "error_message": error_message
         })
 
-    def save_output(self, run: dict, full_text: str, chroma_ids: str) -> dict:
+    def save_output(self, run: dict, full_text: str, chroma_ids: list) -> dict:
         return self._post("agent_outputs", {
             "run_id": run["Id"],
             "agent_id": run["agent_id"],
@@ -190,6 +190,81 @@ class NocodbClient:
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
         })
+
+    # --- code conversations (mirror of chat, separate tables) ------------
+
+    def create_code_conversation(
+        self,
+        org_id: int,
+        model: str,
+        title: str = "",
+        mode: str = "plan",
+    ) -> dict:
+        return self._post("code_conversations", {
+            "org_id": org_id,
+            "model": model,
+            "title": title or "New code session",
+            "rag_enabled": 0,
+            "rag_collection": mode,
+        })
+
+    def get_code_conversation(self, conversation_id: int) -> dict | None:
+        data = self._get("code_conversations", params={
+            "where": f"(Id,eq,{conversation_id})",
+            "limit": 1,
+        })
+        records = data.get("list", [])
+        return records[0] if records else None
+
+    def update_code_conversation(self, conversation_id: int, data: dict) -> dict:
+        payload = {"Id": conversation_id, **data}
+        return self._patch("code_conversations", conversation_id, payload)
+
+    def list_code_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
+        data = self._get("code_conversations", params={
+            "where": f"(org_id,eq,{org_id})",
+            "sort": "-CreatedAt",
+            "limit": limit,
+        })
+        return data.get("list", [])
+
+    def list_code_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
+        data = self._get("code_messages", params={
+            "where": f"(conversation_id,eq,{conversation_id})",
+            "sort": "CreatedAt",
+            "limit": limit,
+        })
+        return data.get("list", [])
+
+    def add_code_message(
+        self,
+        conversation_id: int,
+        org_id: int,
+        role: str,
+        content: str,
+        model: str = "",
+        tokens_input: int = 0,
+        tokens_output: int = 0,
+        mode: str = "",
+        files_json: list | None = None,
+    ) -> dict:
+        payload = {
+            "conversation_id": conversation_id,
+            "org_id": org_id,
+            "role": role,
+            "content": content,
+            "model": model,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+        }
+        # Optional columns — only included if the table has them, so schemas
+        # without the new fields still work. `files_json` is a NocoDB JSON
+        # column so we send the raw list, not a JSON-encoded string.
+        if mode:
+            payload["mode"] = mode
+        if files_json:
+            payload["files_json"] = files_json
+        return self._post("code_messages", payload)
 
     def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:
         """Generic helper: list rows from `table` filtered by conversation_id.

@@ -166,7 +166,7 @@ class EnrichmentDB:
                     "chunks_stored": chunks_stored,
                     "tokens_used": tokens_used,
                     "duration_seconds": duration_seconds,
-                    "flags": json.dumps(flags or []),
+                    "flags": flags or [],
                 },
             )
         except Exception as e:
