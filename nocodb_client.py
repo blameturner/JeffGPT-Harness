@@ -180,8 +180,9 @@ class NocodbClient:
         model: str = "",
         tokens_input: int = 0,
         tokens_output: int = 0,
+        response_style: str = "",
     ) -> dict:
-        return self._post("messages", {
+        payload = {
             "conversation_id": conversation_id,
             "org_id": org_id,
             "role": role,
@@ -189,7 +190,10 @@ class NocodbClient:
             "model": model,
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
-        })
+        }
+        if response_style:
+            payload["response_style"] = response_style
+        return self._post("messages", payload)
 
     # --- code conversations (mirror of chat, separate tables) ------------
 
@@ -247,6 +251,7 @@ class NocodbClient:
         tokens_output: int = 0,
         mode: str = "",
         files_json: list | None = None,
+        response_style: str = "",
     ) -> dict:
         payload = {
             "conversation_id": conversation_id,
@@ -264,6 +269,8 @@ class NocodbClient:
             payload["mode"] = mode
         if files_json:
             payload["files_json"] = files_json
+        if response_style:
+            payload["response_style"] = response_style
         return self._post("code_messages", payload)
 
     def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:

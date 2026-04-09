@@ -13,6 +13,7 @@ from rag import retrieve
 from memory import remember
 from graph import write_relationship
 from workers.web_search import run_web_search, needs_web_search
+from workers.styles import chat_style_prompt
 
 
 # --- Summarisation constants -----------------------------------------------
@@ -253,6 +254,7 @@ class ChatAgent:
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
         search_consent_declined: bool = False,
+        response_style: str | None = None,
     ) -> Iterator[dict]:
         """Yield SSE-ready event dicts for a single chat turn.
 
@@ -355,6 +357,8 @@ class ChatAgent:
                 "to allow it this turn."
             )
 
+        style_key, style_prompt = chat_style_prompt(response_style)
+
         try:
             self.db.add_message(
                 conversation_id=conversation_id,
@@ -362,6 +366,7 @@ class ChatAgent:
                 role="user",
                 content=user_message,
                 model=self.model,
+                response_style=style_key,
             )
         except Exception as e:
             print(f"[chat] user message persist failed: {e}")
@@ -385,6 +390,7 @@ class ChatAgent:
             yield summary_event
 
         payload: list[dict] = []
+        payload.append({"role": "system", "content": style_prompt})
         if system:
             payload.append({"role": "system", "content": system})
         if search_context:
@@ -446,6 +452,7 @@ class ChatAgent:
                 model=str(final_model),
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
+                response_style=style_key,
             )
         except Exception as e:
             print(f"[chat] assistant message persist failed: {e}")

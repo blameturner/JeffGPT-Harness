@@ -11,6 +11,7 @@ import requests
 from memory import remember
 from rag import retrieve
 from workers.chat_agent import ChatAgent
+from workers.styles import code_style_prompt
 
 
 PLAN_SYSTEM = (
@@ -170,8 +171,10 @@ class CodeAgent(ChatAgent):
         max_tokens: int = 8192,
         title: str | None = None,
         codebase_collection: str | None = None,
+        response_style: str | None = None,
     ) -> Iterator[dict]:
         system_prompt = _SYSTEMS[self.mode]
+        style_key, style_prompt = code_style_prompt(response_style)
 
         # --- load or create code conversation ------------------------------
         history: list[dict] = []
@@ -253,11 +256,15 @@ class CodeAgent(ChatAgent):
                     model=self.model,
                     mode=self.mode,
                     files_json=storage_files or None,
+                    response_style=style_key,
                 )
             except Exception as e:
                 print(f"[code] user message persist failed: {e}")
 
-        payload: list[dict] = [{"role": "system", "content": system_prompt}]
+        payload: list[dict] = [
+            {"role": "system", "content": style_prompt},
+            {"role": "system", "content": system_prompt},
+        ]
         if codebase_context:
             payload.append({
                 "role": "system",
@@ -310,6 +317,7 @@ class CodeAgent(ChatAgent):
                     tokens_input=tokens_input,
                     tokens_output=tokens_output,
                     mode=self.mode,
+                    response_style=style_key,
                 )
             except Exception as e:
                 print(f"[code] assistant message persist failed: {e}")

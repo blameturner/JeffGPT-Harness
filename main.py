@@ -5,6 +5,12 @@ from pydantic import BaseModel
 from workers.generator_agent import GeneratorAgent
 from workers.chat_agent import ChatAgent
 from workers.code_agent import CodeAgent
+from workers.styles import (
+    CHAT_DEFAULT_STYLE,
+    CODE_DEFAULT_STYLE,
+    list_chat_styles,
+    list_code_styles,
+)
 from config import MODELS, refresh_models
 from nocodb_client import NocodbClient
 from contextlib import asynccontextmanager
@@ -105,6 +111,7 @@ class ChatRequest(BaseModel):
     knowledge_enabled: bool | None = None
     search_enabled: bool = False
     search_consent_declined: bool = False
+    response_style: str | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -122,6 +129,7 @@ class CodeRequest(BaseModel):
     conversation_id: int | None = None
     title: str | None = None
     codebase_collection: str | None = None
+    response_style: str | None = None
     temperature: float = 0.2
     max_tokens: int = 8192
 
@@ -145,6 +153,31 @@ def list_models():
             "url": entry.get("url"),
         })
     return {"models": models}
+
+
+@app.get("/styles")
+def get_styles(surface: str | None = None):
+    """Return the catalogue of response styles.
+
+    Query param:
+      surface=chat  → only chat styles
+      surface=code  → only code styles
+      (omitted)     → both
+
+    Response shape:
+      {
+        "chat":    {"default": "general", "styles": [{"key": "...", "prompt": "..."}, ...]},
+        "code":    {"default": "review",  "styles": [...]}
+      }
+    """
+    out: dict = {}
+    if surface in (None, "chat"):
+        out["chat"] = {"default": CHAT_DEFAULT_STYLE, "styles": list_chat_styles()}
+    if surface in (None, "code"):
+        out["code"] = {"default": CODE_DEFAULT_STYLE, "styles": list_code_styles()}
+    if not out:
+        raise HTTPException(status_code=400, detail="surface must be 'chat' or 'code'")
+    return out
 
 
 @app.post("/chat")
@@ -171,6 +204,7 @@ def chat(request: ChatRequest):
                 rag_collection=request.rag_collection,
                 knowledge_enabled=request.knowledge_enabled,
                 search_consent_declined=request.search_consent_declined,
+                response_style=request.response_style,
             ):
                 yield _sse(event)
         except Exception as e:
@@ -203,6 +237,7 @@ def code(request: CodeRequest):
                 max_tokens=request.max_tokens,
                 title=request.title,
                 codebase_collection=request.codebase_collection,
+                response_style=request.response_style,
             ):
                 yield _sse(event)
         except Exception as e:
