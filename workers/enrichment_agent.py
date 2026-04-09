@@ -1,11 +1,4 @@
-"""Autonomous enrichment pipeline.
 
-Runs on a schedule from `scheduler.py`. For each active scrape_target that is
-due, fetches the page, validates it, summarises it with the fast model, stores
-the summary in a category-scoped ChromaDB collection, extracts up to 15 entity
-relationships into FalkorDB, and analyses the content for new sources worth
-monitoring. Every step is logged to the `enrichment_log` Nocodb table.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -40,11 +33,6 @@ ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser] = {}
 
 
 class EnrichmentDB:
-    """Narrow Nocodb client for the enrichment tables.
-
-    Kept separate from NocodbClient because the query patterns (ordering,
-    aggregation, upserts on unique URL) don't fit that client's shape.
-    """
 
     def __init__(self) -> None:
         self.base = f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}"
@@ -99,10 +87,10 @@ class EnrichmentDB:
         r.raise_for_status()
 
     def list_orgs(self) -> list[dict]:
-        # Single-tenant fallback when the organisations table is absent.
-        if "organisations" not in self.tables:
+        # Single-tenant fallback when the organisation table is absent.
+        if "organisation" not in self.tables:
             return [{"Id": 1}]
-        return self._get("organisations", params={"limit": 500}).get("list", [])
+        return self._get("organisation", params={"limit": 500}).get("list", [])
 
     def has_running_inferences(self) -> bool:
         if "agent_runs" not in self.tables:
@@ -117,7 +105,7 @@ class EnrichmentDB:
         data = self._get(
             "scrape_targets",
             params={
-                "where": f"(org_id,eq,{org_id})~and(active,eq,true)",
+                "where": f"(org_id,eq,{org_id})~and(active,eq,1)",
                 "limit": 500,
             },
         )
@@ -616,16 +604,29 @@ def run_enrichment_cycle() -> None:
     try:
         orgs = db.list_orgs()
     except Exception as e:
-        print(f"[enrichment] list_orgs failed: {e}")
+        db.log_event(cycle_id, "org_list_failed", message=str(e)[:500])
         orgs = [{"Id": 1}]
+
+    if not orgs:
+        db.log_event(cycle_id, "no_orgs", message="list_orgs returned empty")
 
     for org in orgs:
         org_id = int(org.get("Id") or org.get("id") or 1)
         try:
             sources = db.list_due_sources(org_id)
         except Exception as e:
-            print(f"[enrichment] list_due_sources failed for org {org_id}: {e}")
+            db.log_event(
+                cycle_id, "sources_query_failed",
+                org_id=org_id, message=str(e)[:500],
+            )
             continue
+
+        if not sources:
+            db.log_event(
+                cycle_id, "no_sources_due",
+                org_id=org_id,
+                message="list_due_sources returned 0 rows",
+            )
 
         for source in sources:
             remaining = ENRICHMENT_TOKEN_BUDGET - tokens_used

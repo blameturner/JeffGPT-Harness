@@ -36,7 +36,7 @@ def _fetch_agent_schedules() -> list[dict]:
         data = requests.get(
             f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}/{tables['agent_schedules']}",
             headers={"xc-token": NOCODB_TOKEN},
-            params={"where": "(active,eq,true)", "limit": 500},
+            params={"where": "(active,eq,1)", "limit": 500},
             timeout=10,
         )
         data.raise_for_status()
