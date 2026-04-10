@@ -483,7 +483,7 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
     for r in raw_results:
         if len(summaries) >= MAX_SOURCES:
             break
-        text = scrape_page(r["url"], snippet=r.get("snippet", ""), source={"playwright_fallback": True})
+        text = scrape_page(r["url"], snippet=r.get("snippet", ""))
         if not text:
             continue
         summary = summarise_page(text, query)
@@ -517,8 +517,11 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
     sources = [f"{title}: {url}" for title, url, _ in summaries]
     _log.info("search done   queries=%d candidates=%d summaries=%d", len(queries), len(raw_results), len(summaries))
 
-    # Evaluate search results as potential ongoing monitoring targets
-    _suggest_sources_from_search(summaries, query, org_id)
+    threading.Thread(
+        target=_suggest_sources_from_search,
+        args=(summaries, query, org_id),
+        daemon=True,
+    ).start()
 
     return context_block, sources
 

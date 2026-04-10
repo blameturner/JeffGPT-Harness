@@ -734,6 +734,195 @@ def enrichment_agent_status(agent_id: int):
     }
 
 
+class SourceCreate(BaseModel):
+    org_id: int
+    url: str
+    name: str
+    category: str = "documentation"
+    frequency_hours: float = 24
+    active: bool = True
+    enrichment_agent_id: int | None = None
+    use_playwright: bool = False
+    playwright_fallback: bool = False
+
+
+class SourceUpdate(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    category: str | None = None
+    frequency_hours: float | None = None
+    active: bool | None = None
+    enrichment_agent_id: int | None = None
+    use_playwright: bool | None = None
+    playwright_fallback: bool | None = None
+
+
+@app.get("/enrichment/sources")
+def list_sources(org_id: int, agent_id: int | None = None, active_only: bool = False):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return {"sources": db.list_sources(org_id, enrichment_agent_id=agent_id, active_only=active_only)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/sources")
+def create_source(body: SourceCreate):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return db.create_source(body.model_dump())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/enrichment/sources/{source_id}")
+def get_source(source_id: int):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        source = db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        return source
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/enrichment/sources/{source_id}")
+def update_source(source_id: int, body: SourceUpdate):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        if not updates:
+            return db.get_source(source_id)
+        db.update_scrape_target(source_id, **updates)
+        return db.get_source(source_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/enrichment/sources/{source_id}")
+def delete_source(source_id: int):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        db.delete_source(source_id)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/sources/{source_id}/flush")
+def flush_source(source_id: int):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return db.flush_source(source_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/enrichment/sources/{source_id}/log")
+def source_log(source_id: int, limit: int = 50):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return {"log": db.list_log(scrape_target_id=source_id, limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/enrichment/log")
+def enrichment_log(org_id: int | None = None, limit: int = 100):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return {"log": db.list_log(org_id=org_id, limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SuggestionUpdate(BaseModel):
+    status: str | None = None
+
+
+@app.get("/enrichment/suggestions")
+def list_suggestions(org_id: int, status: str | None = None):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return {"suggestions": db.list_suggestions(org_id, status=status)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/enrichment/suggestions/{suggestion_id}")
+def get_suggestion(suggestion_id: int):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        suggestion = db.get_suggestion(suggestion_id)
+        if not suggestion:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        return suggestion
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/enrichment/suggestions/{suggestion_id}")
+def update_suggestion(suggestion_id: int, body: SuggestionUpdate):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        if not updates:
+            return db.get_suggestion(suggestion_id)
+        return db.update_suggestion(suggestion_id, updates)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SuggestionApprove(BaseModel):
+    enrichment_agent_id: int | None = None
+
+
+@app.post("/enrichment/suggestions/{suggestion_id}/approve")
+def approve_suggestion(suggestion_id: int, body: SuggestionApprove | None = None):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        suggestion = db.get_suggestion(suggestion_id)
+        if not suggestion:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        org_id = int(suggestion.get("org_id") or 1)
+        agent_id = body.enrichment_agent_id if body else None
+        source = db.approve_suggestion(suggestion_id, org_id, enrichment_agent_id=agent_id)
+        return {"ok": True, "source": source}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/suggestions/{suggestion_id}/reject")
+def reject_suggestion(suggestion_id: int):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return db.update_suggestion(suggestion_id, {"status": "rejected"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=3800, reload=True)

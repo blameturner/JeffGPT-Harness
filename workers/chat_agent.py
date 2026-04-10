@@ -348,6 +348,10 @@ class ChatAgent:
                 needs, reason = False, ""
             if needs:
                 _log.info("search consent required — pausing turn  conv=%s reason=%s", conversation_id, reason)
+                try:
+                    self.db.update_conversation(conversation_id, {"status": "awaiting_consent"})
+                except Exception:
+                    pass
                 emit({
                     "type": "search_consent_required",
                     "query": user_message,

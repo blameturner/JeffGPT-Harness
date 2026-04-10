@@ -135,6 +135,99 @@ class EnrichmentDB:
     def update_enrichment_agent(self, agent_id: int, data: dict) -> dict:
         return self._patch("enrichment_agents", agent_id, data)
 
+    def list_sources(self, org_id: int, enrichment_agent_id: int | None = None, active_only: bool = False) -> list[dict]:
+        where = f"(org_id,eq,{org_id})"
+        if enrichment_agent_id is not None:
+            where += f"~and(enrichment_agent_id,eq,{enrichment_agent_id})"
+        if active_only:
+            where += "~and(active,eq,1)"
+        return self._get(
+            "scrape_targets",
+            params={"where": where, "limit": 500, "sort": "-CreatedAt"},
+        ).get("list", [])
+
+    def get_source(self, source_id: int) -> dict | None:
+        try:
+            r = requests.get(
+                f"{self.base}/{self.tables['scrape_targets']}/{source_id}",
+                headers=self.headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    def create_source(self, data: dict) -> dict:
+        return self._post("scrape_targets", data)
+
+    def delete_source(self, source_id: int) -> None:
+        self._delete("scrape_targets", source_id)
+
+    def flush_source(self, source_id: int) -> dict:
+        return self._patch("scrape_targets", source_id, {
+            "content_hash": None,
+            "last_scraped_at": None,
+            "status": None,
+            "chunk_count": 0,
+        })
+
+    def list_log(
+        self,
+        org_id: int | None = None,
+        scrape_target_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        where_parts: list[str] = []
+        if org_id is not None:
+            where_parts.append(f"(org_id,eq,{org_id})")
+        if scrape_target_id is not None:
+            where_parts.append(f"(scrape_target_id,eq,{scrape_target_id})")
+        params: dict = {"sort": "-CreatedAt", "limit": limit}
+        if where_parts:
+            params["where"] = "~and".join(where_parts)
+        return self._get("enrichment_log", params=params).get("list", [])
+
+    def list_suggestions(self, org_id: int, status: str | None = None) -> list[dict]:
+        where = f"(org_id,eq,{org_id})"
+        if status:
+            where += f"~and(status,eq,{status})"
+        return self._get(
+            "suggested_scrape_targets",
+            params={"where": where, "limit": 500, "sort": "-CreatedAt"},
+        ).get("list", [])
+
+    def get_suggestion(self, suggestion_id: int) -> dict | None:
+        try:
+            r = requests.get(
+                f"{self.base}/{self.tables['suggested_scrape_targets']}/{suggestion_id}",
+                headers=self.headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    def update_suggestion(self, suggestion_id: int, data: dict) -> dict:
+        return self._patch("suggested_scrape_targets", suggestion_id, data)
+
+    def approve_suggestion(self, suggestion_id: int, org_id: int, enrichment_agent_id: int | None = None) -> dict:
+        suggestion = self.get_suggestion(suggestion_id)
+        if not suggestion:
+            raise ValueError("suggestion not found")
+        source = self.create_source({
+            "org_id": org_id,
+            "url": suggestion.get("url"),
+            "name": suggestion.get("name"),
+            "category": suggestion.get("category"),
+            "active": True,
+            "frequency_hours": 24,
+            "enrichment_agent_id": enrichment_agent_id,
+        })
+        self.update_suggestion(suggestion_id, {"status": "approved"})
+        return source
+
     def list_tracked_urls(self, org_id: int) -> set[str]:
         """Return all URLs already tracked or pending suggestion for an org."""
         tracked = self._get(
