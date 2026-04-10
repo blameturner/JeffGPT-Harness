@@ -235,7 +235,7 @@ def _get_browser():
         from playwright.sync_api import sync_playwright
         _pw_instance = sync_playwright().start()
         _pw_browser = _pw_instance.chromium.launch(headless=True)
-        _log.info("playwright chromium launched (pid=%s)", _pw_browser.contexts)
+        _log.info("playwright chromium launched")
         return _pw_browser
 
 
