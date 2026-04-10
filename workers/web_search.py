@@ -244,6 +244,21 @@ _pw_instance = None
 _pw_browser = None
 
 
+def _sanitise_url(url: str) -> str:
+    """Strip fragments and dangerous characters from a URL before navigating."""
+    parsed = urlparse(url)
+    clean = parsed._replace(fragment="")
+    return clean.geturl()
+
+
+_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+window.chrome = {runtime: {}};
+"""
+
+
 def _get_browser():
     """Lazy singleton — launches Chromium once, reuses across all fetches."""
     global _pw_instance, _pw_browser
@@ -254,7 +269,20 @@ def _get_browser():
             return _pw_browser
         from playwright.sync_api import sync_playwright
         _pw_instance = sync_playwright().start()
-        _pw_browser = _pw_instance.chromium.launch(headless=True)
+        _pw_browser = _pw_instance.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-extensions",
+                "--disable-gpu",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+            ],
+        )
         _log.info("playwright chromium launched")
         return _pw_browser
 
@@ -264,6 +292,7 @@ def playwright_fetch(url: str) -> str:
     if not _is_safe_url(url):
         _log.warning("playwright_fetch blocked unsafe url %s", url[:120])
         return ""
+    url = _sanitise_url(url)
     started = time.time()
     try:
         browser = _get_browser()
@@ -271,19 +300,29 @@ def playwright_fetch(url: str) -> str:
             user_agent=BROWSER_UA,
             viewport={"width": 1280, "height": 800},
             java_script_enabled=True,
+            service_workers="block",
+            permissions=[],
+            accept_downloads=False,
+            locale="en-US",
+            timezone_id="America/New_York",
         )
         try:
             page = context.new_page()
+            page.add_init_script(_STEALTH_SCRIPT)
+
+            _allowed_types = {"document", "stylesheet", "font", "image", "script", "xhr", "fetch"}
             page.route("**/*", lambda route: (
-                route.continue_() if route.request.resource_type in
-                ("document", "stylesheet", "font", "image", "script", "xhr", "fetch")
+                route.continue_() if route.request.resource_type in _allowed_types
                 else route.abort()
             ))
+
             page.goto(url, wait_until="networkidle", timeout=30_000)
+
             final_url = page.url
             if not _is_safe_url(final_url):
                 _log.warning("playwright_fetch blocked redirect to %s", final_url[:120])
                 return ""
+
             text = page.inner_text("body")
             text = _strip_injection_patterns(text)[:PER_PAGE_CHAR_CAP]
             elapsed = round(time.time() - started, 2)
