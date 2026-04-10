@@ -175,6 +175,7 @@ class CodeAgent(ChatAgent):
         title: str | None = None,
         codebase_collection: str | None = None,
         response_style: str | None = None,
+        knowledge_enabled: bool | None = None,
     ) -> None:
         from workers.jobs import STORE
 
@@ -193,6 +194,7 @@ class CodeAgent(ChatAgent):
                     model=self.model,
                     title=(title or user_message)[:80],
                     mode=self.mode,
+                    knowledge_enabled=bool(knowledge_enabled),
                 )
                 conversation_id = convo["Id"]
                 is_new = True
@@ -216,6 +218,9 @@ class CodeAgent(ChatAgent):
                 _log.error("load code conversation failed", exc_info=True)
                 emit({"type": "error", "message": "failed to load conversation"})
                 return
+
+        convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
+        _log.info("code conversation flags  conv=%s knowledge=%s mode=%s", conversation_id, convo_knowledge, self.mode)
 
         if conversation_id is not None and not is_new:
             try:
@@ -297,7 +302,7 @@ class CodeAgent(ChatAgent):
                 try:
                     self.db.update_code_conversation(conversation_id, {"status": "error"})
                 except Exception:
-                    pass
+                    _log.warning("status update to error failed  conv=%s", conversation_id)
             emit({"type": "error", "message": "model call failed"})
             return
 
@@ -333,6 +338,18 @@ class CodeAgent(ChatAgent):
                 )
             except Exception:
                 _log.error("memory write failed", exc_info=True)
+
+        if convo_knowledge and output:
+            try:
+                remember(
+                    text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
+                    metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
+                    org_id=self.org_id,
+                    collection_name="code_knowledge",
+                )
+            except Exception:
+                _log.error("code_knowledge write failed", exc_info=True)
+            self._extract_and_write_graph(user_message, output, conversation_id)
 
         checklist_steps = None
         if self.mode == "plan" and output:

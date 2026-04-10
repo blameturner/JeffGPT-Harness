@@ -341,7 +341,7 @@ def _check_robots(url: str) -> bool:
 
 
 def _validate_content(text: str) -> tuple[bool, str, int]:
-    """Gate: prompt injection / AI slop / implausible claims. Returns (ok, reason, tokens)."""
+    _log.debug("validating content  text_len=%d", len(text))
     prompt = (
         "You are a content safety gate. Respond with a single JSON object: "
         '{"ok": true|false, "reason": "<short phrase>"}. '
@@ -352,27 +352,38 @@ def _validate_content(text: str) -> tuple[bool, str, int]:
     )
     raw, tokens = _fast_call(prompt, max_tokens=80)
     if not raw:
+        _log.warning("validator unavailable, passing content through")
         return True, "validator_unavailable", 0
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         obj = json.loads(cleaned)
-        return bool(obj.get("ok")), str(obj.get("reason", ""))[:200], tokens
+        ok = bool(obj.get("ok"))
+        reason = str(obj.get("reason", ""))[:200]
+        _log.info("validate  ok=%s reason=%s tokens=%d", ok, reason, tokens)
+        return ok, reason, tokens
     except Exception:
+        _log.warning("validator response unparseable: %s", raw[:200])
         return True, "validator_unparseable", tokens
 
 
 def _summarise(text: str) -> tuple[str, int]:
+    _log.debug("summarise  text_len=%d", len(text))
     prompt = (
         "Summarise the following page for a knowledge base. Be factual, "
         "≤ 250 words, preserve key names, numbers, dates, and verbatim "
         "quotes where notable.\n\n"
         f"PAGE:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
     )
-    return _fast_call(prompt, max_tokens=300)
+    summary, tokens = _fast_call(prompt, max_tokens=300)
+    if summary:
+        _log.info("summarise ok  summary_len=%d tokens=%d", len(summary), tokens)
+    else:
+        _log.warning("summarise returned empty  tokens=%d", tokens)
+    return summary, tokens
 
 
 def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
-    """Extract up to 15 (subject, relation, object) triples and write to FalkorDB."""
+    _log.debug("extracting relationships  org=%d text_len=%d", org_id, len(text))
     prompt = (
         "Extract up to 15 factual entity relationships from the content as "
         'a JSON array of objects with keys: from_type, from_name, relationship, '
@@ -382,15 +393,19 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
     )
     raw, tokens = _fast_call(prompt, max_tokens=600)
     if not raw:
+        _log.warning("relationship extraction returned empty  tokens=%d", tokens)
         return 0, tokens
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         triples = json.loads(cleaned)
     except Exception:
+        _log.warning("relationship extraction unparseable: %s", raw[:200])
         return 0, tokens
     if not isinstance(triples, list):
+        _log.warning("relationship extraction returned non-list: %s", type(triples).__name__)
         return 0, tokens
 
+    _log.debug("extracted %d relationship candidates", len(triples))
     written = 0
     for t in triples[:15]:
         try:
@@ -403,8 +418,9 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
                 to_name=str(t["to_name"]),
             )
             written += 1
-        except Exception as e:
-            _log.error("relationship write failed", exc_info=True)
+        except Exception:
+            _log.error("relationship write failed  triple=%s", t, exc_info=True)
+    _log.info("relationships written  %d/%d  org=%d", written, len(triples[:15]), org_id)
     return written, tokens
 
 
@@ -415,6 +431,7 @@ def _discover_sources(
     cycle_id: str,
     db: EnrichmentDB,
 ) -> int:
+    _log.debug("discovering sources from %s  org=%d", source_url[:80], org_id)
     prompt = (
         "Analyse the content for up to 5 NEW external sources worth "
         "monitoring for ongoing updates (documentation sites, blogs, "
@@ -426,15 +443,19 @@ def _discover_sources(
     )
     raw, tokens = _fast_call(prompt, max_tokens=500)
     if not raw:
+        _log.debug("discover_sources returned empty from %s", source_url[:80])
         return tokens
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         items = json.loads(cleaned)
     except Exception:
+        _log.warning("discover_sources unparseable from %s: %s", source_url[:80], raw[:200])
         return tokens
     if not isinstance(items, list):
+        _log.warning("discover_sources non-list from %s", source_url[:80])
         return tokens
 
+    recorded = 0
     for item in items[:5]:
         try:
             score = int(item.get("confidence_score") or 0)
@@ -444,10 +465,12 @@ def _discover_sources(
             category = str(item.get("category") or "").lower()
             if category not in CATEGORY_COLLECTIONS:
                 continue
+            url = str(item.get("url") or "")
+            _log.debug("suggesting source  url=%s category=%s score=%d from=%s", url[:80], category, score, source_url[:60])
             db.record_suggestion(
                 org_id=org_id,
-                url=str(item["url"]),
-                name=str(item.get("name") or item["url"]),
+                url=url,
+                name=str(item.get("name") or url),
                 category=category,
                 reason=str(item.get("reason") or ""),
                 confidence=confidence,
@@ -455,8 +478,10 @@ def _discover_sources(
                 suggested_by_url=source_url,
                 suggested_by_cycle=cycle_id,
             )
-        except Exception as e:
+            recorded += 1
+        except Exception:
             _log.error("suggestion record failed", exc_info=True)
+    _log.info("discover_sources  from=%s candidates=%d recorded=%d", source_url[:80], len(items), recorded)
     return tokens
 
 

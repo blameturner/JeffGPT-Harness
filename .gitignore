@@ -3,7 +3,6 @@
 .env.*
 .venv/
 venv/
-.idea/
 __pycache__/
 *.pyc
 *.pyo
@@ -13,6 +12,7 @@ __pycache__/
 dist/
 build/
 .DS_Store
-
-.idea/*
+.claude
 */.idea
+*.idea
+.idea/*

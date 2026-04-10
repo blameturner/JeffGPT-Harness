@@ -15,10 +15,10 @@ client = chromadb.HttpClient(
     host=parsed.hostname if parsed else "localhost",
     port=parsed.port if parsed else 8000,
 )
+_log.info("chroma client  host=%s port=%s", parsed.hostname if parsed else "localhost", parsed.port if parsed else 8000)
 
 def get_collection(org_id: int, name: str):
     scoped = scoped_collection(org_id, name)
-    _log.debug("get_collection %s", scoped)
     return client.get_or_create_collection(scoped)
 
 def remember(text: str, metadata: dict, org_id: int, collection_name: str = "agent_outputs") -> list[str]:
@@ -27,7 +27,7 @@ def remember(text: str, metadata: dict, org_id: int, collection_name: str = "age
 
     chunks = chunk_text(text)
     scoped = scoped_collection(org_id, collection_name)
-    _log.debug("remember  collection=%s chunks=%d text_len=%d", scoped, len(chunks), len(text))
+    _log.info("remember  collection=%s chunks=%d text_len=%d", scoped, len(chunks), len(text))
     collection = get_collection(org_id, collection_name)
     ids = []
 
@@ -35,7 +35,7 @@ def remember(text: str, metadata: dict, org_id: int, collection_name: str = "age
         try:
             vector = embed(chunk)
         except Exception:
-            _log.warning("embed failed  collection=%s chunk=%d/%d len=%d, skipping", scoped, i, len(chunks), len(chunk.split()))
+            _log.warning("embed failed  collection=%s chunk=%d/%d words=%d, skipping", scoped, i, len(chunks), len(chunk.split()))
             continue
         chunk_id = str(uuid.uuid4())
         try:
@@ -49,10 +49,12 @@ def remember(text: str, metadata: dict, org_id: int, collection_name: str = "age
         except Exception:
             _log.error("chroma add failed  collection=%s chunk=%d/%d", scoped, i, len(chunks), exc_info=True)
 
-    _log.debug("remember ok  collection=%s stored=%d/%d", scoped, len(ids), len(chunks))
+    _log.info("remember ok  collection=%s stored=%d/%d", scoped, len(ids), len(chunks))
     return ids
 
 def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_results: int = 5) -> list[dict]:
+    scoped = scoped_collection(org_id, collection_name)
+    _log.debug("recall  collection=%s n_results=%d query=%s", scoped, n_results, query[:80])
     collection = get_collection(org_id, collection_name)
     vector = embed(query)
 
@@ -69,5 +71,5 @@ def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_re
             "distance": results["distances"][0][i],
         })
 
-    _log.debug("recall  collection=%s results=%d", scoped_collection(org_id, collection_name), len(output))
+    _log.info("recall ok  collection=%s returned=%d", scoped, len(output))
     return output

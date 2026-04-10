@@ -25,9 +25,11 @@ class NocodbClient:
                 )
                 response.raise_for_status()
                 tables = response.json()["list"]
-                return {table["title"]: table["id"] for table in tables}
+                table_map = {table["title"]: table["id"] for table in tables}
+                _log.debug("tables loaded  count=%d", len(table_map))
+                return table_map
             except Exception:
-                _log.warning("nocodb not ready, retrying (%d/15)", attempt + 1)
+                _log.warning("not ready, retrying (%d/15)", attempt + 1)
                 time.sleep(2)
         raise RuntimeError("Could not connect to Nocodb after 30 seconds")
 
@@ -42,22 +44,30 @@ class NocodbClient:
         return response.json()
 
     def _post(self, table: str, data: dict) -> dict:
+        _log.debug("db write  %s", table)
         response = requests.post(
             f"{self.url}/{self.tables[table]}",
             headers=self.headers,
             json=data,
             timeout=10
         )
+        if response.status_code >= 400:
+            _log.error("db write %s failed  %d: %s", table, response.status_code, response.text[:300])
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+        _log.debug("db write ok  %s id=%s", table, result.get("Id"))
+        return result
 
     def _patch(self, table: str, row_id: int, data: dict) -> dict:
+        _log.debug("db update  %s/%d", table, row_id)
         response = requests.patch(
             f"{self.url}/{self.tables[table]}/{row_id}",
             headers=self.headers,
             json=data,
             timeout=10
         )
+        if response.status_code >= 400:
+            _log.error("db update %s/%d failed  %d: %s", table, row_id, response.status_code, response.text[:300])
         response.raise_for_status()
         return response.json()
 
@@ -66,7 +76,9 @@ class NocodbClient:
             "where": f"(org_id,eq,{org_id})~and(deleted_at,is,null)",
             "limit": limit,
         })
-        return data.get("list", [])
+        rows = data.get("list", [])
+        _log.debug("list_agents  org=%d count=%d", org_id, len(rows))
+        return rows
 
     def get_agent(self, name: str, org_id: int) -> dict | None:
         data = self._get("agents", params={
@@ -74,11 +86,12 @@ class NocodbClient:
             "limit": 1
         })
         records = data.get("list", [])
-        if not records:
-            return None
-        return records[0]
+        found = records[0] if records else None
+        _log.debug("get_agent  name=%s org=%d found=%s", name, org_id, bool(found))
+        return found
 
     def create_run(self, agent: dict, org_id: int, task_description: str, product: str) -> dict:
+        _log.info("create_run  agent=%s org=%d", agent.get("name"), org_id)
         return self._post("agent_runs", {
             "agent_id": agent["Id"],
             "agent_name": agent["name"],
@@ -101,6 +114,7 @@ class NocodbClient:
         quality_score: int,
         model_name: str
     ) -> dict:
+        _log.info("complete_run  id=%d tokens_in=%d tokens_out=%d %.1fs", run_id, tokens_input, tokens_output, duration_seconds)
         return self._patch("agent_runs", run_id, {
             "status": "complete",
             "summary": summary,
@@ -113,12 +127,14 @@ class NocodbClient:
         })
 
     def fail_run(self, run_id: int, error_message: str) -> dict:
+        _log.warning("fail_run  id=%d error=%s", run_id, error_message[:200])
         return self._patch("agent_runs", run_id, {
             "status": "failed",
             "error_message": error_message
         })
 
     def save_output(self, run: dict, full_text: str, chroma_ids: list) -> dict:
+        _log.debug("save_output  run=%d text_len=%d chroma_ids=%d", run["Id"], len(full_text), len(chroma_ids))
         return self._post("agent_outputs", {
             "run_id": run["Id"],
             "agent_id": run["agent_id"],
@@ -136,13 +152,16 @@ class NocodbClient:
         title: str = "",
         rag_enabled: bool = False,
         rag_collection: str | None = None,
+        knowledge_enabled: bool = False,
     ) -> dict:
+        _log.info("create_conversation  org=%d model=%s title=%s rag=%s knowledge=%s", org_id, model, title[:40], rag_enabled, knowledge_enabled)
         return self._post("conversations", {
             "org_id": org_id,
             "model": model,
             "title": title or "New chat",
             "rag_enabled": 1 if rag_enabled else 0,
             "rag_collection": rag_collection or "",
+            "knowledge_enabled": 1 if knowledge_enabled else 0,
         })
 
     def get_conversation(self, conversation_id: int) -> dict | None:
@@ -154,8 +173,7 @@ class NocodbClient:
         return records[0] if records else None
 
     def update_conversation(self, conversation_id: int, data: dict) -> dict:
-        payload = {"Id": conversation_id, **data}
-        return self._patch("conversations", conversation_id, payload)
+        return self._patch("conversations", conversation_id, {"Id": conversation_id, **data})
 
     def list_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
         data = self._get("conversations", params={
@@ -184,6 +202,7 @@ class NocodbClient:
         tokens_output: int = 0,
         response_style: str = "",
     ) -> dict:
+        _log.info("add_message  conv=%d role=%s model=%s content_len=%d", conversation_id, role, model, len(content))
         payload = {
             "conversation_id": conversation_id,
             "org_id": org_id,
@@ -203,13 +222,16 @@ class NocodbClient:
         model: str,
         title: str = "",
         mode: str = "plan",
+        knowledge_enabled: bool = False,
     ) -> dict:
+        _log.info("create_code_conversation  org=%d model=%s mode=%s knowledge=%s title=%s", org_id, model, mode, knowledge_enabled, title[:40])
         return self._post("code_conversations", {
             "org_id": org_id,
             "model": model,
             "title": title or "New code session",
             "rag_enabled": 0,
             "rag_collection": mode,
+            "knowledge_enabled": 1 if knowledge_enabled else 0,
         })
 
     def get_code_conversation(self, conversation_id: int) -> dict | None:
@@ -221,8 +243,7 @@ class NocodbClient:
         return records[0] if records else None
 
     def update_code_conversation(self, conversation_id: int, data: dict) -> dict:
-        payload = {"Id": conversation_id, **data}
-        return self._patch("code_conversations", conversation_id, payload)
+        return self._patch("code_conversations", conversation_id, {"Id": conversation_id, **data})
 
     def list_code_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
         data = self._get("code_conversations", params={
@@ -253,6 +274,7 @@ class NocodbClient:
         files_json: list | None = None,
         response_style: str = "",
     ) -> dict:
+        _log.info("add_code_message  conv=%d role=%s mode=%s content_len=%d", conversation_id, role, mode, len(content))
         payload = {
             "conversation_id": conversation_id,
             "org_id": org_id,
@@ -271,10 +293,6 @@ class NocodbClient:
         return self._post("code_messages", payload)
 
     def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:
-        """Generic helper: list rows from `table` filtered by conversation_id.
-
-        Returns [] if the column doesn't exist on that table yet.
-        """
         try:
             data = self._get(table, params={
                 "where": f"(conversation_id,eq,{conversation_id})",
@@ -282,6 +300,7 @@ class NocodbClient:
             })
             return data.get("list", [])
         except (requests.HTTPError, KeyError):
+            _log.debug("_list_by_conversation  table=%s conv=%d returned empty (table may lack column)", table, conversation_id)
             return []
 
     def list_runs_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
@@ -301,6 +320,7 @@ class NocodbClient:
             })
             return data.get("list", [])
         except requests.HTTPError:
+            _log.debug("list_observations  conv=%d returned empty (table may lack column)", conversation_id)
             return []
 
     def save_observation(
@@ -312,6 +332,7 @@ class NocodbClient:
         domain: str,
         confidence: str = "medium"
     ) -> dict:
+        _log.debug("save_observation  run=%d type=%s domain=%s", run["Id"], obs_type, domain)
         return self._post("observations", {
             "title": title,
             "content": content,

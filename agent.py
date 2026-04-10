@@ -30,8 +30,9 @@ class Agent:
 
         self.config = self.db.get_agent(agent_name, org_id)
         if not self.config:
+            _log.error("agent not found  name=%s org=%d", agent_name, org_id)
             raise ValueError(f"Agent {agent_name} not found on org {org_id}")
-        assert self.config is not None
+        _log.info("agent loaded  name=%s org=%d model=%s", agent_name, org_id, self.config.get("model"))
 
     def _get_model_url(self) -> str:
         model_key = self.config["model"].lower()
@@ -157,6 +158,7 @@ class Agent:
         yield {"type": "done", "usage": final_usage, "model": final_model}
 
     def run(self, task: str, product: str = "") -> RunResult:
+        _log.info("run  agent=%s task=%s", self.agent_name, task[:100])
         context = ""
         context_tokens = 0
 

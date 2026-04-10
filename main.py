@@ -51,11 +51,14 @@ async def health():
 
 @app.post("/run")
 def run_agent(request: RunRequest):
+    _log.info("POST /run  agent=%s org=%d", request.agent_name, request.org_id)
     try:
         agent = GeneratorAgent(request.agent_name, request.org_id)
         result = agent.run(request.task, request.product)
         if result is None:
+            _log.warning("POST /run  agent=%s produced no output", request.agent_name)
             raise HTTPException(status_code=500, detail="Agent ran but failed to produce output")
+        _log.info("POST /run ok  agent=%s", request.agent_name)
         return {
             "success": True,
             "agent": request.agent_name,
@@ -65,12 +68,16 @@ def run_agent(request: RunRequest):
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        _log.error("POST /run failed  agent=%s", request.agent_name, exc_info=True)
+        raise HTTPException(status_code=500, detail="internal error")
 
 
 @app.post("/run/stream")
 def run_agent_stream(request: RunRequest):
+    _log.info("POST /run/stream  agent=%s org=%d", request.agent_name, request.org_id)
     try:
         agent = GeneratorAgent(request.agent_name, request.org_id)
     except ValueError as e:
@@ -117,6 +124,7 @@ class CodeRequest(BaseModel):
     title: str | None = None
     codebase_collection: str | None = None
     response_style: str | None = None
+    knowledge_enabled: bool | None = None
     temperature: float = 0.2
     max_tokens: int = 8192
 
@@ -156,6 +164,7 @@ def get_styles(surface: str | None = None):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    _log.info("POST /chat  model=%s org=%d conv=%s search=%s", request.model, request.org_id, request.conversation_id, request.search_enabled)
     try:
         agent = ChatAgent(
             model=request.model,
@@ -183,6 +192,7 @@ def chat(request: ChatRequest):
 
 @app.post("/code")
 def code(request: CodeRequest):
+    _log.info("POST /code  model=%s org=%d mode=%s conv=%s", request.model, request.org_id, request.mode, request.conversation_id)
     try:
         agent = CodeAgent(
             model=request.model,
@@ -203,8 +213,140 @@ def code(request: CodeRequest):
         title=request.title,
         codebase_collection=request.codebase_collection,
         response_style=request.response_style,
+        knowledge_enabled=request.knowledge_enabled,
     ))
     return {"job_id": job.id}
+
+
+@app.get("/collections")
+def list_collections(org_id: int | None = None):
+    from memory import client
+    try:
+        cols = client.list_collections()
+        result = []
+        for c in cols:
+            name = c.name
+            count = c.count()
+            if org_id is not None and not name.startswith(f"org_{org_id}_"):
+                continue
+            result.append({"name": name, "records": count})
+        return {"collections": sorted(result, key=lambda x: x["name"])}
+    except Exception as e:
+        _log.error("list_collections failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CodebaseCreate(BaseModel):
+    org_id: int
+    name: str
+    description: str | None = None
+
+
+class CodebaseFileUpload(BaseModel):
+    files: list[dict]
+
+
+@app.get("/codebases")
+def list_codebases(org_id: int):
+    from memory import client
+    try:
+        db = NocodbClient()
+        prefix = f"org_{org_id}_codebase_"
+        codebases = []
+        if "knowledge_sources" in db.tables:
+            rows = db._get("knowledge_sources", params={
+                "where": f"(org_id,eq,{org_id})~and(type,eq,codebase)",
+                "limit": 200,
+            }).get("list", [])
+            for row in rows:
+                collection_name = row.get("collection_name") or ""
+                record_count = 0
+                try:
+                    col = client.get_or_create_collection(collection_name)
+                    record_count = col.count()
+                except Exception:
+                    pass
+                codebases.append({
+                    "id": row["Id"],
+                    "name": row.get("name"),
+                    "description": row.get("description"),
+                    "collection_name": collection_name,
+                    "records": record_count,
+                    "source": row.get("source"),
+                    "created_at": row.get("CreatedAt"),
+                })
+        return {"codebases": codebases}
+    except Exception as e:
+        _log.error("list_codebases failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/codebases")
+def create_codebase(body: CodebaseCreate):
+    from config import scoped_collection
+    try:
+        db = NocodbClient()
+        collection_name = scoped_collection(body.org_id, f"codebase_{body.name.lower().replace(' ', '_')}")
+        row = db._post("knowledge_sources", {
+            "org_id": body.org_id,
+            "name": body.name,
+            "description": body.description or "",
+            "type": "codebase",
+            "collection_name": collection_name,
+            "source": "manual",
+        })
+        _log.info("codebase created  name=%s collection=%s", body.name, collection_name)
+        return row
+    except Exception as e:
+        _log.error("create_codebase failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/codebases/{codebase_id}/index")
+def index_codebase_files(codebase_id: int, body: CodebaseFileUpload):
+    import base64
+    from memory import remember
+    try:
+        db = NocodbClient()
+        if "knowledge_sources" not in db.tables:
+            raise HTTPException(status_code=404, detail="knowledge_sources table not found")
+        rows = db._get("knowledge_sources", params={
+            "where": f"(Id,eq,{codebase_id})",
+            "limit": 1,
+        }).get("list", [])
+        if not rows:
+            raise HTTPException(status_code=404, detail="codebase not found")
+        row = rows[0]
+        collection_name = row["collection_name"]
+        org_id = int(row["org_id"])
+
+        indexed = 0
+        for f in body.files:
+            name = f.get("name", "unknown")
+            content = f.get("content") or ""
+            if f.get("content_b64"):
+                content = base64.b64decode(f["content_b64"]).decode("utf-8", errors="replace")
+            if not content.strip():
+                continue
+            text = f"FILE: {name}\n\n{content}"
+            try:
+                remember(
+                    text=text,
+                    metadata={"file": name, "codebase_id": codebase_id, "type": "codebase"},
+                    org_id=org_id,
+                    collection_name=collection_name,
+                )
+                indexed += 1
+            except Exception:
+                _log.error("index failed for file %s in codebase %d", name, codebase_id, exc_info=True)
+
+        _log.info("codebase indexed  id=%d files=%d/%d", codebase_id, indexed, len(body.files))
+        return {"indexed": indexed, "total": len(body.files)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("index_codebase_files failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/stream/{job_id}")

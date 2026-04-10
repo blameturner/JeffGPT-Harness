@@ -26,6 +26,7 @@ AGENT_JOB_PREFIX = "agent_schedule_"
 
 
 def _fetch_agent_schedules() -> list[dict]:
+    _log.debug("fetching agent_schedules from nocodb")
     try:
         meta = requests.get(
             f"{NOCODB_URL}/api/v1/db/meta/projects/{NOCODB_BASE_ID}/tables",
@@ -50,8 +51,8 @@ def _fetch_agent_schedules() -> list[dict]:
 
 
 def _run_agent_job(agent_name: str, org_id: int, task: str, product: str) -> None:
-    """Fire the harness /run endpoint for a scheduled agent."""
     def _call() -> None:
+        _log.info("scheduled agent firing  agent=%s org=%d", agent_name, org_id)
         try:
             r = requests.post(
                 "http://localhost:3800/run",
@@ -64,9 +65,11 @@ def _run_agent_job(agent_name: str, org_id: int, task: str, product: str) -> Non
                 timeout=600,
             )
             if r.status_code >= 400:
-                _log.error("agent run %s failed: %d %s", agent_name, r.status_code, r.text[:200])
+                _log.error("scheduled agent %s failed: %d %s", agent_name, r.status_code, r.text[:200])
+            else:
+                _log.info("scheduled agent %s completed: %d", agent_name, r.status_code)
         except Exception as e:
-            _log.error("agent run %s error: %s", agent_name, e)
+            _log.error("scheduled agent %s error: %s", agent_name, e, exc_info=True)
 
     threading.Thread(target=_call, daemon=True).start()
 
@@ -172,7 +175,11 @@ def start_scheduler() -> BackgroundScheduler:
 
 
 def reload_agent_schedules() -> dict[str, Any]:
+    _log.info("reloading agent schedules")
     if _scheduler is None:
+        _log.warning("reload requested but scheduler not running")
         return {"ok": False, "error": "scheduler not running"}
-    count = _register_agent_schedules(_scheduler)
-    return {"ok": True, "registered": count}
+    agent_count = _register_agent_schedules(_scheduler)
+    enrichment_count = _register_enrichment_agents(_scheduler)
+    _log.info("reload complete  agents=%d enrichment=%d", agent_count, enrichment_count)
+    return {"ok": True, "agent_schedules": agent_count, "enrichment_agents": enrichment_count}

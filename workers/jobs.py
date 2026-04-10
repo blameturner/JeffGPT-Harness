@@ -76,16 +76,20 @@ STORE = JobStore()
 
 
 def run_in_background(job: Job, worker_fn: Callable[[Job], None]):
-    _log.debug("job %s started", job.id)
+    _log.info("job %s starting", job.id)
 
     def _thread():
+        started = time.time()
         try:
             worker_fn(job)
         except Exception as e:
-            _log.error("job %s worker failed", job.id, exc_info=True)
+            elapsed = round(time.time() - started, 1)
+            _log.error("job %s failed after %.1fs", job.id, elapsed, exc_info=True)
             STORE.append(job, {"type": "error", "message": str(e)})
             STORE.finish(job, error=str(e))
             return
+        elapsed = round(time.time() - started, 1)
+        _log.info("job %s completed  events=%d %.1fs", job.id, len(job.events), elapsed)
         STORE.finish(job)
 
     threading.Thread(target=_thread, daemon=True).start()
@@ -94,6 +98,7 @@ def run_in_background(job: Job, worker_fn: Callable[[Job], None]):
 def stream_events(job_id: str, cursor: int = 0) -> Iterator[str]:
     job = STORE.get(job_id)
     if job is None:
+        _log.warning("stream requested for unknown job %s", job_id)
         yield f"data: {json.dumps({'type': 'error', 'message': 'job not found or expired'})}\n\n"
         yield "data: [DONE]\n\n"
         return

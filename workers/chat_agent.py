@@ -93,6 +93,8 @@ class ChatAgent:
         if total_chars <= SUMMARISE_TRIGGER_CHARS:
             return history, None
 
+        _log.info("summarisation triggered  messages=%d chars=%d threshold=%d", len(history), total_chars, SUMMARISE_TRIGGER_CHARS)
+
         keep_tail = 4
         if len(history) <= keep_tail:
             return history, None
@@ -176,7 +178,9 @@ class ChatAgent:
         """
         fast_url, fast_model = self._tool_model_url()
         if not fast_url:
+            _log.warning("graph extraction skipped — no tool model available")
             return
+        _log.info("graph extraction starting  conv=%d", conversation_id)
 
         prompt = (
             "Extract concepts and relations from this chat turn. "
@@ -208,6 +212,8 @@ class ChatAgent:
             return
 
         relations = data.get("relations") or []
+        _log.info("graph extraction found %d relations  conv=%d", len(relations), conversation_id)
+        written = 0
         for row in relations:
             if not isinstance(row, (list, tuple)) or len(row) != 3:
                 continue
@@ -224,8 +230,10 @@ class ChatAgent:
                     to_type="Concept",
                     to_name=b[:200],
                 )
-            except Exception as e:
-                _log.warning("graph write failed (%s-%s->%s): %s", a, rel, b, e)
+                written += 1
+            except Exception:
+                _log.error("graph write failed (%s-%s->%s)  conv=%d", a, rel, b, conversation_id, exc_info=True)
+        _log.info("graph extraction done  conv=%d written=%d/%d", conversation_id, written, len(relations))
 
     def run_job(
         self,
@@ -253,6 +261,7 @@ class ChatAgent:
                 title=user_message[:80],
                 rag_enabled=bool(rag_enabled),
                 rag_collection=rag_collection or "",
+                knowledge_enabled=bool(knowledge_enabled),
             )
             conversation_id = convo["Id"]
             history: list[dict] = []
@@ -272,6 +281,7 @@ class ChatAgent:
             or self._default_collection(conversation_id)
         )
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
+        _log.info("conversation flags  conv=%s rag=%s knowledge=%s (raw=%s, param=%s)", conversation_id, convo_rag_enabled, convo_knowledge, convo.get("knowledge_enabled"), knowledge_enabled)
 
         try:
             self.db.update_conversation(conversation_id, {"status": "processing"})
@@ -318,6 +328,7 @@ class ChatAgent:
                 _log.warning("needs_web_search classifier failed", exc_info=True)
                 needs, reason = False, ""
             if needs:
+                _log.info("search consent required — pausing turn  conv=%s reason=%s", conversation_id, reason)
                 emit({
                     "type": "search_consent_required",
                     "query": user_message,
@@ -406,7 +417,7 @@ class ChatAgent:
             try:
                 self.db.update_conversation(conversation_id, {"status": "error"})
             except Exception:
-                pass
+                _log.warning("status update to error failed  conv=%s", conversation_id)
             emit({"type": "error", "message": "model call failed"})
             return
 

@@ -47,8 +47,8 @@ def _query_model_id(url: str) -> str | None:
         data = response.json()
         if data.get("data"):
             return _clean_model_id(data["data"][0]["id"])
-    except (requests.RequestException, ValueError, KeyError):
-        pass
+    except (requests.RequestException, ValueError, KeyError) as e:
+        _log.debug("model probe %s: %s", url, e)
     return None
 
 
@@ -147,6 +147,7 @@ _log.info("model catalog ready: %s", sorted({v['role'] for v in MODELS.values() 
 
 
 def refresh_models() -> dict:
+    _log.info("refreshing model catalog")
     global MODELS
     MODELS = discover_models()
     return MODELS
@@ -156,6 +157,7 @@ def get_model_url(key: str) -> str | None:
     entry = MODELS.get(key) or MODELS.get(key.lower())
     if isinstance(entry, dict):
         return entry.get("url")
+    _log.debug("model not found in catalog  key=%s available=%s", key, list(MODELS.keys()))
     return None
 
 
