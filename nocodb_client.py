@@ -201,6 +201,11 @@ class NocodbClient:
         tokens_input: int = 0,
         tokens_output: int = 0,
         response_style: str = "",
+        search_used: bool = False,
+        search_status: str = "",
+        search_confidence: str = "",
+        search_source_count: int = 0,
+        search_context_text: str = "",
     ) -> dict:
         _log.info("add_message  conv=%d role=%s model=%s content_len=%d", conversation_id, role, model, len(content))
         payload = {
@@ -214,7 +219,57 @@ class NocodbClient:
         }
         if response_style:
             payload["response_style"] = response_style
+        if search_used:
+            payload["search_used"] = 1
+        if search_status:
+            payload["search_status"] = search_status
+        if search_confidence:
+            payload["search_confidence"] = search_confidence
+        if search_source_count:
+            payload["search_source_count"] = search_source_count
+        if search_context_text:
+            payload["search_context_text"] = search_context_text
         return self._post("messages", payload)
+
+    def add_message_search_sources(
+        self,
+        message_id: int,
+        conversation_id: int,
+        org_id: int,
+        sources: list[dict],
+    ) -> list[dict]:
+        """Write individual source rows to the message_search_sources table."""
+        rows: list[dict] = []
+        for i, src in enumerate(sources):
+            payload = {
+                "message_id": message_id,
+                "conversation_id": conversation_id,
+                "org_id": org_id,
+                "source_index": i,
+                "title": (src.get("title") or "")[:255],
+                "url": src.get("url") or "",
+                "relevance": src.get("relevance") or "unknown",
+                "source_type": src.get("source_type") or "unknown",
+                "snippet": src.get("summary") or "",
+                "used_in_answer": 1 if src.get("used_in_answer") else 0,
+            }
+            try:
+                row = self._post("message_search_sources", payload)
+                rows.append(row)
+            except Exception:
+                _log.error("message_search_sources write failed  msg=%d idx=%d", message_id, i, exc_info=True)
+        return rows
+
+    def list_message_search_sources(self, message_id: int | None = None, conversation_id: int | None = None) -> list[dict]:
+        parts = []
+        if message_id is not None:
+            parts.append(f"(message_id,eq,{message_id})")
+        if conversation_id is not None:
+            parts.append(f"(conversation_id,eq,{conversation_id})")
+        params: dict = {"sort": "source_index", "limit": 500}
+        if parts:
+            params["where"] = "~and".join(parts)
+        return self._get("message_search_sources", params=params).get("list", [])
 
     def create_code_conversation(
         self,

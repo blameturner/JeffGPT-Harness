@@ -596,12 +596,39 @@ def get_messages(conversation_id: int):
         convo = db.get_conversation(conversation_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = db.list_messages(conversation_id)
+        sources_by_msg: dict[int, list[dict]] = {}
+        if any(int(m.get("search_source_count") or 0) > 0 for m in messages):
+            all_sources = db.list_message_search_sources(conversation_id=conversation_id)
+            for src in all_sources:
+                mid = src.get("message_id")
+                if mid is not None:
+                    sources_by_msg.setdefault(mid, []).append(src)
+        for msg in messages:
+            raw_sources = sources_by_msg.get(msg.get("Id"), [])
+            for src in raw_sources:
+                src["index"] = (src.get("source_index") or 0) + 1
+                src["used_in_answer"] = bool(src.get("used_in_answer"))
+            msg["search_sources"] = raw_sources
         return {
             "conversation": convo,
-            "messages": db.list_messages(conversation_id),
+            "messages": messages,
         }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/messages/{message_id}/search-sources")
+def get_message_search_sources(message_id: int):
+    try:
+        db = NocodbClient()
+        sources = db.list_message_search_sources(message_id=message_id)
+        for src in sources:
+            src["index"] = (src.get("source_index") or 0) + 1
+            src["used_in_answer"] = bool(src.get("used_in_answer"))
+        return {"sources": sources}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -921,6 +948,56 @@ def reject_suggestion(suggestion_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class BulkSuggestionAction(BaseModel):
+    parent_target: int
+    enrichment_agent_id: int | None = None
+
+
+@app.post("/enrichment/suggestions/approve-by-parent")
+def approve_suggestions_by_parent(body: BulkSuggestionAction):
+    from workers.enrichment_agent import EnrichmentDB
+    from config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
+    try:
+        db = EnrichmentDB()
+        suggestions = db._get(
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
+            params={
+                "where": f"(parent_target,eq,{body.parent_target})~and(status,eq,pending)",
+                "limit": 200,
+            },
+        ).get("list", [])
+        if not suggestions:
+            return {"ok": True, "approved": 0, "sources": []}
+        sources = []
+        for s in suggestions:
+            org_id = int(s.get("org_id") or 1)
+            source = db.approve_suggestion(s["Id"], org_id, enrichment_agent_id=body.enrichment_agent_id)
+            sources.append(source)
+        return {"ok": True, "approved": len(sources), "sources": sources}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/suggestions/reject-by-parent")
+def reject_suggestions_by_parent(body: BulkSuggestionAction):
+    from workers.enrichment_agent import EnrichmentDB
+    from config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
+    try:
+        db = EnrichmentDB()
+        suggestions = db._get(
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
+            params={
+                "where": f"(parent_target,eq,{body.parent_target})~and(status,eq,pending)",
+                "limit": 200,
+            },
+        ).get("list", [])
+        for s in suggestions:
+            db.update_suggestion(s["Id"], {"status": "rejected"})
+        return {"ok": True, "rejected": len(suggestions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/stats/usage")
 def stats_usage(org_id: int, period: str = "30d"):
     from datetime import datetime, timedelta, timezone
@@ -937,46 +1014,69 @@ def stats_usage(org_id: int, period: str = "30d"):
     else:
         start = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
-    period_start = start.isoformat()
-    period_end = now.isoformat()
+    period_start = start.strftime("%Y-%m-%d")
+    period_end = now.strftime("%Y-%m-%d")
 
     try:
-        msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{period_start})"
+        msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start.isoformat()})"
         messages = db._get("messages", params={"where": msg_where, "limit": 5000}).get("list", [])
     except Exception:
         messages = []
 
     try:
-        run_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{period_start})"
+        run_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start.isoformat()})"
         runs = db._get("agent_runs", params={"where": run_where, "limit": 5000}).get("list", [])
     except Exception:
         runs = []
 
+    # --- totals ---
     total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
     total_tokens_in += sum(int(r.get("tokens_input") or 0) for r in runs)
     total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in messages)
     total_tokens_out += sum(int(r.get("tokens_output") or 0) for r in runs)
     total_requests = len(messages) + len(runs)
+    total_conversations = len({m.get("conversation_id") for m in messages if m.get("conversation_id")})
+    failed_runs = [r for r in runs if r.get("status") == "failed"]
+    total_errors = len(failed_runs)
 
+    # --- by_model (with percentiles) ---
     by_model: dict = {}
     for m in messages:
         model = (m.get("model") or "unknown").strip() or "unknown"
-        entry = by_model.setdefault(model, {"model_name": model, "requests": 0, "tokens_input": 0, "tokens_output": 0, "total_duration": 0.0})
+        entry = by_model.setdefault(model, {
+            "model_name": model, "requests": 0, "tokens_input": 0,
+            "tokens_output": 0, "durations": [], "error_count": 0,
+        })
         entry["requests"] += 1
         entry["tokens_input"] += int(m.get("tokens_input") or 0)
         entry["tokens_output"] += int(m.get("tokens_output") or 0)
     for r in runs:
         model = (r.get("model_name") or "unknown").strip() or "unknown"
-        entry = by_model.setdefault(model, {"model_name": model, "requests": 0, "tokens_input": 0, "tokens_output": 0, "total_duration": 0.0})
+        entry = by_model.setdefault(model, {
+            "model_name": model, "requests": 0, "tokens_input": 0,
+            "tokens_output": 0, "durations": [], "error_count": 0,
+        })
         entry["requests"] += 1
         entry["tokens_input"] += int(r.get("tokens_input") or 0)
         entry["tokens_output"] += int(r.get("tokens_output") or 0)
-        entry["total_duration"] += float(r.get("duration_seconds") or 0)
+        dur = float(r.get("duration_seconds") or 0)
+        if dur > 0:
+            entry["durations"].append(dur)
+        if r.get("status") == "failed":
+            entry["error_count"] += 1
+
+    def _percentile(sorted_vals: list[float], pct: float) -> float:
+        if not sorted_vals:
+            return 0.0
+        idx = int(len(sorted_vals) * pct)
+        idx = min(idx, len(sorted_vals) - 1)
+        return round(sorted_vals[idx], 2)
 
     by_model_list = []
     for entry in sorted(by_model.values(), key=lambda x: x["requests"], reverse=True):
         avg_tokens = (entry["tokens_input"] + entry["tokens_output"]) // max(entry["requests"], 1)
-        avg_dur = round(entry["total_duration"] / max(entry["requests"], 1), 2)
+        durations = sorted(entry["durations"])
+        avg_dur = round(sum(durations) / len(durations), 2) if durations else 0.0
         by_model_list.append({
             "model_name": entry["model_name"],
             "requests": entry["requests"],
@@ -984,14 +1084,21 @@ def stats_usage(org_id: int, period: str = "30d"):
             "tokens_output": entry["tokens_output"],
             "avg_tokens_per_request": avg_tokens,
             "avg_duration_seconds": avg_dur,
+            "p50_duration_seconds": _percentile(durations, 0.50),
+            "p95_duration_seconds": _percentile(durations, 0.95),
+            "p99_duration_seconds": _percentile(durations, 0.99),
+            "time_to_first_token_ms": 0,  # not tracked yet
+            "error_count": entry["error_count"],
+            "error_rate": round(entry["error_count"] / max(entry["requests"], 1), 4),
         })
 
+    # --- by_day ---
     by_day: dict = {}
     for m in messages:
         day = (m.get("CreatedAt") or "")[:10]
         if not day:
             continue
-        d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0})
+        d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0, "errors": 0})
         d["requests"] += 1
         d["tokens_input"] += int(m.get("tokens_input") or 0)
         d["tokens_output"] += int(m.get("tokens_output") or 0)
@@ -999,19 +1106,92 @@ def stats_usage(org_id: int, period: str = "30d"):
         day = (r.get("CreatedAt") or "")[:10]
         if not day:
             continue
-        d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0})
+        d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0, "errors": 0})
         d["requests"] += 1
         d["tokens_input"] += int(r.get("tokens_input") or 0)
         d["tokens_output"] += int(r.get("tokens_output") or 0)
+        if r.get("status") == "failed":
+            d["errors"] += 1
     by_day_list = sorted(by_day.values(), key=lambda x: x["date"])
 
+    # --- by_hour (heatmap) ---
+    by_hour: dict = {}
+    for m in messages:
+        ts = m.get("CreatedAt") or ""
+        if len(ts) < 13:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            key = (dt.hour, dt.isoweekday() % 7)  # 0=Sun
+            bucket = by_hour.setdefault(key, {"hour": dt.hour, "day_of_week": dt.isoweekday() % 7, "requests": 0})
+            bucket["requests"] += 1
+        except (ValueError, AttributeError):
+            continue
+    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
+
+    # --- by_style ---
     by_style: dict = {}
     for m in messages:
         style = (m.get("response_style") or "").strip() or "default"
         by_style[style] = by_style.get(style, 0) + 1
     by_style_list = [{"style": k, "requests": v} for k, v in sorted(by_style.items(), key=lambda x: -x[1])]
 
-    enrichment_stats = {"total_cycles": 0, "total_sources_scraped": 0, "total_tokens_used": 0, "suggestions_generated": 0, "suggestions_approved": 0}
+    # --- top_conversations ---
+    convos: dict = {}
+    for m in messages:
+        cid = m.get("conversation_id")
+        if not cid:
+            continue
+        c = convos.setdefault(cid, {"conversation_id": cid, "title": "", "message_count": 0, "total_tokens": 0, "last_active": ""})
+        c["message_count"] += 1
+        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
+        ts = m.get("CreatedAt") or ""
+        if ts > c["last_active"]:
+            c["last_active"] = ts
+    top_conversations = sorted(convos.values(), key=lambda x: x["message_count"], reverse=True)[:10]
+    if top_conversations:
+        try:
+            conv_rows = db._get("conversations", params={
+                "where": "~or".join(f"(Id,eq,{c['conversation_id']})" for c in top_conversations),
+                "limit": 10,
+            }).get("list", [])
+            title_map = {r["Id"]: r.get("title") or "" for r in conv_rows}
+            for c in top_conversations:
+                c["title"] = title_map.get(c["conversation_id"], "")
+        except Exception:
+            pass
+
+    # --- agent_runs ---
+    successful_runs = [r for r in runs if r.get("status") == "complete"]
+    by_agent: dict = {}
+    for r in runs:
+        name = r.get("agent_name") or "unknown"
+        a = by_agent.setdefault(name, {"agent_name": name, "runs": 0, "successful": 0, "total_steps": 0})
+        a["runs"] += 1
+        if r.get("status") == "complete":
+            a["successful"] += 1
+        a["total_steps"] += int(r.get("steps") or 0)
+    agent_runs_section = {
+        "total_runs": len(runs),
+        "successful": len(successful_runs),
+        "failed": len(failed_runs),
+        "avg_steps": round(sum(int(r.get("steps") or 0) for r in runs) / max(len(runs), 1), 1),
+        "by_agent": [
+            {
+                "agent_name": a["agent_name"],
+                "runs": a["runs"],
+                "success_rate": round(a["successful"] / max(a["runs"], 1), 3),
+                "avg_steps": round(a["total_steps"] / max(a["runs"], 1), 1),
+            }
+            for a in sorted(by_agent.values(), key=lambda x: x["runs"], reverse=True)
+        ],
+    }
+
+    # --- enrichment ---
+    enrichment_stats = {
+        "total_cycles": 0, "total_sources_scraped": 0, "total_tokens_used": 0,
+        "suggestions_generated": 0, "suggestions_approved": 0,
+    }
     try:
         from workers.enrichment_agent import EnrichmentDB
         edb = EnrichmentDB()
@@ -1029,11 +1209,16 @@ def stats_usage(org_id: int, period: str = "30d"):
         "total_requests": total_requests,
         "total_tokens_input": total_tokens_in,
         "total_tokens_output": total_tokens_out,
+        "total_conversations": total_conversations,
+        "total_errors": total_errors,
         "period_start": period_start,
         "period_end": period_end,
         "by_model": by_model_list,
         "by_day": by_day_list,
+        "by_hour": by_hour_list,
         "by_style": by_style_list,
+        "top_conversations": top_conversations,
+        "agent_runs": agent_runs_section,
         "enrichment": enrichment_stats,
     }
 

@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from config import CATEGORY_COLLECTIONS, MODELS, SEARXNG_URL
+from config import CATEGORY_COLLECTIONS, MAX_SUMMARY_INPUT_CHARS, MODELS, SEARXNG_URL
 from memory import remember
 
 _log = logging.getLogger("web_search")
@@ -45,6 +45,8 @@ MAX_SOURCES = 8
 OVERFETCH_FACTOR = 3
 PER_PAGE_CHAR_CAP = 20_000
 SUMMARY_MAX_TOKENS = 500
+SUMMARY_INPUT_CHAR_CAP = MAX_SUMMARY_INPUT_CHARS
+SUMMARY_BATCH_SIZE = 3
 SEARXNG_TIMEOUT = 10
 SCRAPE_TIMEOUT = 15
 FAST_TIMEOUT = 60
@@ -96,8 +98,16 @@ def _is_safe_url(url: str) -> bool:
         return False
     if host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]"):
         return False
-    if host.startswith("10.") or host.startswith("172.") or host.startswith("192.168."):
+    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
         return False
+    if host.startswith("172."):
+        # RFC 1918: 172.16.0.0 – 172.31.255.255
+        try:
+            second_octet = int(host.split(".")[1])
+            if 16 <= second_octet <= 31:
+                return False
+        except (IndexError, ValueError):
+            return False
     if host.endswith(".local") or host.endswith(".internal"):
         return False
     return True
@@ -287,6 +297,25 @@ def _get_browser():
         return _pw_browser
 
 
+def _reset_browser() -> None:
+    """Kill the cached browser so the next call to _get_browser() relaunches."""
+    global _pw_instance, _pw_browser
+    with _pw_lock:
+        if _pw_browser is not None:
+            try:
+                _pw_browser.close()
+            except Exception:
+                pass
+        if _pw_instance is not None:
+            try:
+                _pw_instance.stop()
+            except Exception:
+                pass
+        _pw_browser = None
+        _pw_instance = None
+        _log.info("playwright browser reset")
+
+
 def playwright_fetch(url: str) -> str:
     """Fetch page text using in-process Playwright/Chromium."""
     if not _is_safe_url(url):
@@ -316,7 +345,13 @@ def playwright_fetch(url: str) -> str:
                 else route.abort()
             ))
 
-            page.goto(url, wait_until="networkidle", timeout=30_000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # Brief settle for JS-rendered content without waiting on
+            # straggler analytics/websocket requests that block networkidle.
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass  # DOM is loaded, proceed with what we have
 
             final_url = page.url
             if not _is_safe_url(final_url):
@@ -333,7 +368,20 @@ def playwright_fetch(url: str) -> str:
     except Exception as e:
         elapsed = round(time.time() - started, 2)
         _log.warning("playwright_fetch failed  url=%s error=%s %.2fs", url[:120], e, elapsed)
+        # If the browser itself is broken (not just a page-level error),
+        # reset so the next call gets a fresh instance.
+        if "browser" not in str(type(e).__name__).lower():
+            try:
+                _get_browser().contexts  # probe: is it still alive?
+            except Exception:
+                _log.warning("playwright browser appears dead, resetting")
+                _reset_browser()
+        else:
+            _reset_browser()
         return ""
+
+
+MAX_RESPONSE_BYTES = 5_000_000  # 5 MB — skip anything larger
 
 
 def _scrape_with_httpx(url: str) -> str:
@@ -347,6 +395,13 @@ def _scrape_with_httpx(url: str) -> str:
             headers=BROWSER_HEADERS,
         )
         resp.raise_for_status()
+        if len(resp.content) > MAX_RESPONSE_BYTES:
+            _log.warning("scrape skip  response too large (%d bytes) for %s", len(resp.content), url)
+            return ""
+        final_url = str(resp.url)
+        if final_url != url and not _is_safe_url(final_url):
+            _log.warning("scrape blocked redirect to unsafe url %s", final_url[:120])
+            return ""
     except httpx.HTTPStatusError as e:
         _log.warning("scrape %d for %s (%s)", e.response.status_code, url, e.response.reason_phrase)
         return ""
@@ -358,6 +413,10 @@ def _scrape_with_httpx(url: str) -> str:
         return ""
 
     elapsed = round(time.time() - started, 2)
+    content_type = (resp.headers.get("content-type") or "").lower()
+    if content_type and "text/html" not in content_type and "text/plain" not in content_type:
+        _log.debug("scrape skip  non-html content-type=%s for %s", content_type.split(";")[0], url)
+        return ""
     _log.debug("scrape ok    %s  status=%d size=%d %.2fs", url, resp.status_code, len(resp.text), elapsed)
 
     try:
@@ -453,7 +512,7 @@ def summarise_page(text: str, query: str) -> dict | None:
         "\"product_page\", \"government\", \"unknown\".\n\n"
         "If the page is completely irrelevant to the question, return: "
         '{\"irrelevant\": true}\n\n'
-        f"PAGE:\n{text}"
+        f"PAGE:\n{text[:SUMMARY_INPUT_CHAR_CAP]}"
     )
     started = time.time()
     try:
@@ -501,6 +560,106 @@ def summarise_page(text: str, query: str) -> dict | None:
         _log.error("summarisation failed for '%s'", query, exc_info=True)
         return {"summary": text[:1200], "relevance": "unknown", "source_type": "unknown"}
 
+
+
+def summarise_pages_batch(
+    pages: list[dict], query: str
+) -> list[dict | None]:
+    """Summarise multiple pages in a single tool-model call.
+
+    *pages* is a list of {"index": int, "text": str, ...}.
+    Returns a list aligned with *pages* — each element is the assessment dict
+    or None (irrelevant / parse failure).  Falls back to per-page calls on
+    any top-level failure.
+    """
+    if not pages:
+        return []
+
+    tool_url, tool_model = _tool_model()
+    if not tool_url:
+        return [
+            {"summary": p["text"][:1200], "relevance": "unknown", "source_type": "unknown"}
+            for p in pages
+        ]
+
+    # Divide the char budget evenly across pages
+    per_page_cap = max(800, SUMMARY_INPUT_CHAR_CAP // len(pages))
+
+    page_blocks = []
+    for i, p in enumerate(pages):
+        page_blocks.append(f"--- PAGE {i + 1} ---\n{p['text'][:per_page_cap]}")
+    all_pages_text = "\n\n".join(page_blocks)
+
+    prompt = (
+        "You are summarising multiple web pages for someone who asked: "
+        f"'{query[:500]}'\n\n"
+        f"There are {len(pages)} pages below. For EACH page, return a JSON object with:\n"
+        "- page: the page number (1-indexed)\n"
+        "- summary: factual summary (up to 200 words). Preserve key names, numbers, dates.\n"
+        "- relevance: \"high\", \"medium\", or \"low\"\n"
+        "- source_type: e.g. \"official_docs\", \"news_article\", \"blog_post\", "
+        "\"research_paper\", \"forum\", \"product_page\", \"government\", \"unknown\"\n\n"
+        "If a page is completely irrelevant, return: {\"page\": N, \"irrelevant\": true}\n\n"
+        "Return a JSON array of objects, one per page. Example:\n"
+        '[{"page": 1, "summary": "...", "relevance": "high", "source_type": "news_article"}, '
+        '{"page": 2, "irrelevant": true}]\n\n'
+        f"{all_pages_text}"
+    )
+
+    started = time.time()
+    try:
+        resp = httpx.post(
+            f"{tool_url}/v1/chat/completions",
+            json={
+                "model": tool_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": SUMMARY_MAX_TOKENS * len(pages),
+            },
+            timeout=FAST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        elapsed = round(time.time() - started, 2)
+        _log.debug("batch summarise  %d pages %.2fs", len(pages), elapsed)
+
+        # Strip markdown fences and any prose before/after the JSON
+        cleaned = raw.strip()
+        fence_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", cleaned)
+        if fence_match:
+            cleaned = fence_match.group(1)
+        else:
+            cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
+        # If model prefixed with prose, find the array
+        if not cleaned.startswith("["):
+            arr_match = re.search(r"\[[\s\S]*\]", cleaned)
+            if arr_match:
+                cleaned = arr_match.group(0)
+        items = json.loads(cleaned)
+        if not isinstance(items, list):
+            items = [items]
+
+        results: list[dict | None] = [None] * len(pages)
+        for item in items:
+            idx = item.get("page")
+            if not isinstance(idx, int) or idx < 1 or idx > len(pages):
+                continue
+            if item.get("irrelevant"):
+                results[idx - 1] = None
+                continue
+            summary = str(item.get("summary") or "").strip()
+            if not summary:
+                continue
+            results[idx - 1] = {
+                "summary": summary,
+                "relevance": str(item.get("relevance") or "unknown").lower(),
+                "source_type": str(item.get("source_type") or "unknown").lower(),
+            }
+        return results
+
+    except Exception:
+        _log.warning("batch summarisation failed, falling back to per-page", exc_info=True)
+        return [summarise_page(p["text"], query) for p in pages]
 
 
 _EXPLICIT_SEARCH_PATTERNS = [
@@ -621,41 +780,58 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[dict], str]:
 
     results: list[dict] = []
     scrape_failures = 0
-    for r in raw_results:
+    for start in range(0, len(raw_results), SUMMARY_BATCH_SIZE):
         if len(results) >= MAX_SOURCES:
             break
-        text = scrape_page(r["url"], snippet=r.get("snippet", ""))
-        if not text:
-            scrape_failures += 1
-            continue
-        assessed = summarise_page(text, query)
-        if not assessed:
-            continue
-        entry = {
-            "title": r["title"] or r["url"],
-            "url": r["url"],
-            "summary": assessed["summary"],
-            "relevance": assessed.get("relevance", "unknown"),
-            "source_type": assessed.get("source_type", "unknown"),
-        }
-        results.append(entry)
 
-        try:
-            remember(
-                text=f"{entry['title']}\n\n{entry['summary']}",
-                metadata={
-                    "url": r["url"],
-                    "title": r["title"],
-                    "query": query,
-                    "relevance": entry["relevance"],
-                    "source_type": entry["source_type"],
-                    "fetched_at": time.time(),
-                },
-                org_id=org_id,
-                collection_name="web_search",
-            )
-        except Exception:
-            _log.error("chroma write failed for %s", r["url"], exc_info=True)
+        batch = raw_results[start:start + SUMMARY_BATCH_SIZE]
+        scraped_pages: list[dict] = []
+        for r in batch:
+            text = scrape_page(r["url"], snippet=r.get("snippet", ""))
+            if not text:
+                scrape_failures += 1
+                continue
+            scraped_pages.append({"result": r, "text": text})
+
+        if not scraped_pages:
+            continue
+
+        assessments = summarise_pages_batch(
+            [{"index": i, "text": page["text"]} for i, page in enumerate(scraped_pages)],
+            query,
+        )
+        for page, assessed in zip(scraped_pages, assessments):
+            if len(results) >= MAX_SOURCES:
+                break
+            if not assessed:
+                continue
+
+            result = page["result"]
+            entry = {
+                "title": result["title"] or result["url"],
+                "url": result["url"],
+                "summary": assessed["summary"],
+                "relevance": assessed.get("relevance", "unknown"),
+                "source_type": assessed.get("source_type", "unknown"),
+            }
+            results.append(entry)
+
+            try:
+                remember(
+                    text=f"{entry['title']}\n\n{entry['summary']}",
+                    metadata={
+                        "url": result["url"],
+                        "title": result["title"],
+                        "query": query,
+                        "relevance": entry["relevance"],
+                        "source_type": entry["source_type"],
+                        "fetched_at": time.time(),
+                    },
+                    org_id=org_id,
+                    collection_name="web_search",
+                )
+            except Exception:
+                _log.error("chroma write failed for %s", result["url"], exc_info=True)
 
     if results:
         high = [r for r in results if r["relevance"] == "high"]

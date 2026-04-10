@@ -1,16 +1,18 @@
-
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import random
 import re
 import time
 import urllib.robotparser
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import httpx
+from bs4 import BeautifulSoup
 import requests
 
 from config import (
@@ -18,12 +20,17 @@ from config import (
     ENRICHMENT_TOKEN_BUDGET,
     ENRICHMENT_LOG_RETENTION_DAYS,
     MAX_SUMMARY_INPUT_CHARS,
+    NOCODB_TABLE_AGENT_RUNS,
     NOCODB_BASE_ID,
+    NOCODB_TABLE_ENRICHMENT_AGENTS,
+    NOCODB_TABLE_ENRICHMENT_LOG,
+    NOCODB_TABLE_ORGANISATION,
+    NOCODB_TABLE_SCRAPE_TARGETS,
+    NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
     NOCODB_TOKEN,
     NOCODB_URL,
     PROACTIVE_BUDGET_THRESHOLD,
 )
-import logging
 
 from graph import get_graph, write_relationship
 from memory import remember
@@ -32,8 +39,13 @@ from workers.web_search import _tool_model, scrape_page, searxng_search
 _log = logging.getLogger("enrichment")
 
 FAST_TIMEOUT = 60
-POLITE_DELAY_SECONDS = 2
-ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser] = {}
+POLITE_DELAY_MIN = 2
+POLITE_DELAY_MAX = 5
+POLITE_SAME_DOMAIN_MIN = 4
+POLITE_SAME_DOMAIN_MAX = 8
+_last_domain_hit: dict[str, float] = {}
+ROBOTS_CACHE: dict[str, tuple[urllib.robotparser.RobotFileParser, float]] = {}
+ROBOTS_CACHE_TTL = 3600  # re-check robots.txt after 1 hour
 
 _last_runs: dict[str | None, dict] = {}
 
@@ -94,33 +106,33 @@ class EnrichmentDB:
 
     def list_orgs(self) -> list[dict]:
         # Single-tenant fallback when the organisation table is absent.
-        if "organisation" not in self.tables:
+        if NOCODB_TABLE_ORGANISATION not in self.tables:
             return [{"Id": 1}]
-        return self._get("organisation", params={"limit": 500}).get("list", [])
+        return self._get(NOCODB_TABLE_ORGANISATION, params={"limit": 500}).get("list", [])
 
     def has_running_inferences(self) -> bool:
-        if "agent_runs" not in self.tables:
+        if NOCODB_TABLE_AGENT_RUNS not in self.tables:
             return False
         data = self._get(
-            "agent_runs",
+            NOCODB_TABLE_AGENT_RUNS,
             params={"where": "(status,eq,running)", "limit": 1},
         )
         return bool(data.get("list"))
 
     def list_enrichment_agents(self, org_id: int | None = None) -> list[dict]:
-        if "enrichment_agents" not in self.tables:
+        if NOCODB_TABLE_ENRICHMENT_AGENTS not in self.tables:
             return []
         where = "(active,eq,1)"
         if org_id is not None:
             where = f"(org_id,eq,{org_id})~and(active,eq,1)"
-        return self._get("enrichment_agents", params={"where": where, "limit": 200}).get("list", [])
+        return self._get(NOCODB_TABLE_ENRICHMENT_AGENTS, params={"where": where, "limit": 200}).get("list", [])
 
     def get_enrichment_agent(self, agent_id: int) -> dict | None:
-        if "enrichment_agents" not in self.tables:
+        if NOCODB_TABLE_ENRICHMENT_AGENTS not in self.tables:
             return None
         try:
             r = requests.get(
-                f"{self.base}/{self.tables['enrichment_agents']}/{agent_id}",
+                f"{self.base}/{self.tables[NOCODB_TABLE_ENRICHMENT_AGENTS]}/{agent_id}",
                 headers=self.headers,
                 timeout=15,
             )
@@ -130,10 +142,10 @@ class EnrichmentDB:
             return None
 
     def create_enrichment_agent(self, data: dict) -> dict:
-        return self._post("enrichment_agents", data)
+        return self._post(NOCODB_TABLE_ENRICHMENT_AGENTS, data)
 
     def update_enrichment_agent(self, agent_id: int, data: dict) -> dict:
-        return self._patch("enrichment_agents", agent_id, data)
+        return self._patch(NOCODB_TABLE_ENRICHMENT_AGENTS, agent_id, data)
 
     def list_sources(self, org_id: int, enrichment_agent_id: int | None = None, active_only: bool = False) -> list[dict]:
         where = f"(org_id,eq,{org_id})"
@@ -142,14 +154,14 @@ class EnrichmentDB:
         if active_only:
             where += "~and(active,eq,1)"
         return self._get(
-            "scrape_targets",
+            NOCODB_TABLE_SCRAPE_TARGETS,
             params={"where": where, "limit": 500, "sort": "-CreatedAt"},
         ).get("list", [])
 
     def get_source(self, source_id: int) -> dict | None:
         try:
             r = requests.get(
-                f"{self.base}/{self.tables['scrape_targets']}/{source_id}",
+                f"{self.base}/{self.tables[NOCODB_TABLE_SCRAPE_TARGETS]}/{source_id}",
                 headers=self.headers,
                 timeout=15,
             )
@@ -159,13 +171,13 @@ class EnrichmentDB:
             return None
 
     def create_source(self, data: dict) -> dict:
-        return self._post("scrape_targets", data)
+        return self._post(NOCODB_TABLE_SCRAPE_TARGETS, data)
 
     def delete_source(self, source_id: int) -> None:
-        self._delete("scrape_targets", source_id)
+        self._delete(NOCODB_TABLE_SCRAPE_TARGETS, source_id)
 
     def flush_source(self, source_id: int) -> dict:
-        return self._patch("scrape_targets", source_id, {
+        return self._patch(NOCODB_TABLE_SCRAPE_TARGETS, source_id, {
             "content_hash": None,
             "last_scraped_at": None,
             "status": None,
@@ -186,21 +198,21 @@ class EnrichmentDB:
         params: dict = {"sort": "-CreatedAt", "limit": limit}
         if where_parts:
             params["where"] = "~and".join(where_parts)
-        return self._get("enrichment_log", params=params).get("list", [])
+        return self._get(NOCODB_TABLE_ENRICHMENT_LOG, params=params).get("list", [])
 
     def list_suggestions(self, org_id: int, status: str | None = None) -> list[dict]:
         where = f"(org_id,eq,{org_id})"
         if status:
             where += f"~and(status,eq,{status})"
         return self._get(
-            "suggested_scrape_targets",
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
             params={"where": where, "limit": 500, "sort": "-CreatedAt"},
         ).get("list", [])
 
     def get_suggestion(self, suggestion_id: int) -> dict | None:
         try:
             r = requests.get(
-                f"{self.base}/{self.tables['suggested_scrape_targets']}/{suggestion_id}",
+                f"{self.base}/{self.tables[NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS]}/{suggestion_id}",
                 headers=self.headers,
                 timeout=15,
             )
@@ -210,7 +222,7 @@ class EnrichmentDB:
             return None
 
     def update_suggestion(self, suggestion_id: int, data: dict) -> dict:
-        return self._patch("suggested_scrape_targets", suggestion_id, data)
+        return self._patch(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggestion_id, data)
 
     def approve_suggestion(self, suggestion_id: int, org_id: int, enrichment_agent_id: int | None = None) -> dict:
         suggestion = self.get_suggestion(suggestion_id)
@@ -221,6 +233,7 @@ class EnrichmentDB:
             "url": suggestion.get("url"),
             "name": suggestion.get("name"),
             "category": suggestion.get("category"),
+            "parent_target": suggestion.get("parent_target"),
             "active": True,
             "frequency_hours": 24,
             "enrichment_agent_id": enrichment_agent_id,
@@ -231,11 +244,11 @@ class EnrichmentDB:
     def list_tracked_urls(self, org_id: int) -> set[str]:
         """Return all URLs already tracked or pending suggestion for an org."""
         tracked = self._get(
-            "scrape_targets",
+            NOCODB_TABLE_SCRAPE_TARGETS,
             params={"where": f"(org_id,eq,{org_id})", "limit": 1000},
         ).get("list", [])
         pending = self._get(
-            "suggested_scrape_targets",
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
             params={
                 "where": f"(org_id,eq,{org_id})~and(status,eq,pending)",
                 "limit": 1000,
@@ -250,7 +263,7 @@ class EnrichmentDB:
         if enrichment_agent_id is not None:
             where += f"~and(enrichment_agent_id,eq,{enrichment_agent_id})"
         data = self._get(
-            "scrape_targets",
+            NOCODB_TABLE_SCRAPE_TARGETS,
             params={
                 "where": where,
                 "limit": 500,
@@ -285,7 +298,7 @@ class EnrichmentDB:
     def update_scrape_target(self, row_id: int | None, **fields: Any) -> None:
         if row_id is None:
             return
-        self._patch("scrape_targets", row_id, fields)
+        self._patch(NOCODB_TABLE_SCRAPE_TARGETS, row_id, fields)
 
     def log_event(
         self,
@@ -302,7 +315,7 @@ class EnrichmentDB:
     ) -> None:
         try:
             self._post(
-                "enrichment_log",
+                NOCODB_TABLE_ENRICHMENT_LOG,
                 {
                     "cycle_id": cycle_id,
                     "event_type": event_type,
@@ -330,10 +343,11 @@ class EnrichmentDB:
         confidence_score: int,
         suggested_by_url: str | None,
         suggested_by_cycle: str,
+        parent_target: int | None = None,
     ) -> None:
         # Dedupe client-side because URLs may contain chars that break Nocodb where filters.
         pending = self._get(
-            "suggested_scrape_targets",
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
             params={
                 "where": f"(org_id,eq,{org_id})~and(status,eq,pending)",
                 "limit": 1000,
@@ -342,13 +356,13 @@ class EnrichmentDB:
         for row in pending:
             if row.get("url") == url:
                 self._patch(
-                    "suggested_scrape_targets",
+                    NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
                     row["Id"],
                     {"times_suggested": int(row.get("times_suggested") or 1) + 1},
                 )
                 return
         self._post(
-            "suggested_scrape_targets",
+            NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
             {
                 "org_id": org_id,
                 "url": url,
@@ -361,13 +375,14 @@ class EnrichmentDB:
                 "suggested_by_cycle": suggested_by_cycle,
                 "times_suggested": 1,
                 "status": "pending",
+                "parent_target": parent_target,
             },
         )
 
     def purge_old_logs(self, retention_days: int) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         data = self._get(
-            "enrichment_log",
+            NOCODB_TABLE_ENRICHMENT_LOG,
             params={
                 "where": f"(CreatedAt,lt,{cutoff.isoformat()})",
                 "limit": 1000,
@@ -376,14 +391,14 @@ class EnrichmentDB:
         rows = data.get("list", [])
         for row in rows:
             try:
-                self._delete("enrichment_log", row["Id"])
+                self._delete(NOCODB_TABLE_ENRICHMENT_LOG, row["Id"])
             except Exception as e:
                 _log.error("purge row %s failed", row.get("Id"), exc_info=True)
         return len(rows)
 
     def tokens_used_in_cycle(self, cycle_id: str) -> int:
         data = self._get(
-            "enrichment_log",
+            NOCODB_TABLE_ENRICHMENT_LOG,
             params={"where": f"(cycle_id,eq,{cycle_id})", "limit": 1000},
         )
         return sum(int(r.get("tokens_used") or 0) for r in data.get("list", []))
@@ -434,16 +449,29 @@ def _content_hash(text: str) -> str:
 def _check_robots(url: str) -> bool:
     parsed = urlparse(url)
     host = f"{parsed.scheme}://{parsed.netloc}"
-    rp = ROBOTS_CACHE.get(host)
-    if rp is None:
-        rp = urllib.robotparser.RobotFileParser()
-        rp.set_url(f"{host}/robots.txt")
-        try:
-            rp.read()
-        except Exception:
-            # Fail open when robots.txt is missing or unreachable.
-            return True
-        ROBOTS_CACHE[host] = rp
+    cached = ROBOTS_CACHE.get(host)
+    now = time.time()
+    if cached is not None:
+        rp, fetched_at = cached
+        if now - fetched_at < ROBOTS_CACHE_TTL:
+            try:
+                return rp.can_fetch("mst-harness", url)
+            except Exception:
+                return True
+    rp = urllib.robotparser.RobotFileParser()
+    rp.set_url(f"{host}/robots.txt")
+    try:
+        rp.read()
+    except Exception:
+        # Fail open when robots.txt is missing or unreachable.
+        return True
+    ROBOTS_CACHE[host] = (rp, now)
+    # Evict old entries to prevent unbounded growth
+    if len(ROBOTS_CACHE) > 500:
+        cutoff = now - ROBOTS_CACHE_TTL
+        stale = [k for k, (_, t) in ROBOTS_CACHE.items() if t < cutoff]
+        for k in stale:
+            del ROBOTS_CACHE[k]
     try:
         return rp.can_fetch("mst-harness", url)
     except Exception:
@@ -677,6 +705,94 @@ def _discover_sources(
     return tokens
 
 
+MAX_CRAWL_DEPTH = 5
+CRAWL_LINK_CAP = 50
+
+
+def _extract_internal_links(url: str, source: dict | None = None) -> list[str]:
+    """Fetch a page and return de-duped internal links (same domain)."""
+    from workers.web_search import (
+        BROWSER_HEADERS, SCRAPE_TIMEOUT, _is_safe_url, _is_blocklisted,
+    )
+    parsed_base = urlparse(url)
+    base_domain = parsed_base.netloc.lower()
+
+    try:
+        resp = httpx.get(
+            url, timeout=SCRAPE_TIMEOUT, follow_redirects=True,
+            headers=BROWSER_HEADERS,
+        )
+        resp.raise_for_status()
+    except Exception:
+        _log.debug("link extraction failed for %s", url[:120])
+        return []
+
+    try:
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return []
+
+    seen: set[str] = set()
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        full = urljoin(url, href).split("#")[0].split("?")[0]
+        parsed = urlparse(full)
+        if parsed.netloc.lower() != base_domain:
+            continue
+        if full in seen or full == url:
+            continue
+        if not _is_safe_url(full) or _is_blocklisted(full):
+            continue
+        seen.add(full)
+        links.append(full)
+        if len(links) >= CRAWL_LINK_CAP:
+            break
+
+    _log.debug("extracted %d internal links from %s", len(links), url[:80])
+    return links
+
+
+def _select_crawl_paths(links: list[str], source_url: str, budget_remaining: int) -> list[str]:
+    """Ask the tool LLM which internal links are worth crawling."""
+    if not links:
+        return []
+
+    max_pages = min(MAX_CRAWL_DEPTH, max(1, budget_remaining // 2000))
+    link_list = "\n".join(f"- {u}" for u in links[:CRAWL_LINK_CAP])
+    prompt = (
+        f"You are selecting which pages to crawl from the site {source_url}.\n"
+        f"Below are internal links found on that page. Select up to {max_pages} "
+        "links that are most likely to contain substantive, unique content worth "
+        "indexing in a knowledge base.\n\n"
+        "Prefer:\n"
+        "- Article/content pages over navigation/index pages\n"
+        "- Pages with specific topics over generic landing pages\n"
+        "- Documentation, guides, research, or news over login/signup/about/contact\n\n"
+        "SKIP: login pages, user profiles, search pages, privacy policies, "
+        "terms of service, duplicate/paginated versions of the same content.\n\n"
+        f"LINKS:\n{link_list}\n\n"
+        "Return ONLY a JSON array of the selected URLs, nothing else. "
+        "If none are worth crawling, return []."
+    )
+    raw, tokens = _fast_call(prompt, max_tokens=400)
+    if not raw:
+        return []
+    try:
+        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
+        selected = json.loads(cleaned)
+    except Exception:
+        _log.warning("crawl path selection unparseable: %s", raw[:200])
+        return []
+    if not isinstance(selected, list):
+        return []
+    # Only keep URLs that were in the original link list
+    link_set = set(links)
+    return [u for u in selected if isinstance(u, str) and u in link_set][:max_pages]
+
+
 def _process_source(
     source: dict,
     org_id: int,
@@ -711,7 +827,41 @@ def _process_source(
 
     _log.debug("source %s scraped %d chars from %s", target_id, len(text), url)
     new_hash = _content_hash(text)
+    is_parent = source.get("parent_target") is None
     if source.get("content_hash") == new_hash:
+        # Content unchanged — but for parent pages, still look for new sub-pages
+        if is_parent:
+            try:
+                already_tracked = db.list_tracked_urls(org_id)
+            except Exception:
+                already_tracked = set()
+            internal_links = _extract_internal_links(url, source=source)
+            new_links = [u for u in internal_links if u not in already_tracked]
+            if new_links:
+                selected = _select_crawl_paths(new_links, url, budget_remaining)
+                suggested = 0
+                for sub_url in selected:
+                    if not _check_robots(sub_url):
+                        continue
+                    try:
+                        db.record_suggestion(
+                            org_id=org_id,
+                            url=sub_url,
+                            name=source.get("name") or url,
+                            category=category,
+                            reason=f"Internal sub-page of {url}",
+                            confidence="high",
+                            confidence_score=9,
+                            suggested_by_url=url,
+                            suggested_by_cycle=cycle_id,
+                            parent_target=target_id,
+                        )
+                        suggested += 1
+                    except Exception:
+                        _log.error("failed to suggest child target %s", sub_url[:120], exc_info=True)
+                _log.info("source %s unchanged but suggested %d new sub-pages from %s",
+                          target_id, suggested, url[:80])
+
         db.update_scrape_target(
             target_id,
             last_scraped_at=datetime.now(timezone.utc).isoformat(),
@@ -770,6 +920,41 @@ def _process_source(
     rels, tokens = _extract_relationships(text, org_id)
     total_tokens += tokens
 
+    # --- Discover internal sub-pages and suggest as child targets ---
+    if total_tokens < budget_remaining:
+        try:
+            already_tracked = db.list_tracked_urls(org_id)
+        except Exception:
+            already_tracked = set()
+        internal_links = _extract_internal_links(url, source=source)
+        new_links = [u for u in internal_links if u not in already_tracked]
+        if new_links:
+            selected = _select_crawl_paths(new_links, url, budget_remaining - total_tokens)
+            suggested = 0
+            for sub_url in selected:
+                if not _check_robots(sub_url):
+                    _log.debug("crawl skip robots.txt disallow %s", sub_url[:120])
+                    continue
+                try:
+                    db.record_suggestion(
+                        org_id=org_id,
+                        url=sub_url,
+                        name=source.get("name") or url,
+                        category=category,
+                        reason=f"Internal sub-page of {url}",
+                        confidence="high",
+                        confidence_score=9,
+                        suggested_by_url=url,
+                        suggested_by_cycle=cycle_id,
+                        parent_target=target_id,
+                    )
+                    suggested += 1
+                except Exception:
+                    _log.error("failed to suggest child target %s", sub_url[:120], exc_info=True)
+            _log.info("source %s crawl  links=%d new=%d selected=%d suggested=%d from %s",
+                       target_id, len(internal_links), len(new_links),
+                       len(selected), suggested, url[:80])
+
     if total_tokens < budget_remaining:
         total_tokens += _discover_sources(text, url, org_id, cycle_id, db)
 
@@ -781,7 +966,8 @@ def _process_source(
         status="ok",
     )
     elapsed = round(time.time() - started, 2)
-    _log.info("source %s done  url=%s chunks=%d rels=%d tokens=%d %.1fs", target_id, url, chunks, rels, total_tokens, elapsed)
+    _log.info("source %s done  url=%s chunks=%d rels=%d tokens=%d %.1fs",
+              target_id, url, chunks, rels, total_tokens, elapsed)
     db.log_event(
         cycle_id, "source_scraped", org_id, target_id, url,
         message=f"rels={rels}",
@@ -990,16 +1176,32 @@ def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
             if remaining <= 0:
                 db.log_event(cycle_id, "budget_exhausted", org_id=org_id)
                 break
+
+            # Per-domain polite delay — longer if we just hit the same host
+            source_url = source.get("url") or ""
+            try:
+                domain = urlparse(source_url).netloc.lower()
+            except Exception:
+                domain = ""
+            now = time.time()
+            last_hit = _last_domain_hit.get(domain, 0)
+            if domain and now - last_hit < POLITE_SAME_DOMAIN_MAX:
+                delay = random.uniform(POLITE_SAME_DOMAIN_MIN, POLITE_SAME_DOMAIN_MAX)
+            else:
+                delay = random.uniform(POLITE_DELAY_MIN, POLITE_DELAY_MAX)
+            time.sleep(delay)
+            if domain:
+                _last_domain_hit[domain] = time.time()
+
             try:
                 tokens_used += _process_source(source, org_id, cycle_id, db, remaining)
             except Exception as e:
                 db.log_event(
                     cycle_id, "source_error", org_id=org_id,
                     scrape_target_id=source.get("Id"),
-                    source_url=source.get("url"),
+                    source_url=source_url,
                     message=str(e)[:500],
                 )
-            time.sleep(POLITE_DELAY_SECONDS)
 
         remaining = token_budget - tokens_used
         if sources and remaining > PROACTIVE_BUDGET_THRESHOLD:

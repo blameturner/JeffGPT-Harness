@@ -173,12 +173,21 @@ NOCODB_URL = os.getenv("NOCODB_URL")
 NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
 NOCODB_BASE_ID = os.getenv("NOCODB_BASE_ID")
 
+NOCODB_TABLE_ORGANISATION = "organisation"
+NOCODB_TABLE_AGENT_RUNS = "agent_runs"
+NOCODB_TABLE_ENRICHMENT_AGENTS = "enrichment_agents"
+NOCODB_TABLE_SCRAPE_TARGETS = "scrape_targets"
+NOCODB_TABLE_ENRICHMENT_LOG = "enrichment_log"
+NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS = "suggested_scrape_targets"
+NOCODB_TABLE_MESSAGES = "messages"
+NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
+
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
 
 ENRICHMENT_TOKEN_BUDGET = int(os.getenv("ENRICHMENT_TOKEN_BUDGET", "50000"))
 ENRICHMENT_LOG_RETENTION_DAYS = int(os.getenv("ENRICHMENT_LOG_RETENTION_DAYS", "30"))
-MAX_SUMMARY_INPUT_CHARS = 15000
+MAX_SUMMARY_INPUT_CHARS = 6000  # tuned for the small tool model's 8k context window
 PROACTIVE_BUDGET_THRESHOLD = 5000
 CATEGORY_COLLECTIONS = {
     "documentation": "scraped_documentation",

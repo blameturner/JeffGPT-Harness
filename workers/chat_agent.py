@@ -313,6 +313,7 @@ class ChatAgent:
         search_context = ""
         search_sources: list[dict] = []
         search_confidence = "none"
+        search_status = "not_used"
         search_note = ""
         search_errored = False
         if self.search_enabled:
@@ -330,6 +331,12 @@ class ChatAgent:
                 "ok": bool(search_sources),
                 "confidence": search_confidence,
             })
+            if search_errored:
+                search_status = "error"
+            elif search_sources:
+                search_status = "used"
+            else:
+                search_status = "no_results"
             if not search_sources:
                 search_note = (
                     "SEARCH STATUS: A live web search was performed but the "
@@ -354,14 +361,21 @@ class ChatAgent:
                     search_context, search_sources, search_confidence = run_web_search(user_message, self.org_id)
                 except Exception:
                     _log.error("web search failed", exc_info=True)
-                    search_context, search_sources = "", []
+                    search_context, search_sources, search_confidence = "", [], "none"
                     search_errored = True
                 emit({
                     "type": "search_complete",
                     "source_count": len(search_sources),
                     "sources": search_sources,
                     "ok": bool(search_sources),
+                    "confidence": search_confidence,
                 })
+                if search_errored:
+                    search_status = "error"
+                elif search_sources:
+                    search_status = "used"
+                else:
+                    search_status = "no_results"
                 if not search_sources:
                     search_note = (
                         "SEARCH STATUS: A live web search was performed but the "
@@ -374,6 +388,7 @@ class ChatAgent:
                         "it just returned empty this time."
                     )
             elif needs:
+                search_status = "consent_required"
                 _log.info("search consent required  conv=%s confidence=%s reason=%s", conversation_id, confidence, reason)
                 try:
                     self.db.update_conversation(conversation_id, {"status": "awaiting_consent"})
@@ -397,6 +412,7 @@ class ChatAgent:
                 })
                 return
         else:
+            search_status = "declined"
             search_note = (
                 "SEARCH STATUS: The user declined a live web search for this "
                 "question. Answer from general knowledge and explicitly flag "
@@ -479,7 +495,7 @@ class ChatAgent:
 
         if output:
             try:
-                self.db.add_message(
+                msg_row = self.db.add_message(
                     conversation_id=conversation_id,
                     org_id=self.org_id,
                     role="assistant",
@@ -488,8 +504,23 @@ class ChatAgent:
                     tokens_input=tokens_input,
                     tokens_output=tokens_output,
                     response_style=style_key,
+                    search_used=bool(search_sources) or search_status in ("used", "no_results", "error"),
+                    search_status=search_status,
+                    search_confidence=search_confidence,
+                    search_source_count=len(search_sources),
+                    search_context_text=search_context,
                 )
                 _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
+                if search_sources and msg_row.get("Id"):
+                    try:
+                        self.db.add_message_search_sources(
+                            message_id=msg_row["Id"],
+                            conversation_id=conversation_id,
+                            org_id=self.org_id,
+                            sources=search_sources,
+                        )
+                    except Exception:
+                        _log.error("search sources persist failed  conv=%s", conversation_id, exc_info=True)
             except Exception:
                 _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
@@ -530,6 +561,11 @@ class ChatAgent:
             "duration_seconds": duration,
             "rag_enabled": convo_rag_enabled,
             "context_chars": len(rag_context),
+            "response_style": style_key,
+            "search_used": bool(search_sources) or search_status in ("used", "no_results", "error"),
+            "search_status": search_status,
+            "search_confidence": search_confidence,
+            "search_source_count": len(search_sources),
         })
 
     def send_streaming(
