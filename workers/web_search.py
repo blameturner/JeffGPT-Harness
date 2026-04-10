@@ -526,7 +526,7 @@ def _dedupe(results: Iterable[dict]) -> list[dict]:
     return out
 
 
-def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
+def run_web_search(query: str, org_id: int) -> tuple[str, list[dict], str]:
     _log.debug("search start  query=%s org=%d", query[:100], org_id)
     queries = generate_search_queries(query)
 
@@ -617,9 +617,15 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
                 f"[{i}] {entry['title']} ({entry['url']}) {rel_tag}\n{entry['summary']}\n"
             )
         context_block = "\n".join(context_parts)
-        sources = [f"{e['title']}: {e['url']}" for e in sorted_results]
+        sources = [
+            {"index": i + 1, "title": e["title"], "url": e["url"],
+             "relevance": e["relevance"], "source_type": e["source_type"],
+             "snippet": e["summary"][:200]}
+            for i, e in enumerate(sorted_results)
+        ]
     elif raw_results:
         _log.warning("scraping failed on all %d candidates, returning raw SearxNG results", len(raw_results))
+        confidence = "low"
         context_parts = [
             "WEB SEARCH RESULTS — confidence: low. "
             "Search found results but full page content could not be retrieved. "
@@ -632,10 +638,15 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
             snippet = r.get("snippet") or ""
             context_parts.append(f"[{i}] {title} ({r['url']})\n{snippet}\n")
         context_block = "\n".join(context_parts)
-        sources = [f"{r.get('title') or r['url']}: {r['url']}" for r in raw_results[:MAX_SOURCES]]
+        sources = [
+            {"index": i + 1, "title": r.get("title") or r["url"], "url": r["url"],
+             "relevance": "unknown", "source_type": "unknown",
+             "snippet": (r.get("snippet") or "")[:200]}
+            for i, r in enumerate(raw_results[:MAX_SOURCES])
+        ]
     else:
         _log.warning("search returned no results for query=%s", query[:100])
-        return "", []
+        return "", [], "none"
 
     _log.info("search done   queries=%d candidates=%d results=%d scrape_failures=%d",
               len(queries), len(raw_results), len(results), scrape_failures)
@@ -648,7 +659,7 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
             daemon=True,
         ).start()
 
-    return context_block, sources
+    return context_block, sources, confidence
 
 
 def _suggest_sources_from_search(

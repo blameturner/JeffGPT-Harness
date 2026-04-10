@@ -311,22 +311,24 @@ class ChatAgent:
         emit({"type": "meta", "conversation_id": conversation_id})
 
         search_context = ""
-        search_sources: list[str] = []
+        search_sources: list[dict] = []
+        search_confidence = "none"
         search_note = ""
         search_errored = False
         if self.search_enabled:
             emit({"type": "searching"})
             try:
-                search_context, search_sources = run_web_search(user_message, self.org_id)
+                search_context, search_sources, search_confidence = run_web_search(user_message, self.org_id)
             except Exception:
                 _log.error("web search failed", exc_info=True)
-                search_context, search_sources = "", []
+                search_context, search_sources, search_confidence = "", [], "none"
                 search_errored = True
             emit({
                 "type": "search_complete",
                 "source_count": len(search_sources),
                 "sources": search_sources,
                 "ok": bool(search_sources),
+                "confidence": search_confidence,
             })
             if not search_sources:
                 search_note = (
@@ -339,17 +341,17 @@ class ChatAgent:
                     "Do NOT say you cannot search — you can and did, "
                     "it just returned empty this time."
                 )
-        else:
+        elif not search_consent_declined:
             try:
-                needs, reason = needs_web_search(user_message)
+                needs, reason, confidence = needs_web_search(user_message)
             except Exception:
                 _log.warning("needs_web_search classifier failed", exc_info=True)
-                needs, reason = False, ""
-            if needs:
+                needs, reason, confidence = False, "", ""
+            if needs and confidence == "high":
                 _log.info("auto-invoking search  conv=%s reason=%s", conversation_id, reason)
                 emit({"type": "searching"})
                 try:
-                    search_context, search_sources = run_web_search(user_message, self.org_id)
+                    search_context, search_sources, search_confidence = run_web_search(user_message, self.org_id)
                 except Exception:
                     _log.error("web search failed", exc_info=True)
                     search_context, search_sources = "", []
@@ -371,6 +373,37 @@ class ChatAgent:
                         "Do NOT say you cannot search — you can and did, "
                         "it just returned empty this time."
                     )
+            elif needs:
+                _log.info("search consent required  conv=%s confidence=%s reason=%s", conversation_id, confidence, reason)
+                try:
+                    self.db.update_conversation(conversation_id, {"status": "awaiting_consent"})
+                except Exception:
+                    pass
+                emit({
+                    "type": "search_consent_required",
+                    "query": user_message,
+                    "reason": reason or "this question may benefit from a web search",
+                })
+                emit({
+                    "type": "done",
+                    "conversation_id": conversation_id,
+                    "awaiting": "search_consent",
+                    "model": self.model,
+                    "tokens_input": 0,
+                    "tokens_output": 0,
+                    "duration_seconds": 0.0,
+                    "rag_enabled": False,
+                    "context_chars": 0,
+                })
+                return
+        else:
+            search_note = (
+                "SEARCH STATUS: The user declined a live web search for this "
+                "question. Answer from general knowledge and explicitly flag "
+                "that anything time-sensitive may be out of date. Do NOT "
+                "claim you lack the ability to search — the user chose not "
+                "to allow it this turn."
+            )
 
         style_key, style_prompt = chat_style_prompt(response_style)
 
