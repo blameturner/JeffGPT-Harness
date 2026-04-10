@@ -382,6 +382,23 @@ def _summarise(text: str) -> tuple[str, int]:
     return summary, tokens
 
 
+def _salvage_json_array(text: str) -> list | None:
+    # Truncated JSON from token limits — find the last complete object and close the array.
+    last_close = text.rfind("}")
+    if last_close == -1:
+        return None
+    truncated = text[:last_close + 1].rstrip(", \n\t") + "]"
+    if not truncated.startswith("["):
+        truncated = "[" + truncated
+    try:
+        result = json.loads(truncated)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
     _log.debug("extracting relationships  org=%d text_len=%d", org_id, len(text))
     prompt = (
@@ -391,16 +408,19 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
         "UPPER_SNAKE_CASE for relationship. Return only the JSON array.\n\n"
         f"CONTENT:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
     )
-    raw, tokens = _fast_call(prompt, max_tokens=600)
+    raw, tokens = _fast_call(prompt, max_tokens=1200)
     if not raw:
         _log.warning("relationship extraction returned empty  tokens=%d", tokens)
         return 0, tokens
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         triples = json.loads(cleaned)
-    except Exception:
-        _log.warning("relationship extraction unparseable: %s", raw[:200])
-        return 0, tokens
+    except json.JSONDecodeError:
+        triples = _salvage_json_array(cleaned)
+        if triples is None:
+            _log.warning("relationship extraction unparseable: %s", raw[:300])
+            return 0, tokens
+        _log.info("relationship extraction salvaged %d items from truncated JSON", len(triples))
     if not isinstance(triples, list):
         _log.warning("relationship extraction returned non-list: %s", type(triples).__name__)
         return 0, tokens

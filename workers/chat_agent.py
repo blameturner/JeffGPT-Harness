@@ -165,6 +165,18 @@ class ChatAgent:
             "fallback": True,
         }
 
+    @staticmethod
+    def _salvage_graph_json(text: str) -> dict | None:
+        # Truncated JSON — try to close partial structures.
+        for suffix in ["}", '"}', '"]}', '"]}}']:
+            try:
+                result = json.loads(text + suffix)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                continue
+        return None
+
     def _extract_and_write_graph(
         self,
         user_text: str,
@@ -198,7 +210,7 @@ class ChatAgent:
                     "model": fast_model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.0,
-                    "max_tokens": 400,
+                    "max_tokens": 1200,
                 },
                 timeout=60,
             )
@@ -206,7 +218,14 @@ class ChatAgent:
             raw = resp.json()["choices"][0]["message"]["content"].strip()
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?", "", raw).rstrip("`").strip()
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = self._salvage_graph_json(raw)
+                if data is None:
+                    _log.warning("graph extraction unparseable: %s", raw[:300])
+                    return
+                _log.info("graph extraction salvaged from truncated JSON  conv=%d", conversation_id)
         except Exception as e:
             _log.warning("graph extraction failed: %s", e)
             return
