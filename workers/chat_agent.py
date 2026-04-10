@@ -339,43 +339,38 @@ class ChatAgent:
                     "Do NOT say you cannot search — you can and did, "
                     "it just returned empty this time."
                 )
-        elif not search_consent_declined:
+        else:
             try:
                 needs, reason = needs_web_search(user_message)
             except Exception:
                 _log.warning("needs_web_search classifier failed", exc_info=True)
                 needs, reason = False, ""
             if needs:
-                _log.info("search consent required — pausing turn  conv=%s reason=%s", conversation_id, reason)
+                _log.info("auto-invoking search  conv=%s reason=%s", conversation_id, reason)
+                emit({"type": "searching"})
                 try:
-                    self.db.update_conversation(conversation_id, {"status": "awaiting_consent"})
+                    search_context, search_sources = run_web_search(user_message, self.org_id)
                 except Exception:
-                    pass
+                    _log.error("web search failed", exc_info=True)
+                    search_context, search_sources = "", []
+                    search_errored = True
                 emit({
-                    "type": "search_consent_required",
-                    "query": user_message,
-                    "reason": reason or "question appears to need live information",
+                    "type": "search_complete",
+                    "source_count": len(search_sources),
+                    "sources": search_sources,
+                    "ok": bool(search_sources),
                 })
-                emit({
-                    "type": "done",
-                    "conversation_id": conversation_id,
-                    "awaiting": "search_consent",
-                    "model": self.model,
-                    "tokens_input": 0,
-                    "tokens_output": 0,
-                    "duration_seconds": 0.0,
-                    "rag_enabled": False,
-                    "context_chars": 0,
-                })
-                return
-        else:
-            search_note = (
-                "SEARCH STATUS: The user declined a live web search for this "
-                "question. Answer from general knowledge and explicitly flag "
-                "that anything time-sensitive may be out of date. Do NOT "
-                "claim you lack the ability to search — the user chose not "
-                "to allow it this turn."
-            )
+                if not search_sources:
+                    search_note = (
+                        "SEARCH STATUS: A live web search was performed but the "
+                        "search engine returned no results at all"
+                        + (" (the search backend errored)." if search_errored
+                           else " for this query.")
+                        + " Tell the user you searched but found nothing, then "
+                        "answer from your own knowledge with a recency caveat. "
+                        "Do NOT say you cannot search — you can and did, "
+                        "it just returned empty this time."
+                    )
 
         style_key, style_prompt = chat_style_prompt(response_style)
 

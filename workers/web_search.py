@@ -422,28 +422,67 @@ def summarise_page(text: str, query: str) -> dict | None:
 
 
 
-def needs_web_search(message: str) -> tuple[bool, str]:
-    """Fast-model classifier — does this question need live web info?
+_EXPLICIT_SEARCH_PATTERNS = [
+    re.compile(r"\b(?:search|look up|google|find|lookup)\b.*\b(?:for|about|this|that|it|me)\b", re.I),
+    re.compile(r"\b(?:search|look up|google|find|lookup)\s+(?:for\s+)?(?:me\s+)?[\"'].+[\"']", re.I),
+    re.compile(r"\bwhat(?:'s| is| are)\b.*\b(?:today|tonight|this week|this weekend|right now|currently|latest|recent)\b", re.I),
+    re.compile(r"\b(?:current|latest|recent|live|today'?s?|tonight'?s?)\b.*\b(?:price|score|weather|news|results?|standings?|fixtures?|schedule|status)\b", re.I),
+    re.compile(r"\b(?:who won|who is winning|what happened|what's happening)\b", re.I),
+    re.compile(r"\bcan you (?:search|look|find|check)\b", re.I),
+    re.compile(r"\b(?:give me|get me|pull up|show me)\b.*\b(?:info|information|details|data|docs|documentation)\b", re.I),
+    re.compile(r"\b(?:best|top|recommended)\b.*\b(?:resources?|sources?|articles?|guides?|tutorials?|docs)\b", re.I),
+]
 
-    Returns (needs_search, reason). Defaults to (False, "") on any failure so
-    classifier hiccups never block a reply.
+
+def _explicit_search_intent(message: str) -> tuple[bool, str]:
+    for pat in _EXPLICIT_SEARCH_PATTERNS:
+        if pat.search(message):
+            return True, "explicit search request"
+    return False, ""
+
+
+def needs_web_search(message: str) -> tuple[bool, str, str]:
+    """Classify whether a message needs web search.
+
+    Returns (needs_search, reason, confidence).
+    confidence is "high" (auto-invoke), "medium" (consent prompt), or "" (no search).
+    Defaults to (False, "", "") on any failure.
     """
     msg = (message or "").strip()
     if not msg:
-        return False, ""
+        return False, "", ""
+
+    explicit, reason = _explicit_search_intent(msg)
+    if explicit:
+        _log.info("search intent detected (pattern): %s", reason)
+        return True, reason, "high"
 
     tool_url, tool_model = _tool_model()
     if not tool_url:
-        return False, ""
+        return False, "", ""
 
     prompt = (
-        "Decide whether answering this user question requires LIVE web "
-        "information — recent news, current scores/prices, 'today' / 'this "
-        "week' events, things that change frequently, or anything after an "
-        "LLM knowledge cutoff. Timeless or conceptual questions do NOT need "
-        "search. Reply with ONLY a JSON object of the form "
-        '{"needs_search": true|false, "reason": "<15 words or fewer>"}.\n\n'
-        f"Question: {msg}"
+        "Decide whether answering this user message would benefit from a web search. "
+        "Lean towards YES — it's better to search and find nothing than to miss "
+        "useful information. Return ONLY a JSON object:\n"
+        '{"needs_search": true|false, "confidence": "high"|"medium"|"low", '
+        '"reason": "<15 words or fewer>"}\n\n'
+        "needs_search=true (confidence high) when:\n"
+        "- Current events, scores, prices, weather, news, schedules\n"
+        "- References to 'today', 'this week', 'latest', 'recent', 'current'\n"
+        "- Specific products, frameworks, tools, or technologies\n"
+        "- Company or person's recent activity\n"
+        "- Fact-checking or verification requests\n"
+        "- Requests for documentation, resources, or guides\n\n"
+        "needs_search=true (confidence medium) when:\n"
+        "- The topic might have recent developments\n"
+        "- Unclear whether the user needs current vs general info\n"
+        "- A web search could add value but isn't essential\n\n"
+        "needs_search=false when:\n"
+        "- Clearly asking for help writing code, prose, or analysis\n"
+        "- Casual conversation or follow-up within an ongoing thread\n"
+        "- Abstract or philosophical questions\n\n"
+        f"Message: {msg[:500]}"
     )
     try:
         resp = httpx.post(
@@ -452,22 +491,27 @@ def needs_web_search(message: str) -> tuple[bool, str]:
                 "model": tool_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
-                "max_tokens": 60,
+                "max_tokens": 80,
             },
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         match = re.search(r"\{.*?\}", raw, re.S)
         if not match:
-            return False, ""
+            return False, "", ""
         data = json.loads(match.group(0))
         needs = bool(data.get("needs_search"))
         reason = str(data.get("reason") or "").strip()[:120]
-        return needs, reason
+        confidence = str(data.get("confidence") or "medium").lower()
+        if confidence not in ("high", "medium", "low"):
+            confidence = "medium"
+        if needs:
+            _log.info("search intent detected (classifier): confidence=%s reason=%s", confidence, reason)
+        return needs, reason, confidence if needs else ""
     except Exception as e:
         _log.warning("needs_web_search classifier failed: %s", e)
-        return False, ""
+        return False, "", ""
 
 
 def _dedupe(results: Iterable[dict]) -> list[dict]:
