@@ -7,10 +7,13 @@ at runtime via POST /scheduler/reload (wired in main.py).
 """
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any
 
 import requests
+
+_log = logging.getLogger("scheduler")
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -42,7 +45,7 @@ def _fetch_agent_schedules() -> list[dict]:
         data.raise_for_status()
         return data.json().get("list", [])
     except Exception as e:
-        print(f"[scheduler] fetch agent_schedules failed: {e}")
+        _log.error("fetch agent_schedules failed: %s", e)
         return []
 
 
@@ -61,9 +64,9 @@ def _run_agent_job(agent_name: str, org_id: int, task: str, product: str) -> Non
                 timeout=600,
             )
             if r.status_code >= 400:
-                print(f"[scheduler] agent run {agent_name} failed: {r.status_code} {r.text[:200]}")
+                _log.error("agent run %s failed: %d %s", agent_name, r.status_code, r.text[:200])
         except Exception as e:
-            print(f"[scheduler] agent run {agent_name} error: {e}")
+            _log.error("agent run %s error: %s", agent_name, e)
 
     threading.Thread(target=_call, daemon=True).start()
 
@@ -100,7 +103,7 @@ def _register_agent_schedules(sched: BackgroundScheduler) -> int:
             )
             count += 1
         except Exception as e:
-            print(f"[scheduler] agent_schedule row {row.get('Id')} invalid: {e}")
+            _log.warning("agent_schedule row %s invalid: %s", row.get("Id"), e)
     return count
 
 
@@ -125,7 +128,7 @@ def start_scheduler() -> BackgroundScheduler:
     )
     sched.start()
     registered = _register_agent_schedules(sched)
-    print(f"[scheduler] registered {registered} agent schedules")
+    _log.info("registered %d agent schedules", registered)
     _scheduler = sched
     return sched
 

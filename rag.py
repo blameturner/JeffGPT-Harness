@@ -39,7 +39,3 @@ def retrieve(query: str, org_id: int, collection_name: str = "agent_outputs", n_
     context_block = "\n\n---\n\n".join(top_texts)
     return f"RELEVANT CONTEXT:\n\n{context_block}"
 
-# Step 1 gets candidates from this org's scoped Chroma collection only
-# Step 2 extracts text from each
-# Step 3 reranks by relevance. only top k
-# Step 4 formats into context block

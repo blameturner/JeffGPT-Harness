@@ -1,8 +1,11 @@
 import json
+import logging
 from typing import Iterator
 from pydantic import ValidationError
 from agent import Agent, RunResult
 from schemas.base import AgentOutput
+
+_log = logging.getLogger("generator")
 
 class GeneratorAgent(Agent):
 
@@ -32,11 +35,11 @@ class GeneratorAgent(Agent):
             return AgentOutput(**data)
 
         except json.JSONDecodeError as e:
-            print(f"JSON parse error: {e}")
+            _log.warning("JSON parse error: %s", e)
             return None
 
         except ValidationError as e:
-            print(f"Validation error: {e}")
+            _log.warning("validation error: %s", e)
             return None
 
     def run(self, task: str, product: str = "") -> AgentOutput | None:
@@ -48,7 +51,7 @@ class GeneratorAgent(Agent):
         parsed = self._parse_response(result.output)
 
         if parsed is None:
-            print(f"Failed to parse structured output for task: {task[:100]}")
+            _log.warning("failed to parse structured output for task: %s", task[:100])
             return None
 
         return parsed

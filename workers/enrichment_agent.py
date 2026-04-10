@@ -23,9 +23,13 @@ from config import (
     NOCODB_URL,
     PROACTIVE_BUDGET_THRESHOLD,
 )
+import logging
+
 from graph import get_graph, write_relationship
 from memory import remember
-from workers.web_search import _fast_model, scrape_page, searxng_search
+from workers.web_search import _tool_model, scrape_page, searxng_search
+
+_log = logging.getLogger("enrichment")
 
 FAST_TIMEOUT = 60
 POLITE_DELAY_SECONDS = 2
@@ -170,7 +174,7 @@ class EnrichmentDB:
                 },
             )
         except Exception as e:
-            print(f"[enrichment] log_event failed ({event_type}): {e}")
+            _log.error("log_event failed (%s)", event_type, exc_info=True)
 
     def record_suggestion(
         self,
@@ -231,7 +235,7 @@ class EnrichmentDB:
             try:
                 self._delete("enrichment_log", row["Id"])
             except Exception as e:
-                print(f"[enrichment] purge row {row.get('Id')} failed: {e}")
+                _log.error("purge row %s failed", row.get("Id"), exc_info=True)
         return len(rows)
 
     def tokens_used_in_cycle(self, cycle_id: str) -> int:
@@ -244,14 +248,17 @@ class EnrichmentDB:
 
 def _fast_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
     """Call the fast model. Returns (text, tokens_used_estimate)."""
-    fast_url, fast_model = _fast_model()
-    if not fast_url:
+    tool_url, tool_model_id = _tool_model()
+    if not tool_url:
+        _log.error("tool model not available — no 'tool' or 'fast' role in model catalog")
         return "", 0
+    started = time.time()
+    _log.debug("tool_call    url=%s model=%s prompt_len=%d max_tokens=%d", tool_url, tool_model_id, len(prompt), max_tokens)
     try:
         r = httpx.post(
-            f"{fast_url}/v1/chat/completions",
+            f"{tool_url}/v1/chat/completions",
             json={
-                "model": fast_model,
+                "model": tool_model_id,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -263,9 +270,17 @@ def _fast_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[
         text = data["choices"][0]["message"]["content"].strip()
         usage = data.get("usage") or {}
         tokens = int(usage.get("total_tokens") or (len(prompt) // 4 + max_tokens))
+        elapsed = round(time.time() - started, 2)
+        _log.debug("tool_call ok  tokens=%d %.2fs", tokens, elapsed)
         return text, tokens
-    except Exception as e:
-        print(f"[enrichment] fast model call failed: {e}")
+    except httpx.HTTPStatusError as e:
+        _log.error("tool model %d from %s: %s", e.response.status_code, tool_url, e.response.text[:300])
+        return "", 0
+    except httpx.TimeoutException:
+        _log.error("tool model timeout after %ds from %s (prompt_len=%d)", FAST_TIMEOUT, tool_url, len(prompt))
+        return "", 0
+    except Exception:
+        _log.error("tool model call failed from %s", tool_url, exc_info=True)
         return "", 0
 
 
@@ -356,7 +371,7 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
             )
             written += 1
         except Exception as e:
-            print(f"[enrichment] relationship write failed: {e}")
+            _log.error("relationship write failed", exc_info=True)
     return written, tokens
 
 
@@ -408,7 +423,7 @@ def _discover_sources(
                 suggested_by_cycle=cycle_id,
             )
         except Exception as e:
-            print(f"[enrichment] suggestion record failed: {e}")
+            _log.error("suggestion record failed", exc_info=True)
     return tokens
 
 
@@ -422,25 +437,29 @@ def _process_source(
     """Returns tokens consumed."""
     url = source.get("url") or ""
     target_id = source.get("Id")
+    _log.debug("processing source %s (id=%s, org=%d)", url[:80], target_id, org_id)
     category = (source.get("category") or "documentation").lower()
     collection = CATEGORY_COLLECTIONS.get(category, "scraped_documentation")
     started = time.time()
 
     if not url:
+        _log.warning("source %s rejected: empty url", target_id)
         db.log_event(cycle_id, "source_rejected", org_id, target_id, url, "empty url")
         return 0
 
     if not _check_robots(url):
+        _log.info("source %s rejected: robots.txt disallow for %s", target_id, url)
         db.log_event(cycle_id, "source_rejected", org_id, target_id, url, "robots.txt disallow")
         return 0
 
-    # scrape_page already strips prompt-injection patterns before returning.
     text = scrape_page(url)
     if not text:
+        _log.warning("source %s scrape failed: no text extracted from %s", target_id, url)
         db.log_event(cycle_id, "source_error", org_id, target_id, url, "scrape failed")
         db.update_scrape_target(target_id, status="error")
         return 0
 
+    _log.debug("source %s scraped %d chars from %s", target_id, len(text), url)
     new_hash = _content_hash(text)
     if source.get("content_hash") == new_hash:
         db.update_scrape_target(
@@ -448,6 +467,7 @@ def _process_source(
             last_scraped_at=datetime.now(timezone.utc).isoformat(),
             status="ok",
         )
+        _log.debug("source %s unchanged (hash match) %s", target_id, url)
         db.log_event(
             cycle_id, "source_unchanged", org_id, target_id, url,
             duration_seconds=time.time() - started,
@@ -459,6 +479,7 @@ def _process_source(
     ok, reason, tokens = _validate_content(text)
     total_tokens += tokens
     if not ok:
+        _log.info("source %s rejected by validator: %s (%s)", target_id, reason, url)
         db.log_event(
             cycle_id, "source_rejected", org_id, target_id, url,
             message=reason, tokens_used=tokens, flags=["validator"],
@@ -473,6 +494,7 @@ def _process_source(
     summary, tokens = _summarise(text)
     total_tokens += tokens
     if not summary:
+        _log.warning("source %s summariser returned empty for %s", target_id, url)
         db.log_event(cycle_id, "source_error", org_id, target_id, url, "summariser failed")
         return total_tokens
 
@@ -508,12 +530,14 @@ def _process_source(
         chunk_count=chunks,
         status="ok",
     )
+    elapsed = round(time.time() - started, 2)
+    _log.info("source %s done  url=%s chunks=%d rels=%d tokens=%d %.1fs", target_id, url, chunks, rels, total_tokens, elapsed)
     db.log_event(
         cycle_id, "source_scraped", org_id, target_id, url,
         message=f"rels={rels}",
         chunks_stored=chunks,
         tokens_used=total_tokens,
-        duration_seconds=time.time() - started,
+        duration_seconds=elapsed,
     )
     return total_tokens
 
@@ -532,7 +556,7 @@ def _proactive_search(
         )
         concepts = [row[0] for row in result.result_set if row and row[0]]
     except Exception as e:
-        print(f"[enrichment] proactive: graph query failed: {e}")
+        _log.error("proactive graph query failed", exc_info=True)
         return 0
 
     if not concepts:
@@ -587,14 +611,16 @@ def _proactive_search(
 
 def run_enrichment_cycle() -> None:
     cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    _log.info("cycle %s starting", cycle_id)
     started = time.time()
     try:
         db = EnrichmentDB()
     except Exception as e:
-        print(f"[enrichment] DB init failed: {e}")
+        _log.error("DB init failed", exc_info=True)
         return
 
     if db.has_running_inferences():
+        _log.info("cycle %s deferred — active agent_runs", cycle_id)
         db.log_event(cycle_id, "deferred", message="active agent_runs")
         return
 
@@ -649,12 +675,14 @@ def run_enrichment_cycle() -> None:
             try:
                 tokens_used += _proactive_search(org_id, cycle_id, db, remaining)
             except Exception as e:
-                print(f"[enrichment] proactive_search failed: {e}")
+                _log.error("proactive_search failed", exc_info=True)
 
+    elapsed = round(time.time() - started, 1)
+    _log.info("cycle %s done  tokens=%d %.1fs", cycle_id, tokens_used, elapsed)
     db.log_event(
         cycle_id, "cycle_end",
         tokens_used=tokens_used,
-        duration_seconds=time.time() - started,
+        duration_seconds=elapsed,
     )
 
 
@@ -662,9 +690,9 @@ def run_log_cleanup() -> None:
     try:
         db = EnrichmentDB()
         deleted = db.purge_old_logs(ENRICHMENT_LOG_RETENTION_DAYS)
-        print(f"[enrichment] log cleanup deleted {deleted} rows")
+        _log.info("log cleanup deleted %d rows", deleted)
     except Exception as e:
-        print(f"[enrichment] log cleanup failed: {e}")
+        _log.error("log cleanup failed", exc_info=True)
 
 
 def sources_due_count() -> int:

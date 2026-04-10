@@ -1,43 +1,59 @@
+import logging
 import chromadb
 
-from config import CHROMA_URL, scoped_collection  # added scoped_collection
+from config import CHROMA_URL, scoped_collection
 from embedder import embed
 from urllib import parse
 
-parsed = parse.urlparse(CHROMA_URL)
+_log = logging.getLogger("memory")
+
+parsed = parse.urlparse(CHROMA_URL) if CHROMA_URL else None
+if not parsed or not parsed.hostname:
+    _log.error("CHROMA_URL is missing or invalid: %s", CHROMA_URL)
 
 client = chromadb.HttpClient(
-    host=parsed.hostname,
-    port=parsed.port
+    host=parsed.hostname if parsed else "localhost",
+    port=parsed.port if parsed else 8000,
 )
 
-def get_collection(org_id: int, name: str):  # added org_id parameter
-    return client.get_or_create_collection(scoped_collection(org_id, name))  # scope the name
+def get_collection(org_id: int, name: str):
+    scoped = scoped_collection(org_id, name)
+    _log.debug("get_collection %s", scoped)
+    return client.get_or_create_collection(scoped)
 
-def remember(text: str, metadata: dict, org_id: int, collection_name: str = "agent_outputs") -> list[str]:  # added org_id
+def remember(text: str, metadata: dict, org_id: int, collection_name: str = "agent_outputs") -> list[str]:
     from chunker import chunk_text
     import uuid
 
     chunks = chunk_text(text)
-    collection = get_collection(org_id, collection_name)  # pass org_id
+    scoped = scoped_collection(org_id, collection_name)
+    _log.debug("remember  collection=%s chunks=%d text_len=%d", scoped, len(chunks), len(text))
+    collection = get_collection(org_id, collection_name)
     ids = []
 
     for i, chunk in enumerate(chunks):
-        vector = embed(chunk)
+        try:
+            vector = embed(chunk)
+        except Exception:
+            _log.warning("embed failed  collection=%s chunk=%d/%d len=%d, skipping", scoped, i, len(chunks), len(chunk.split()))
+            continue
         chunk_id = str(uuid.uuid4())
+        try:
+            collection.add(
+                ids=[chunk_id],
+                embeddings=[vector],
+                documents=[chunk],
+                metadatas=[{**metadata, "chunk_index": i, "org_id": org_id}],
+            )
+            ids.append(chunk_id)
+        except Exception:
+            _log.error("chroma add failed  collection=%s chunk=%d/%d", scoped, i, len(chunks), exc_info=True)
 
-        collection.add(
-            ids=[chunk_id],
-            embeddings=[vector],
-            documents=[chunk],
-            metadatas=[{**metadata, "chunk_index": i, "org_id": org_id}],  # added org_id to metadata
-        )
-        ids.append(chunk_id)
-
+    _log.debug("remember ok  collection=%s stored=%d/%d", scoped, len(ids), len(chunks))
     return ids
 
-def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_results: int = 5) -> list[dict]:  # added org_id
-    collection = get_collection(org_id, collection_name)  # pass org_id
+def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_results: int = 5) -> list[dict]:
+    collection = get_collection(org_id, collection_name)
     vector = embed(query)
 
     results = collection.query(
@@ -46,7 +62,6 @@ def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_re
     )
 
     output = []
-
     for i, doc in enumerate(results["documents"][0]):
         output.append({
             "text": doc,
@@ -54,4 +69,5 @@ def recall(query: str, org_id: int, collection_name: str = "agent_outputs", n_re
             "distance": results["distances"][0][i],
         })
 
+    _log.debug("recall  collection=%s results=%d", scoped_collection(org_id, collection_name), len(output))
     return output

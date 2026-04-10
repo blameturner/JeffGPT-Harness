@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import time
 from typing import Iterator, Literal
@@ -12,6 +13,8 @@ from memory import remember
 from rag import retrieve
 from workers.chat_agent import ChatAgent
 from workers.styles import code_style_prompt
+
+_log = logging.getLogger("code")
 
 
 PLAN_SYSTEM = (
@@ -114,7 +117,7 @@ def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> lis
             return []
         return [str(x).strip() for x in data if str(x).strip()][:30]
     except Exception as e:
-        print(f"[code] plan checklist parse failed: {e}")
+        _log.warning("plan checklist parse failed: %s", e)
         return []
 
 
@@ -142,7 +145,7 @@ class CodeAgent(ChatAgent):
         try:
             msgs = self.db.list_code_messages(conversation_id)
         except Exception as e:
-            print(f"[code] workspace load failed: {e}")
+            _log.error("workspace load failed", exc_info=True)
             return []
         for m in reversed(msgs):
             if m.get("role") != "user":
@@ -150,8 +153,6 @@ class CodeAgent(ChatAgent):
             raw = m.get("files_json")
             if not raw:
                 continue
-            # NocoDB JSON columns return a list/dict directly; older rows or
-            # string-encoded values need parsing.
             if isinstance(raw, list):
                 return raw
             if isinstance(raw, str):
@@ -176,7 +177,6 @@ class CodeAgent(ChatAgent):
         system_prompt = _SYSTEMS[self.mode]
         style_key, style_prompt = code_style_prompt(response_style)
 
-        # --- load or create code conversation ------------------------------
         history: list[dict] = []
         is_new = False
         if conversation_id is None:
@@ -190,7 +190,7 @@ class CodeAgent(ChatAgent):
                 conversation_id = convo["Id"]
                 is_new = True
             except Exception as e:
-                print(f"[code] create_code_conversation failed: {e}")
+                _log.error("create_code_conversation failed", exc_info=True)
         else:
             try:
                 convo = self.db.get_code_conversation(conversation_id)
@@ -201,25 +201,22 @@ class CodeAgent(ChatAgent):
                     {"role": m["role"], "content": m["content"]}
                     for m in self.db.list_code_messages(conversation_id)
                 ]
-                # If caller sent no files, re-hydrate the prior workspace.
                 if not self.files:
                     self.files = self._load_workspace(conversation_id)
             except Exception as e:
-                print(f"[code] load history failed: {e}")
+                _log.error("load history failed", exc_info=True)
 
-        # Patch the conversation's stored mode on every turn so the sidebar
-        # badge reflects the latest mode in a switched session.
         if conversation_id is not None and not is_new:
             try:
                 self.db.update_code_conversation(
                     conversation_id, {"rag_collection": self.mode}
                 )
             except Exception as e:
-                print(f"[code] mode patch failed: {e}")
+                _log.warning("mode patch failed: %s", e)
 
+        _log.debug("turn start  conv=%s mode=%s model=%s org=%d", conversation_id, self.mode, self.model, self.org_id)
         yield {"type": "meta", "mode": self.mode, "conversation_id": conversation_id}
 
-        # --- build the composed user message -------------------------------
         files_block = _render_files_block(self.files)
         pieces: list[str] = []
         if files_block:
@@ -229,7 +226,6 @@ class CodeAgent(ChatAgent):
         pieces.append(user_message)
         composed_message = "\n\n".join(pieces)
 
-        # --- optional: retrieve from a codebase RAG collection -------------
         codebase_context = ""
         if codebase_collection:
             try:
@@ -241,10 +237,9 @@ class CodeAgent(ChatAgent):
                     top_k=5,
                 )
             except Exception as e:
-                print(f"[code] codebase retrieve failed: {e}")
+                _log.error("codebase RAG retrieve failed", exc_info=True)
                 codebase_context = ""
 
-        # --- persist user turn ---------------------------------------------
         storage_files = _files_to_storage(self.files)
         if conversation_id is not None:
             try:
@@ -252,14 +247,14 @@ class CodeAgent(ChatAgent):
                     conversation_id=conversation_id,
                     org_id=self.org_id,
                     role="user",
-                    content=user_message,  # store the raw user text, not the composed blob
+                    content=user_message,
                     model=self.model,
                     mode=self.mode,
                     files_json=storage_files or None,
                     response_style=style_key,
                 )
             except Exception as e:
-                print(f"[code] user message persist failed: {e}")
+                _log.error("user message persist failed", exc_info=True)
 
         payload: list[dict] = [
             {"role": "system", "content": style_prompt},
@@ -277,6 +272,7 @@ class CodeAgent(ChatAgent):
         payload.extend(history)
         payload.append({"role": "user", "content": composed_message})
 
+        _log.debug("model call   conv=%s messages=%d temp=%.1f max_tokens=%d", conversation_id, len(payload), temperature, max_tokens)
         start = time.time()
         accumulated: list[str] = []
         final_usage: dict = {}
@@ -304,8 +300,8 @@ class CodeAgent(ChatAgent):
         output = "".join(accumulated)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
+        _log.info("turn done    conv=%s mode=%s model=%s in=%d out=%d %.1fs", conversation_id, self.mode, final_model, tokens_input, tokens_output, duration)
 
-        # --- persist assistant turn ----------------------------------------
         if conversation_id is not None:
             try:
                 self.db.add_code_message(
@@ -320,9 +316,8 @@ class CodeAgent(ChatAgent):
                     response_style=style_key,
                 )
             except Exception as e:
-                print(f"[code] assistant message persist failed: {e}")
+                _log.error("assistant message persist failed", exc_info=True)
 
-        # --- save to semantic memory (Chroma), mirroring chat RAG ---------
         if conversation_id is not None:
             try:
                 remember(
@@ -337,11 +332,10 @@ class CodeAgent(ChatAgent):
                     collection_name=f"code_{conversation_id}",
                 )
             except Exception as e:
-                print(f"[code] memory write failed: {e}")
+                _log.error("memory write failed", exc_info=True)
 
-        # --- plan → checklist (plan mode only) -----------------------------
         if self.mode == "plan":
-            fast_url, fast_model = self._fast_model_url()
+            fast_url, fast_model = self._tool_model_url()
             if fast_url:
                 steps = _parse_plan_checklist(output, fast_url, fast_model)
                 if steps:
@@ -351,7 +345,7 @@ class CodeAgent(ChatAgent):
                                 conversation_id, {"code_checklist": steps}
                             )
                         except Exception as e:
-                            print(f"[code] checklist persist failed: {e}")
+                            _log.error("checklist persist failed", exc_info=True)
                     yield {"type": "plan_checklist", "steps": steps}
 
         yield {

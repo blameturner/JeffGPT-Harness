@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Iterable
@@ -12,6 +13,8 @@ from bs4 import BeautifulSoup
 
 from config import MODELS, SEARXNG_URL
 from memory import remember
+
+_log = logging.getLogger("web_search")
 
 SCRAPE_BLOCKLIST = {
     "reddit.com",
@@ -38,14 +41,13 @@ def _is_blocklisted(url: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in SCRAPE_BLOCKLIST)
 
 MAX_SOURCES = 5
-OVERFETCH_FACTOR = 4                # how many candidates per desired summary
-PER_PAGE_CHAR_CAP = 20_000          # hard cap before summarisation
-SUMMARY_MAX_TOKENS = 300            # fast-model cap per page
+OVERFETCH_FACTOR = 4
+PER_PAGE_CHAR_CAP = 20_000
+SUMMARY_MAX_TOKENS = 300
 SEARXNG_TIMEOUT = 10
 SCRAPE_TIMEOUT = 15
 FAST_TIMEOUT = 60
 
-# Realistic desktop Chrome UA — many news sites 403 anything that looks like a bot.
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -77,27 +79,47 @@ def _strip_injection_patterns(text: str) -> str:
 
 def _fast_model() -> tuple[str | None, str | None]:
     entry = MODELS.get("fast")
-    if not isinstance(entry, dict):
-        return None, None
-    return entry.get("url"), entry.get("model_id") or "fast"
+    if isinstance(entry, dict):
+        return entry.get("url"), entry.get("model_id") or "fast"
+    for v in MODELS.values():
+        if isinstance(v, dict) and v.get("url"):
+            _log.debug("no 'fast' role in catalog, falling back to %s", v.get("role"))
+            return v.get("url"), v.get("model_id") or v.get("role")
+    return None, None
+
+
+def _tool_model() -> tuple[str | None, str | None]:
+    entry = MODELS.get("tool")
+    if isinstance(entry, dict):
+        return entry.get("url"), entry.get("model_id") or "tool"
+    _log.debug("no 'tool' role in catalog, falling back to fast model")
+    return _fast_model()
 
 
 def searxng_search(query: str, max_results: int = MAX_SOURCES) -> list[dict]:
+    search_url = f"{SEARXNG_URL}/search"
+    _log.debug("searxng request  url=%s query=%s", search_url, query[:120])
     try:
         resp = httpx.get(
-            f"{SEARXNG_URL}/search",
+            search_url,
             params={"q": query, "format": "json"},
             timeout=SEARXNG_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception as e:
-        print(f"[web_search] searxng failed for '{query}': {e}")
+    except httpx.HTTPStatusError as e:
+        _log.error("searxng %d for '%s': %s", e.response.status_code, query, e.response.text[:300])
+        return []
+    except httpx.TimeoutException:
+        _log.error("searxng timeout after %ds for '%s'", SEARXNG_TIMEOUT, query)
+        return []
+    except Exception:
+        _log.error("searxng failed for '%s'", query, exc_info=True)
         return []
 
     results = data.get("results") or []
     out: list[dict] = []
-    for r in results[: max_results * 2]:  # overfetch; scrape may fail
+    for r in results[: max_results * 2]:
         url = r.get("url")
         if not url:
             continue
@@ -106,13 +128,14 @@ def searxng_search(query: str, max_results: int = MAX_SOURCES) -> list[dict]:
             "url": url,
             "snippet": (r.get("content") or "").strip(),
         })
+    _log.debug("searxng returned %d raw results, kept %d", len(results), len(out))
     return out
 
 
 def generate_search_queries(message: str) -> list[str]:
-
-    fast_url, fast_model = _fast_model()
-    if not fast_url:
+    tool_url, tool_model = _tool_model()
+    if not tool_url:
+        _log.debug("no tool model, using raw message as search query")
         return [message.strip()[:200]]
 
     prompt = (
@@ -122,9 +145,9 @@ def generate_search_queries(message: str) -> list[str]:
     )
     try:
         resp = httpx.post(
-            f"{fast_url}/v1/chat/completions",
+            f"{tool_url}/v1/chat/completions",
             json={
-                "model": fast_model,
+                "model": tool_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
                 "max_tokens": 120,
@@ -135,10 +158,12 @@ def generate_search_queries(message: str) -> list[str]:
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         cleaned = _parse_query_list(raw)
         if cleaned:
-            return cleaned[:3]
-        print(f"[web_search] query generation returned no parseable list; raw={raw[:200]!r}")
+            queries = cleaned[:3]
+            _log.debug("generated queries: %s", queries)
+            return queries
+        _log.warning("query generation returned no parseable list; raw=%s", raw[:200])
     except Exception as e:
-        print(f"[web_search] query generation failed: {e}")
+        _log.error("query generation failed", exc_info=True)
 
     return [message.strip()[:200]]
 
@@ -152,12 +177,10 @@ def _parse_query_list(raw: str) -> list[str]:
     if not raw:
         return []
     text = raw.strip()
-    # Strip ``` fences
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = text.rstrip("`").strip()
 
-    # Try: JSON array anywhere in the text
     match = re.search(r"\[.*?\]", text, re.S)
     if match:
         try:
@@ -170,16 +193,13 @@ def _parse_query_list(raw: str) -> list[str]:
         except Exception:
             pass
 
-    # Try: numbered / bulleted / plain lines
     out: list[str] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        # Strip "1.", "1)", "- ", "* ", "• "
         line = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", line)
         line = line.strip().strip('"\'')
-        # Skip obvious prose preamble
         if len(line) > 200 or line.endswith(":"):
             continue
         if line:
@@ -188,15 +208,14 @@ def _parse_query_list(raw: str) -> list[str]:
 
 
 def scrape_page(url: str, snippet: str = "") -> str:
-    """Fetch and extract page text. Falls back to `snippet` on any failure
-    (403, timeout, parse error, blocklisted domain)."""
+    """Fetch and extract page text. Falls back to `snippet` on any failure."""
     fallback = _strip_injection_patterns(snippet)[:PER_PAGE_CHAR_CAP] if snippet else ""
 
     if _is_blocklisted(url):
-        if fallback:
-            print(f"[web_search] blocklisted {url}; using snippet")
+        _log.debug("scrape skip  blocklisted %s", url)
         return fallback
 
+    started = time.time()
     try:
         resp = httpx.get(
             url,
@@ -205,14 +224,23 @@ def scrape_page(url: str, snippet: str = "") -> str:
             headers=BROWSER_HEADERS,
         )
         resp.raise_for_status()
-    except Exception as e:
-        print(f"[web_search] scrape failed for {url}: {e}")
+    except httpx.HTTPStatusError as e:
+        _log.warning("scrape %d for %s (%s)", e.response.status_code, url, e.response.reason_phrase)
         return fallback
+    except httpx.TimeoutException:
+        _log.warning("scrape timeout after %ds for %s", SCRAPE_TIMEOUT, url)
+        return fallback
+    except Exception as e:
+        _log.warning("scrape failed for %s: %s", url, e)
+        return fallback
+
+    elapsed = round(time.time() - started, 2)
+    _log.debug("scrape ok    %s  status=%d size=%d %.2fs", url, resp.status_code, len(resp.text), elapsed)
 
     try:
         soup = BeautifulSoup(resp.text, "lxml")
     except Exception as e:
-        print(f"[web_search] parse failed for {url}: {e}")
+        _log.warning("html parse failed for %s: %s", url, e)
         return fallback
 
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript"]):
@@ -222,6 +250,11 @@ def scrape_page(url: str, snippet: str = "") -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _strip_injection_patterns(text)
     text = text[:PER_PAGE_CHAR_CAP]
+    extracted = len(text)
+    if not text:
+        _log.warning("scrape empty after extraction for %s (raw html was %d chars)", url, len(resp.text))
+    else:
+        _log.debug("scrape extracted %d chars from %s", extracted, url)
     return text or fallback
 
 
@@ -229,8 +262,9 @@ def scrape_page(url: str, snippet: str = "") -> str:
 def summarise_page(text: str, query: str) -> str:
     if not text.strip():
         return ""
-    fast_url, fast_model = _fast_model()
-    if not fast_url:
+    tool_url, tool_model = _tool_model()
+    if not tool_url:
+        _log.warning("no tool model available, returning raw truncation for '%s'", query[:80])
         return text[:1200]
 
     prompt = (
@@ -240,11 +274,12 @@ def summarise_page(text: str, query: str) -> str:
         "If the page is irrelevant, reply exactly: IRRELEVANT.\n\n"
         f"PAGE:\n{text}"
     )
+    started = time.time()
     try:
         resp = httpx.post(
-            f"{fast_url}/v1/chat/completions",
+            f"{tool_url}/v1/chat/completions",
             json={
-                "model": fast_model,
+                "model": tool_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
                 "max_tokens": SUMMARY_MAX_TOKENS,
@@ -253,11 +288,14 @@ def summarise_page(text: str, query: str) -> str:
         )
         resp.raise_for_status()
         summary = resp.json()["choices"][0]["message"]["content"].strip()
+        elapsed = round(time.time() - started, 2)
         if summary.upper().startswith("IRRELEVANT"):
+            _log.debug("summarise    irrelevant for '%s' %.2fs", query[:80], elapsed)
             return ""
+        _log.debug("summarise    ok for '%s' %d chars %.2fs", query[:80], len(summary), elapsed)
         return summary
-    except Exception as e:
-        print(f"[web_search] summarisation failed for {query}: {e}")
+    except Exception:
+        _log.error("summarisation failed for '%s'", query, exc_info=True)
         return text[:1200]
 
 
@@ -272,8 +310,8 @@ def needs_web_search(message: str) -> tuple[bool, str]:
     if not msg:
         return False, ""
 
-    fast_url, fast_model = _fast_model()
-    if not fast_url:
+    tool_url, tool_model = _tool_model()
+    if not tool_url:
         return False, ""
 
     prompt = (
@@ -287,9 +325,9 @@ def needs_web_search(message: str) -> tuple[bool, str]:
     )
     try:
         resp = httpx.post(
-            f"{fast_url}/v1/chat/completions",
+            f"{tool_url}/v1/chat/completions",
             json={
-                "model": fast_model,
+                "model": tool_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": 60,
@@ -306,7 +344,7 @@ def needs_web_search(message: str) -> tuple[bool, str]:
         reason = str(data.get("reason") or "").strip()[:120]
         return needs, reason
     except Exception as e:
-        print(f"[web_search] needs_web_search classifier failed: {e}")
+        _log.warning("needs_web_search classifier failed: %s", e)
         return False, ""
 
 
@@ -323,6 +361,7 @@ def _dedupe(results: Iterable[dict]) -> list[dict]:
 
 
 def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
+    _log.debug("search start  query=%s org=%d", query[:100], org_id)
     queries = generate_search_queries(query)
 
     max_candidates = MAX_SOURCES * OVERFETCH_FACTOR
@@ -333,7 +372,7 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
             break
     raw_results = _dedupe(raw_results)[:max_candidates]
 
-    summaries: list[tuple[str, str, str]] = []  # (title, url, summary)
+    summaries: list[tuple[str, str, str]] = []
     for r in raw_results:
         if len(summaries) >= MAX_SOURCES:
             break
@@ -358,7 +397,7 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
                 collection_name="web_search",
             )
         except Exception as e:
-            print(f"[web_search] chroma write failed for {r['url']}: {e}")
+            _log.error("chroma write failed for %s", r["url"], exc_info=True)
 
     if not summaries:
         return "", []
@@ -369,4 +408,5 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
     context_block = "\n".join(context_parts)
 
     sources = [f"{title}: {url}" for title, url, _ in summaries]
+    _log.info("search done   queries=%d candidates=%d summaries=%d", len(queries), len(raw_results), len(summaries))
     return context_block, sources

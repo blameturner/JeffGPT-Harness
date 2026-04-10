@@ -4,11 +4,11 @@ from config import FALKORDB_HOST, FALKORDB_PORT, scoped_graph
 
 client = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
 
-def get_graph(org_id: int):  # new helper function
+def get_graph(org_id: int):
     return client.select_graph(scoped_graph(org_id))
 
 def write_relationship(
-        org_id: int,  # added org_id
+        org_id: int,
         from_type: str,
         from_name: str,
         relationship: str,

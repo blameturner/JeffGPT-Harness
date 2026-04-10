@@ -1,6 +1,9 @@
 import time
+import logging
 import requests
 from config import NOCODB_URL, NOCODB_TOKEN, NOCODB_BASE_ID
+
+_log = logging.getLogger("nocodb")
 
 
 class NocodbClient:
@@ -12,7 +15,6 @@ class NocodbClient:
         }
         self.tables = self._load_tables()
 
-# runs at startup to get all tableIDs for db functions
     def _load_tables(self) -> dict:
         for attempt in range(15):
             try:
@@ -25,7 +27,7 @@ class NocodbClient:
                 tables = response.json()["list"]
                 return {table["title"]: table["id"] for table in tables}
             except Exception:
-                print(f"Nocodb not ready, retrying... ({attempt + 1}/15)")
+                _log.warning("nocodb not ready, retrying (%d/15)", attempt + 1)
                 time.sleep(2)
         raise RuntimeError("Could not connect to Nocodb after 30 seconds")
 
@@ -195,8 +197,6 @@ class NocodbClient:
             payload["response_style"] = response_style
         return self._post("messages", payload)
 
-    # --- code conversations (mirror of chat, separate tables) ------------
-
     def create_code_conversation(
         self,
         org_id: int,
@@ -262,9 +262,6 @@ class NocodbClient:
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
         }
-        # Optional columns — only included if the table has them, so schemas
-        # without the new fields still work. `files_json` is a NocoDB JSON
-        # column so we send the raw list, not a JSON-encoded string.
         if mode:
             payload["mode"] = mode
         if files_json:
@@ -304,7 +301,6 @@ class NocodbClient:
             })
             return data.get("list", [])
         except requests.HTTPError:
-            # observations table may not have a conversation_id column yet
             return []
 
     def save_observation(

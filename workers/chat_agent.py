@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import threading
 import time
@@ -15,17 +16,11 @@ from graph import write_relationship
 from workers.web_search import run_web_search, needs_web_search
 from workers.styles import chat_style_prompt
 
+_log = logging.getLogger("chat")
 
-# --- Summarisation constants -----------------------------------------------
-# Cap for how much history we feed into the fast model for summarisation.
-# The fast model runs with a 16384-token context; ~48k chars is a safe cap.
+
 MAX_SUMMARY_INPUT_CHARS = 48_000
-
-# Rough char-budget before we trigger summarisation. Assume a chat model
-# window of ~32k tokens ≈ 128k chars; trigger at 80%.
 SUMMARISE_TRIGGER_CHARS = int(128_000 * 0.8)
-
-# Fallback when summarisation fails: keep this many most-recent messages.
 FALLBACK_RECENT_MESSAGES = 12
 
 
@@ -69,8 +64,6 @@ class ChatAgent:
         self.search_enabled = search_enabled
         self.db = NocodbClient()
 
-    # --- helpers -----------------------------------------------------------
-
     @staticmethod
     def _default_collection(conversation_id: int) -> str:
         return f"chat_{conversation_id}"
@@ -85,14 +78,14 @@ class ChatAgent:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return False
 
-    def _fast_model_url(self) -> tuple[str | None, str | None]:
-        """Return (url, model_id) for the configured 'fast' role, or (None, None)."""
+    def _tool_model_url(self) -> tuple[str | None, str | None]:
+        entry = MODELS.get("tool")
+        if isinstance(entry, dict):
+            return entry.get("url"), entry.get("model_id") or "tool"
         entry = MODELS.get("fast")
-        if not isinstance(entry, dict):
-            return None, None
-        return entry.get("url"), entry.get("model_id") or "fast"
-
-    # --- summarisation -----------------------------------------------------
+        if isinstance(entry, dict):
+            return entry.get("url"), entry.get("model_id") or "fast"
+        return None, None
 
     def _maybe_summarise(self, history: list[dict]) -> tuple[list[dict], dict | None]:
         """If history is too large, replace the oldest portion with a summary.
@@ -121,7 +114,7 @@ class ChatAgent:
             used += len(line)
         transcript = "".join(buf)
 
-        fast_url, fast_model = self._fast_model_url()
+        fast_url, fast_model = self._tool_model_url()
         summary_text: str | None = None
 
         if fast_url:
@@ -150,7 +143,7 @@ class ChatAgent:
                 resp.raise_for_status()
                 summary_text = resp.json()["choices"][0]["message"]["content"]
             except Exception as e:
-                print(f"[chat] summarisation failed, falling back: {e}")
+                _log.warning("summarisation failed, falling back: %s", e)
                 summary_text = None
 
         if summary_text:
@@ -166,7 +159,6 @@ class ChatAgent:
                 "summary_chars": len(summary_text),
             }
 
-        # Fallback: just trim to most recent messages, never error.
         trimmed = history[-FALLBACK_RECENT_MESSAGES:]
         return trimmed, {
             "type": "summarised",
@@ -174,8 +166,6 @@ class ChatAgent:
             "summary_chars": 0,
             "fallback": True,
         }
-
-    # --- knowledge graph ---------------------------------------------------
 
     def _extract_and_write_graph(
         self,
@@ -188,7 +178,7 @@ class ChatAgent:
         Safe when the chat model IS the fast model — this runs in a daemon
         thread and does not stream, so there is no recursion risk.
         """
-        fast_url, fast_model = self._fast_model_url()
+        fast_url, fast_model = self._tool_model_url()
         if not fast_url:
             return
 
@@ -218,7 +208,7 @@ class ChatAgent:
                 raw = re.sub(r"^```(?:json)?", "", raw).rstrip("`").strip()
             data = json.loads(raw)
         except Exception as e:
-            print(f"[chat] graph extraction failed: {e}")
+            _log.warning("graph extraction failed: %s", e)
             return
 
         relations = data.get("relations") or []
@@ -239,9 +229,7 @@ class ChatAgent:
                     to_name=b[:200],
                 )
             except Exception as e:
-                print(f"[chat] graph write failed ({a}-{rel}->{b}): {e}")
-
-    # --- streaming send ----------------------------------------------------
+                _log.warning("graph write failed (%s-%s->%s): %s", a, rel, b, e)
 
     def send_streaming(
         self,
@@ -292,6 +280,7 @@ class ChatAgent:
         )
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
 
+        _log.debug("turn start  conv=%s model=%s org=%d", conversation_id, self.model, self.org_id)
         yield {"type": "meta", "conversation_id": conversation_id}
 
         search_context = ""
@@ -303,7 +292,7 @@ class ChatAgent:
             try:
                 search_context, search_sources = run_web_search(user_message, self.org_id)
             except Exception as e:
-                print(f"[chat] web search failed: {e}")
+                _log.error("web search failed", exc_info=True)
                 search_context, search_sources = "", []
                 search_errored = True
             yield {
@@ -328,7 +317,7 @@ class ChatAgent:
             try:
                 needs, reason = needs_web_search(user_message)
             except Exception as e:
-                print(f"[chat] needs_web_search failed: {e}")
+                _log.warning("needs_web_search classifier failed: %s", e)
                 needs, reason = False, ""
             if needs:
                 yield {
@@ -369,7 +358,7 @@ class ChatAgent:
                 response_style=style_key,
             )
         except Exception as e:
-            print(f"[chat] user message persist failed: {e}")
+            _log.error("user message persist failed", exc_info=True)
 
         rag_context = ""
         if convo_rag_enabled:
@@ -382,7 +371,7 @@ class ChatAgent:
                     top_k=3,
                 )
             except Exception as e:
-                print(f"[chat] RAG retrieval failed: {e}")
+                _log.error("RAG retrieval failed", exc_info=True)
                 rag_context = ""
 
         history, summary_event = self._maybe_summarise(history)
@@ -415,6 +404,7 @@ class ChatAgent:
         payload.extend(history)
         payload.append({"role": "user", "content": user_message})
 
+        _log.debug("model call   conv=%s messages=%d temp=%.1f max_tokens=%d", conversation_id, len(payload), temperature, max_tokens)
         start = time.time()
         accumulated: list[str] = []
         final_usage: dict = {}
@@ -442,6 +432,7 @@ class ChatAgent:
         output = "".join(accumulated)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
+        _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs", conversation_id, final_model, tokens_input, tokens_output, duration)
 
         try:
             self.db.add_message(
@@ -455,7 +446,7 @@ class ChatAgent:
                 response_style=style_key,
             )
         except Exception as e:
-            print(f"[chat] assistant message persist failed: {e}")
+            _log.error("assistant message persist failed", exc_info=True)
 
         if convo_rag_enabled:
             try:
@@ -470,7 +461,7 @@ class ChatAgent:
                     collection_name=collection_name,
                 )
             except Exception as e:
-                print(f"[chat] memory write failed: {e}")
+                _log.error("memory write failed", exc_info=True)
 
         if convo_knowledge:
             try:
@@ -485,7 +476,7 @@ class ChatAgent:
                     collection_name="chat_knowledge",
                 )
             except Exception as e:
-                print(f"[chat] chat_knowledge write failed: {e}")
+                _log.error("chat_knowledge write failed", exc_info=True)
 
             threading.Thread(
                 target=self._extract_and_write_graph,
@@ -503,8 +494,6 @@ class ChatAgent:
             "rag_enabled": convo_rag_enabled,
             "context_chars": len(rag_context),
         }
-
-    # --- model call (streaming) --------------------------------------------
 
     def _call_model_streaming(
         self,
@@ -562,8 +551,6 @@ class ChatAgent:
             return
 
         yield {"type": "done", "usage": final_usage, "model": final_model}
-
-    # --- blocking wrapper (kept for any internal sync callers) -------------
 
     def send(
         self,

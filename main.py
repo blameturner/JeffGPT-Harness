@@ -1,10 +1,10 @@
-import json
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from workers.generator_agent import GeneratorAgent
 from workers.chat_agent import ChatAgent
 from workers.code_agent import CodeAgent
+from workers.jobs import STORE, run_in_background, stream_events
 from workers.styles import (
     CHAT_DEFAULT_STYLE,
     CODE_DEFAULT_STYLE,
@@ -14,26 +14,28 @@ from workers.styles import (
 from config import MODELS, refresh_models
 from nocodb_client import NocodbClient
 from contextlib import asynccontextmanager
+import log
 
-
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event)}\n\n"
+log.setup()
+_log = log.get("harness")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("mstag-harness starting...")
+    _log.info("mstag-harness starting")
     from scheduler import start_scheduler
     sched = start_scheduler()
     app.state.scheduler = sched
-    print("Scheduler running")
-    print("ready")
+    _log.info("scheduler running")
+    _log.info("ready")
     try:
         yield
     finally:
         sched.shutdown(wait=False)
+        _log.info("shutdown complete")
 
 app = FastAPI(title="MSTAG Harness", version="1.0.0", lifespan=lifespan)
+
 
 class RunRequest(BaseModel):
     agent_name: str
@@ -41,56 +43,41 @@ class RunRequest(BaseModel):
     task: str
     product: str = ""
 
+
 @app.get("/health")
 async def health():
-    # Stays async — pure, non-blocking, useful for liveness probes that
-    # need a response even if the threadpool is saturated.
     return {"status": "ok", "service": "MSTAG Harness"}
+
 
 @app.post("/run")
 def run_agent(request: RunRequest):
     try:
         agent = GeneratorAgent(request.agent_name, request.org_id)
         result = agent.run(request.task, request.product)
-
         if result is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Agent ran but failed to produce output"
-            )
-
+            raise HTTPException(status_code=500, detail="Agent ran but failed to produce output")
         return {
             "success": True,
             "agent": request.agent_name,
             "org_id": request.org_id,
             "product": request.product,
-            "output": result.model_dump()
+            "output": result.model_dump(),
         }
-
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/run/stream")
 def run_agent_stream(request: RunRequest):
-    """SSE: streams chunks from a GeneratorAgent, then a terminal `parsed` event."""
     try:
         agent = GeneratorAgent(request.agent_name, request.org_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    def gen():
-        try:
-            for event in agent.run_streaming(request.task, request.product):
-                yield _sse(event)
-        except Exception as e:
-            yield _sse({"type": "error", "message": str(e)})
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    job = STORE.create()
+    run_in_background(job, lambda: agent.run_streaming(request.task, request.product))
+    return {"job_id": job.id}
 
 
 class ChatRequest(BaseModel):
@@ -100,12 +87,7 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     system: str | None = None
     temperature: float = 0.7
-    # Chunked streaming makes UX fast regardless of response length, so we
-    # no longer clip max_tokens aggressively on the server side.
     max_tokens: int = 8192
-    # Only honoured on the first message of a conversation (when
-    # conversation_id is None). Subsequent turns inherit the setting
-    # from the conversation row in NocoDB.
     rag_enabled: bool | None = None
     rag_collection: str | None = None
     knowledge_enabled: bool | None = None
@@ -123,9 +105,9 @@ class CodeRequest(BaseModel):
     org_id: int
     model: str
     message: str
-    mode: str = "plan"  # plan | execute | debug
+    mode: str = "plan"
     approved_plan: str | None = None
-    files: list[dict] | None = None  # [{name, content_b64}]
+    files: list[dict] | None = None
     conversation_id: int | None = None
     title: str | None = None
     codebase_collection: str | None = None
@@ -157,19 +139,6 @@ def list_models():
 
 @app.get("/styles")
 def get_styles(surface: str | None = None):
-    """Return the catalogue of response styles.
-
-    Query param:
-      surface=chat  → only chat styles
-      surface=code  → only code styles
-      (omitted)     → both
-
-    Response shape:
-      {
-        "chat":    {"default": "general", "styles": [{"key": "...", "prompt": "..."}, ...]},
-        "code":    {"default": "review",  "styles": [...]}
-      }
-    """
     out: dict = {}
     if surface in (None, "chat"):
         out["chat"] = {"default": CHAT_DEFAULT_STYLE, "styles": list_chat_styles()}
@@ -182,7 +151,6 @@ def get_styles(surface: str | None = None):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """SSE streaming chat. Events: meta, summarised, chunk, done, error, searching, search_complete, search_consent_required."""
     try:
         agent = ChatAgent(
             model=request.model,
@@ -191,32 +159,24 @@ def chat(request: ChatRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    def gen():
-        try:
-            for event in agent.send_streaming(
-                user_message=request.message,
-                conversation_id=request.conversation_id,
-                system=request.system,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                rag_enabled=request.rag_enabled,
-                rag_collection=request.rag_collection,
-                knowledge_enabled=request.knowledge_enabled,
-                search_consent_declined=request.search_consent_declined,
-                response_style=request.response_style,
-            ):
-                yield _sse(event)
-        except Exception as e:
-            yield _sse({"type": "error", "message": str(e)})
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    job = STORE.create()
+    run_in_background(job, lambda: agent.send_streaming(
+        user_message=request.message,
+        conversation_id=request.conversation_id,
+        system=request.system,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        rag_enabled=request.rag_enabled,
+        rag_collection=request.rag_collection,
+        knowledge_enabled=request.knowledge_enabled,
+        search_consent_declined=request.search_consent_declined,
+        response_style=request.response_style,
+    ))
+    return {"job_id": job.id}
 
 
 @app.post("/code")
 def code(request: CodeRequest):
-    """SSE streaming code agent. Events: meta, chunk, plan_checklist, done, error."""
     try:
         agent = CodeAgent(
             model=request.model,
@@ -227,24 +187,23 @@ def code(request: CodeRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    job = STORE.create()
+    run_in_background(job, lambda: agent.run_streaming(
+        user_message=request.message,
+        conversation_id=request.conversation_id,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        title=request.title,
+        codebase_collection=request.codebase_collection,
+        response_style=request.response_style,
+    ))
+    return {"job_id": job.id}
 
-    def gen():
-        try:
-            for event in agent.run_streaming(
-                user_message=request.message,
-                conversation_id=request.conversation_id,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                title=request.title,
-                codebase_collection=request.codebase_collection,
-                response_style=request.response_style,
-            ):
-                yield _sse(event)
-        except Exception as e:
-            yield _sse({"type": "error", "message": str(e)})
-        yield "data: [DONE]\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+@app.get("/stream/{job_id}")
+def stream(job_id: str, cursor: int = 0):
+    # Resumable SSE: clients reconnect with ?cursor=N to replay missed events.
+    return StreamingResponse(stream_events(job_id, cursor), media_type="text/event-stream")
 
 
 @app.get("/code/conversations")
@@ -281,9 +240,6 @@ def get_code_messages(conversation_id: int, limit: int = 500):
 
 @app.get("/code/conversations/{conversation_id}/workspace")
 def get_code_workspace(conversation_id: int):
-    """Return the latest workspace (list of {name, content}) attached to
-    this code conversation, or [] if none. Lets the frontend re-render the
-    file chips when loading an existing session."""
     try:
         db = NocodbClient()
         msgs = db.list_code_messages(conversation_id)
@@ -408,7 +364,6 @@ def conversation_summary(conversation_id: int):
         outputs = db.list_outputs_for_conversation(conversation_id)
         tasks = db.list_tasks_for_conversation(conversation_id)
 
-        # Token aggregates — from both messages and any linked agent runs
         msg_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
         msg_tokens_out = sum(int(m.get("tokens_output") or 0) for m in messages)
         run_tokens_in = sum(int(r.get("tokens_input") or 0) for r in runs)
@@ -419,7 +374,6 @@ def conversation_summary(conversation_id: int):
         tokens_input = msg_tokens_in + run_tokens_in
         tokens_output = msg_tokens_out + run_tokens_out
 
-        # Message-level stats
         role_counts = _counter(messages, "role")
         user_msgs = [m for m in messages if m.get("role") == "user"]
         assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
@@ -430,35 +384,27 @@ def conversation_summary(conversation_id: int):
         first_message_at = min(timestamps) if timestamps else None
         last_message_at = max(timestamps) if timestamps else None
 
-        # Models actually used in this conversation
         models_used = _distinct_nonempty(messages, "model") or _distinct_nonempty(runs, "model_name")
 
-        # Observation dimensions
         themes = _distinct_nonempty(observations, "domain")
         obs_types = _distinct_nonempty(observations, "type")
         obs_confidences = _counter(observations, "confidence")
         obs_statuses = _counter(observations, "status")
         theme_counts = _counter(observations, "domain")
 
-        # Agent runs dimensions
         agents_used = _distinct_nonempty(runs, "agent_name")
         run_statuses = _counter(runs, "status")
 
-        # Task dimensions
         task_statuses = _counter(tasks, "status")
 
         return {
             "conversation": convo,
-
-            # Volume
             "message_count": len(messages),
             "role_counts": role_counts,
             "observation_count": len(observations),
             "run_count": len(runs),
             "output_count": len(outputs),
             "task_count": len(tasks),
-
-            # Tokens
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
             "tokens_total": tokens_input + tokens_output,
@@ -469,32 +415,20 @@ def conversation_summary(conversation_id: int):
                 "runs_output": run_tokens_out,
                 "runs_context": run_context_tokens,
             },
-
-            # Timing
             "first_message_at": first_message_at,
             "last_message_at": last_message_at,
             "run_duration_seconds": round(run_duration, 2),
-
-            # Content size
             "chars_user": chars_user,
             "chars_assistant": chars_assistant,
-
-            # Models / agents
             "models_used": models_used,
             "agents_used": agents_used,
-
-            # Themes & observations
             "themes": themes,
             "theme_counts": theme_counts,
             "observation_types": obs_types,
             "observation_confidences": obs_confidences,
             "observation_statuses": obs_statuses,
-
-            # Runs & tasks
             "run_statuses": run_statuses,
             "task_statuses": task_statuses,
-
-            # Full linked rows
             "observations": observations,
             "runs": runs,
             "outputs": outputs,
@@ -547,7 +481,6 @@ def scheduler_reload():
 
 @app.post("/scheduler/trigger")
 def scheduler_trigger():
-    """Manual enrichment cycle trigger (for UI 'Run now' button)."""
     import threading
     from workers.enrichment_agent import run_enrichment_cycle
     threading.Thread(target=run_enrichment_cycle, daemon=True).start()

@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from typing import Iterator
 import requests
@@ -7,6 +8,8 @@ from config import get_model_url
 from rag import retrieve
 from memory import remember
 from nocodb_client import NocodbClient
+
+_log = logging.getLogger("agent")
 
 
 @dataclass
@@ -156,7 +159,6 @@ class Agent:
         context = ""
         context_tokens = 0
 
-        # RAG retrieval — only if enabled for this agent
         if self.config.get("rag_enabled"):
             context = retrieve(
                 query=task,
@@ -166,7 +168,6 @@ class Agent:
                 top_k=self.config.get("rag_top_k", 3),
             )
 
-        # Everything below runs regardless of whether RAG is enabled
         messages = self._build_prompt(task, context)
 
         start_time = time.time()
@@ -230,6 +231,7 @@ class Agent:
         persists the run to NocoDB + Chroma after the `done` event arrives.
         Token counts come from the final streaming chunk — never zero.
         """
+        _log.debug("run_streaming start  agent=%s org=%d", self.config.get("name"), self.org_id)
         context = ""
         context_tokens = 0
 
@@ -243,7 +245,7 @@ class Agent:
                     top_k=self.config.get("rag_top_k", 3),
                 )
             except Exception as e:
-                print(f"[agent] RAG retrieval failed: {e}")
+                _log.error("RAG retrieval failed", exc_info=True)
                 context = ""
 
         messages = self._build_prompt(task, context)
@@ -262,7 +264,6 @@ class Agent:
             elif etype == "done":
                 final_usage = event.get("usage") or {}
                 final_model = event.get("model") or final_model
-                # Persist below before yielding terminal event.
                 break
             elif etype == "error":
                 errored = True
@@ -276,6 +277,7 @@ class Agent:
         output = "".join(accumulated)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
+        _log.info("run done     agent=%s model=%s in=%d out=%d %.1fs", self.config.get("name"), final_model, tokens_input, tokens_output, duration_seconds)
 
         try:
             chroma_ids = remember(
@@ -289,7 +291,7 @@ class Agent:
                 collection_name=self.config.get("rag_collection", "agent_outputs"),
             )
         except Exception as e:
-            print(f"[agent] memory write failed: {e}")
+            _log.error("memory write failed", exc_info=True)
             chroma_ids = []
 
         try:
@@ -315,7 +317,7 @@ class Agent:
                 chroma_ids=chroma_ids,
             )
         except Exception as e:
-            print(f"[agent] run persistence failed: {e}")
+            _log.error("run persistence failed", exc_info=True)
 
         yield {
             "type": "done",
