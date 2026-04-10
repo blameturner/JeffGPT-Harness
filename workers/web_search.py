@@ -170,11 +170,6 @@ def generate_search_queries(message: str) -> list[str]:
 
 
 def _parse_query_list(raw: str) -> list[str]:
-    """Best-effort extraction of a list of query strings from fast-model output.
-
-    Handles: fenced code blocks, JSON arrays embedded in prose, numbered lists,
-    and plain newline-separated lines.
-    """
     if not raw:
         return []
     text = raw.strip()
@@ -329,39 +324,23 @@ def scrape_page(url: str, snippet: str = "", source: dict | None = None) -> str:
         _log.info("path=scraper  url=%s chars=%d", url[:120], len(text))
         return text
 
-    # Scraper returned nothing useful — try Playwright fallback if enabled
-    if source is not None and _nocodb_truthy(source.get("playwright_fallback")):
+    # Scraper returned nothing useful — try Playwright when called with a source (enrichment)
+    if source is not None:
         pw_text = playwright_fetch(url)
         if pw_text:
-            # Auto-promote to direct Playwright for future runs
             target_id = source.get("Id")
             if target_id:
                 try:
-                    from config import NOCODB_URL, NOCODB_BASE_ID, NOCODB_TOKEN
-                    import requests as _requests
-                    db_base = f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}"
-                    tables_resp = _requests.get(
-                        f"{NOCODB_URL}/api/v1/db/meta/projects/{NOCODB_BASE_ID}/tables",
-                        headers={"xc-token": NOCODB_TOKEN},
-                        timeout=10,
-                    )
-                    tables_resp.raise_for_status()
-                    table_id = {t["title"]: t["id"] for t in tables_resp.json()["list"]}["scrape_targets"]
-                    _requests.patch(
-                        f"{db_base}/{table_id}/{target_id}",
-                        headers={"xc-token": NOCODB_TOKEN, "Content-Type": "application/json"},
-                        json={"use_playwright": True},
-                        timeout=10,
-                    )
-                    _log.info("playwright_fallback promoted to playwright_direct id=%s", target_id)
+                    from workers.enrichment_agent import EnrichmentDB
+                    EnrichmentDB().update_scrape_target(target_id, use_playwright=True)
+                    _log.info("auto-promoted to playwright_direct id=%s", target_id)
                 except Exception as e:
                     _log.warning("playwright promotion failed id=%s: %s", target_id, e)
-            _log.info("path=playwright_fallback  url=%s chars=%d", url[:120], len(pw_text))
+            _log.info("path=playwright_auto  url=%s chars=%d", url[:120], len(pw_text))
             return pw_text
-        _log.info("path=playwright_fallback  url=%s failed, returning snippet", url[:120])
+        _log.info("path=playwright_auto  url=%s failed", url[:120])
         return fallback
 
-    _log.info("path=snippet  url=%s", url[:120])
     return fallback
 
 
@@ -480,11 +459,13 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
     raw_results = _dedupe(raw_results)[:max_candidates]
 
     summaries: list[tuple[str, str, str]] = []
+    scrape_failures = 0
     for r in raw_results:
         if len(summaries) >= MAX_SOURCES:
             break
         text = scrape_page(r["url"], snippet=r.get("snippet", ""))
         if not text:
+            scrape_failures += 1
             continue
         summary = summarise_page(text, query)
         if not summary:
@@ -506,22 +487,42 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
         except Exception as e:
             _log.error("chroma write failed for %s", r["url"], exc_info=True)
 
-    if not summaries:
+    if summaries:
+        context_parts = [
+            "The following web search results were retrieved for the user's question. "
+            "Cite them inline where relevant.\n"
+        ]
+        for i, (title, url, summary) in enumerate(summaries, start=1):
+            context_parts.append(f"[{i}] {title} ({url})\n{summary}\n")
+        context_block = "\n".join(context_parts)
+        sources = [f"{title}: {url}" for title, url, _ in summaries]
+    elif raw_results:
+        _log.warning("scraping failed on all %d candidates, returning raw SearxNG results", len(raw_results))
+        context_parts = [
+            "Web search found the following results but full page content could not be retrieved. "
+            "Use the titles, URLs, and snippets below to inform your answer. "
+            "Cite the URLs so the user can visit them directly. "
+            "Note that you could not verify the full page content.\n"
+        ]
+        for i, r in enumerate(raw_results[:MAX_SOURCES], start=1):
+            title = r.get("title") or r["url"]
+            snippet = r.get("snippet") or ""
+            context_parts.append(f"[{i}] {title} ({r['url']})\n{snippet}\n")
+        context_block = "\n".join(context_parts)
+        sources = [f"{r.get('title') or r['url']}: {r['url']}" for r in raw_results[:MAX_SOURCES]]
+    else:
+        _log.warning("search returned no results for query=%s", query[:100])
         return "", []
 
-    context_parts = ["The following web search results were retrieved for the user's question. Cite them inline where relevant.\n"]
-    for i, (title, url, summary) in enumerate(summaries, start=1):
-        context_parts.append(f"[{i}] {title} ({url})\n{summary}\n")
-    context_block = "\n".join(context_parts)
+    _log.info("search done   queries=%d candidates=%d summaries=%d scrape_failures=%d",
+              len(queries), len(raw_results), len(summaries), scrape_failures)
 
-    sources = [f"{title}: {url}" for title, url, _ in summaries]
-    _log.info("search done   queries=%d candidates=%d summaries=%d", len(queries), len(raw_results), len(summaries))
-
-    threading.Thread(
-        target=_suggest_sources_from_search,
-        args=(summaries, query, org_id),
-        daemon=True,
-    ).start()
+    if summaries:
+        threading.Thread(
+            target=_suggest_sources_from_search,
+            args=(summaries, query, org_id),
+            daemon=True,
+        ).start()
 
     return context_block, sources
 

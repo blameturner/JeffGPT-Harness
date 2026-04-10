@@ -743,7 +743,6 @@ class SourceCreate(BaseModel):
     active: bool = True
     enrichment_agent_id: int | None = None
     use_playwright: bool = False
-    playwright_fallback: bool = False
 
 
 class SourceUpdate(BaseModel):
@@ -754,7 +753,6 @@ class SourceUpdate(BaseModel):
     active: bool | None = None
     enrichment_agent_id: int | None = None
     use_playwright: bool | None = None
-    playwright_fallback: bool | None = None
 
 
 @app.get("/enrichment/sources")

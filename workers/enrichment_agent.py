@@ -1002,7 +1002,7 @@ def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
             time.sleep(POLITE_DELAY_SECONDS)
 
         remaining = token_budget - tokens_used
-        if remaining > PROACTIVE_BUDGET_THRESHOLD:
+        if sources and remaining > PROACTIVE_BUDGET_THRESHOLD:
             try:
                 tokens_used += _proactive_search(org_id, cycle_id, db, remaining)
             except Exception:

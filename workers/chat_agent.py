@@ -330,15 +330,14 @@ class ChatAgent:
             })
             if not search_sources:
                 search_note = (
-                    "SEARCH STATUS: You attempted a live web search for this "
-                    "question but it returned no usable results "
-                    + ("(the search backend errored)." if search_errored
-                       else "(all candidate pages failed to fetch or were irrelevant).")
-                    + " In your reply, clearly tell the user that you tried "
-                    "to search and couldn't retrieve live results, then "
-                    "answer from general knowledge with an explicit caveat "
-                    "about recency. Do NOT claim you lack the ability to "
-                    "search — you have it, it just failed this time."
+                    "SEARCH STATUS: A live web search was performed but the "
+                    "search engine returned no results at all"
+                    + (" (the search backend errored)." if search_errored
+                       else " for this query.")
+                    + " Tell the user you searched but found nothing, then "
+                    "answer from your own knowledge with a recency caveat. "
+                    "Do NOT say you cannot search — you can and did, "
+                    "it just returned empty this time."
                 )
         elif not search_consent_declined:
             try:
