@@ -41,10 +41,10 @@ def _is_blocklisted(url: str) -> bool:
         host = host[4:]
     return any(host == d or host.endswith("." + d) for d in SCRAPE_BLOCKLIST)
 
-MAX_SOURCES = 5
-OVERFETCH_FACTOR = 4
+MAX_SOURCES = 8
+OVERFETCH_FACTOR = 3
 PER_PAGE_CHAR_CAP = 20_000
-SUMMARY_MAX_TOKENS = 300
+SUMMARY_MAX_TOKENS = 500
 SEARXNG_TIMEOUT = 10
 SCRAPE_TIMEOUT = 15
 FAST_TIMEOUT = 60
@@ -345,19 +345,33 @@ def scrape_page(url: str, snippet: str = "", source: dict | None = None) -> str:
 
 
 
-def summarise_page(text: str, query: str) -> str:
+def summarise_page(text: str, query: str) -> dict | None:
+    """Summarise page content and assess its relevance to the query.
+
+    Returns {"summary": str, "relevance": "high"|"medium"|"low", "source_type": str}
+    or None if irrelevant / empty.
+    """
     if not text.strip():
-        return ""
+        return None
     tool_url, tool_model = _tool_model()
     if not tool_url:
         _log.warning("no tool model available, returning raw truncation for '%s'", query[:80])
-        return text[:1200]
+        return {"summary": text[:1200], "relevance": "unknown", "source_type": "unknown"}
 
     prompt = (
-        "Summarise the following page content for a user who asked: "
-        f"'{query}'. Be factual, ≤ 250 words, preserve any key names, "
-        "numbers, dates, and direct quotes relevant to the question. "
-        "If the page is irrelevant, reply exactly: IRRELEVANT.\n\n"
+        "You are summarising a web page for someone who asked: "
+        f"'{query[:500]}'\n\n"
+        "Return a JSON object with these fields:\n"
+        "- summary: factual summary of the page (up to 400 words). Preserve "
+        "key names, numbers, dates, and direct quotes relevant to the question.\n"
+        "- relevance: how relevant this page is to the question — "
+        "\"high\" (directly answers it), \"medium\" (related/useful context), "
+        "or \"low\" (tangentially related at best).\n"
+        "- source_type: what kind of source this is — e.g. \"official_docs\", "
+        "\"news_article\", \"blog_post\", \"research_paper\", \"forum\", "
+        "\"product_page\", \"government\", \"unknown\".\n\n"
+        "If the page is completely irrelevant to the question, return: "
+        '{\"irrelevant\": true}\n\n'
         f"PAGE:\n{text}"
     )
     started = time.time()
@@ -373,16 +387,38 @@ def summarise_page(text: str, query: str) -> str:
             timeout=FAST_TIMEOUT,
         )
         resp.raise_for_status()
-        summary = resp.json()["choices"][0]["message"]["content"].strip()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
         elapsed = round(time.time() - started, 2)
-        if summary.upper().startswith("IRRELEVANT"):
+
+        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            if raw.upper().startswith("IRRELEVANT") or raw.strip() == '{"irrelevant": true}':
+                _log.debug("summarise    irrelevant for '%s' %.2fs", query[:80], elapsed)
+                return None
+            _log.debug("summarise    unparseable json, using raw text for '%s'", query[:80])
+            return {"summary": raw[:2000], "relevance": "unknown", "source_type": "unknown"}
+
+        if data.get("irrelevant"):
             _log.debug("summarise    irrelevant for '%s' %.2fs", query[:80], elapsed)
-            return ""
-        _log.debug("summarise    ok for '%s' %d chars %.2fs", query[:80], len(summary), elapsed)
-        return summary
+            return None
+
+        summary = str(data.get("summary") or "").strip()
+        if not summary:
+            return None
+
+        result = {
+            "summary": summary,
+            "relevance": str(data.get("relevance") or "unknown").lower(),
+            "source_type": str(data.get("source_type") or "unknown").lower(),
+        }
+        _log.debug("summarise    ok for '%s' relevance=%s type=%s %d chars %.2fs",
+                    query[:80], result["relevance"], result["source_type"], len(summary), elapsed)
+        return result
     except Exception:
         _log.error("summarisation failed for '%s'", query, exc_info=True)
-        return text[:1200]
+        return {"summary": text[:1200], "relevance": "unknown", "source_type": "unknown"}
 
 
 
