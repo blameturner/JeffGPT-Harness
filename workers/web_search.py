@@ -65,10 +65,16 @@ BROWSER_HEADERS = {
 
 _INJECTION_PATTERNS = [
     re.compile(r"<\s*/?\s*(?:system|assistant|user|s|\|im_start\||\|im_end\|)[^>]*>", re.I),
-    re.compile(r"ignore (?:all )?previous (?:instructions|messages)", re.I),
-    re.compile(r"disregard (?:all )?(?:prior|previous) (?:instructions|messages)", re.I),
-    re.compile(r"you are now [a-z ]+", re.I),
-    re.compile(r"new instructions?:", re.I),
+    re.compile(r"ignore (?:all )?(?:previous|prior|above|earlier) (?:instructions|messages|context|prompts?)", re.I),
+    re.compile(r"disregard (?:all )?(?:prior|previous|above|earlier) (?:instructions|messages|context|prompts?)", re.I),
+    re.compile(r"(?:you are|act as|pretend (?:you are|to be)|roleplay as|behave as) (?:a |an )?[a-z ]{3,30}", re.I),
+    re.compile(r"new (?:instructions?|rules?|persona|role):", re.I),
+    re.compile(r"(?:system|admin|root|developer) (?:prompt|message|override|mode):", re.I),
+    re.compile(r"(?:forget|override|bypass|skip) (?:all |your )?(?:previous |prior )?(?:instructions|rules|guidelines|safety)", re.I),
+    re.compile(r"\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>", re.I),
+    re.compile(r"human:|assistant:|###\s*(?:system|instruction|human|assistant)", re.I),
+    re.compile(r"(?:do not|don'?t) (?:follow|obey|listen to) (?:your |the )?(?:previous|original|system)", re.I),
+    re.compile(r"(?:reveal|show|print|output|repeat) (?:your |the )?(?:system ?prompt|instructions|rules)", re.I),
 ]
 
 
@@ -76,6 +82,25 @@ def _strip_injection_patterns(text: str) -> str:
     for pat in _INJECTION_PATTERNS:
         text = pat.sub("[redacted]", text)
     return text
+
+
+def _is_safe_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]"):
+        return False
+    if host.startswith("10.") or host.startswith("172.") or host.startswith("192.168."):
+        return False
+    if host.endswith(".local") or host.endswith(".internal"):
+        return False
+    return True
 
 
 def _fast_model() -> tuple[str | None, str | None]:
@@ -236,16 +261,29 @@ def _get_browser():
 
 def playwright_fetch(url: str) -> str:
     """Fetch page text using in-process Playwright/Chromium."""
+    if not _is_safe_url(url):
+        _log.warning("playwright_fetch blocked unsafe url %s", url[:120])
+        return ""
     started = time.time()
     try:
         browser = _get_browser()
         context = browser.new_context(
             user_agent=BROWSER_UA,
             viewport={"width": 1280, "height": 800},
+            java_script_enabled=True,
         )
         try:
             page = context.new_page()
+            page.route("**/*", lambda route: (
+                route.continue_() if route.request.resource_type in
+                ("document", "stylesheet", "font", "image", "script", "xhr", "fetch")
+                else route.abort()
+            ))
             page.goto(url, wait_until="networkidle", timeout=30_000)
+            final_url = page.url
+            if not _is_safe_url(final_url):
+                _log.warning("playwright_fetch blocked redirect to %s", final_url[:120])
+                return ""
             text = page.inner_text("body")
             text = _strip_injection_patterns(text)[:PER_PAGE_CHAR_CAP]
             elapsed = round(time.time() - started, 2)
@@ -306,6 +344,10 @@ def _scrape_with_httpx(url: str) -> str:
 def scrape_page(url: str, snippet: str = "", source: dict | None = None) -> str:
     """Fetch and extract page text. Falls back to `snippet` on any failure."""
     fallback = _strip_injection_patterns(snippet)[:PER_PAGE_CHAR_CAP] if snippet else ""
+
+    if not _is_safe_url(url):
+        _log.warning("scrape skip  unsafe url %s", url[:120])
+        return fallback
 
     if _is_blocklisted(url):
         _log.debug("scrape skip  blocklisted %s", url)
@@ -634,14 +676,14 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[dict], str]:
             "Caveat that you could not verify the full page content.\n"
         ]
         for i, r in enumerate(raw_results[:MAX_SOURCES], start=1):
-            title = r.get("title") or r["url"]
-            snippet = r.get("snippet") or ""
+            title = _strip_injection_patterns(r.get("title") or r["url"])
+            snippet = _strip_injection_patterns(r.get("snippet") or "")
             context_parts.append(f"[{i}] {title} ({r['url']})\n{snippet}\n")
         context_block = "\n".join(context_parts)
         sources = [
-            {"index": i + 1, "title": r.get("title") or r["url"], "url": r["url"],
-             "relevance": "unknown", "source_type": "unknown",
-             "snippet": (r.get("snippet") or "")[:200]}
+            {"index": i + 1, "title": _strip_injection_patterns(r.get("title") or r["url"]),
+             "url": r["url"], "relevance": "unknown", "source_type": "unknown",
+             "snippet": _strip_injection_patterns((r.get("snippet") or "")[:200])}
             for i, r in enumerate(raw_results[:MAX_SOURCES])
         ]
     else:
