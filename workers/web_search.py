@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from typing import Iterable
 
@@ -11,7 +12,7 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from config import MODELS, SEARXNG_URL
+from config import CATEGORY_COLLECTIONS, MODELS, SEARXNG_URL
 from memory import remember
 
 _log = logging.getLogger("web_search")
@@ -207,14 +208,64 @@ def _parse_query_list(raw: str) -> list[str]:
     return out
 
 
-def scrape_page(url: str, snippet: str = "") -> str:
-    """Fetch and extract page text. Falls back to `snippet` on any failure."""
-    fallback = _strip_injection_patterns(snippet)[:PER_PAGE_CHAR_CAP] if snippet else ""
+def _nocodb_truthy(value) -> bool:
+    """NocoDB checkboxes can return bool, int, or string representations."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
-    if _is_blocklisted(url):
-        _log.debug("scrape skip  blocklisted %s", url)
-        return fallback
 
+_pw_lock = threading.Lock()
+_pw_instance = None
+_pw_browser = None
+
+
+def _get_browser():
+    """Lazy singleton — launches Chromium once, reuses across all fetches."""
+    global _pw_instance, _pw_browser
+    if _pw_browser is not None:
+        return _pw_browser
+    with _pw_lock:
+        if _pw_browser is not None:
+            return _pw_browser
+        from playwright.sync_api import sync_playwright
+        _pw_instance = sync_playwright().start()
+        _pw_browser = _pw_instance.chromium.launch(headless=True)
+        _log.info("playwright chromium launched (pid=%s)", _pw_browser.contexts)
+        return _pw_browser
+
+
+def playwright_fetch(url: str) -> str:
+    """Fetch page text using in-process Playwright/Chromium."""
+    started = time.time()
+    try:
+        browser = _get_browser()
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            viewport={"width": 1280, "height": 800},
+        )
+        try:
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+            text = page.inner_text("body")
+            text = _strip_injection_patterns(text)[:PER_PAGE_CHAR_CAP]
+            elapsed = round(time.time() - started, 2)
+            _log.info("playwright_fetch ok  url=%s chars=%d %.2fs", url[:120], len(text), elapsed)
+            return text
+        finally:
+            context.close()
+    except Exception as e:
+        elapsed = round(time.time() - started, 2)
+        _log.warning("playwright_fetch failed  url=%s error=%s %.2fs", url[:120], e, elapsed)
+        return ""
+
+
+def _scrape_with_httpx(url: str) -> str:
+    """Plain httpx + BeautifulSoup scraper. Returns extracted text or empty string."""
     started = time.time()
     try:
         resp = httpx.get(
@@ -226,13 +277,13 @@ def scrape_page(url: str, snippet: str = "") -> str:
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         _log.warning("scrape %d for %s (%s)", e.response.status_code, url, e.response.reason_phrase)
-        return fallback
+        return ""
     except httpx.TimeoutException:
         _log.warning("scrape timeout after %ds for %s", SCRAPE_TIMEOUT, url)
-        return fallback
+        return ""
     except Exception as e:
         _log.warning("scrape failed for %s: %s", url, e)
-        return fallback
+        return ""
 
     elapsed = round(time.time() - started, 2)
     _log.debug("scrape ok    %s  status=%d size=%d %.2fs", url, resp.status_code, len(resp.text), elapsed)
@@ -241,7 +292,7 @@ def scrape_page(url: str, snippet: str = "") -> str:
         soup = BeautifulSoup(resp.text, "lxml")
     except Exception as e:
         _log.warning("html parse failed for %s: %s", url, e)
-        return fallback
+        return ""
 
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript"]):
         tag.decompose()
@@ -250,12 +301,68 @@ def scrape_page(url: str, snippet: str = "") -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _strip_injection_patterns(text)
     text = text[:PER_PAGE_CHAR_CAP]
-    extracted = len(text)
     if not text:
         _log.warning("scrape empty after extraction for %s (raw html was %d chars)", url, len(resp.text))
     else:
-        _log.debug("scrape extracted %d chars from %s", extracted, url)
-    return text or fallback
+        _log.debug("scrape extracted %d chars from %s", len(text), url)
+    return text
+
+
+def scrape_page(url: str, snippet: str = "", source: dict | None = None) -> str:
+    """Fetch and extract page text. Falls back to `snippet` on any failure."""
+    fallback = _strip_injection_patterns(snippet)[:PER_PAGE_CHAR_CAP] if snippet else ""
+
+    if _is_blocklisted(url):
+        _log.debug("scrape skip  blocklisted %s", url)
+        return fallback
+
+    # Playwright direct — skip scraper entirely
+    if source and _nocodb_truthy(source.get("use_playwright")):
+        text = playwright_fetch(url)
+        _log.info("path=playwright_direct  url=%s ok=%s", url[:120], bool(text))
+        return text or fallback
+
+    # Plain scraper
+    text = _scrape_with_httpx(url)
+
+    if text and text != fallback:
+        _log.info("path=scraper  url=%s chars=%d", url[:120], len(text))
+        return text
+
+    # Scraper returned nothing useful — try Playwright fallback if enabled
+    if source is not None and _nocodb_truthy(source.get("playwright_fallback")):
+        pw_text = playwright_fetch(url)
+        if pw_text:
+            # Auto-promote to direct Playwright for future runs
+            target_id = source.get("Id")
+            if target_id:
+                try:
+                    from config import NOCODB_URL, NOCODB_BASE_ID, NOCODB_TOKEN
+                    import requests as _requests
+                    db_base = f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}"
+                    tables_resp = _requests.get(
+                        f"{NOCODB_URL}/api/v1/db/meta/projects/{NOCODB_BASE_ID}/tables",
+                        headers={"xc-token": NOCODB_TOKEN},
+                        timeout=10,
+                    )
+                    tables_resp.raise_for_status()
+                    table_id = {t["title"]: t["id"] for t in tables_resp.json()["list"]}["scrape_targets"]
+                    _requests.patch(
+                        f"{db_base}/{table_id}/{target_id}",
+                        headers={"xc-token": NOCODB_TOKEN, "Content-Type": "application/json"},
+                        json={"use_playwright": True},
+                        timeout=10,
+                    )
+                    _log.info("playwright_fallback promoted to playwright_direct id=%s", target_id)
+                except Exception as e:
+                    _log.warning("playwright promotion failed id=%s: %s", target_id, e)
+            _log.info("path=playwright_fallback  url=%s chars=%d", url[:120], len(pw_text))
+            return pw_text
+        _log.info("path=playwright_fallback  url=%s failed, returning snippet", url[:120])
+        return fallback
+
+    _log.info("path=snippet  url=%s", url[:120])
+    return fallback
 
 
 
@@ -376,7 +483,7 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
     for r in raw_results:
         if len(summaries) >= MAX_SOURCES:
             break
-        text = scrape_page(r["url"], snippet=r.get("snippet", ""))
+        text = scrape_page(r["url"], snippet=r.get("snippet", ""), source={"playwright_fallback": True})
         if not text:
             continue
         summary = summarise_page(text, query)
@@ -409,4 +516,127 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
 
     sources = [f"{title}: {url}" for title, url, _ in summaries]
     _log.info("search done   queries=%d candidates=%d summaries=%d", len(queries), len(raw_results), len(summaries))
+
+    # Evaluate search results as potential ongoing monitoring targets
+    _suggest_sources_from_search(summaries, query, org_id)
+
     return context_block, sources
+
+
+def _suggest_sources_from_search(
+    summaries: list[tuple[str, str, str]],
+    query: str,
+    org_id: int,
+) -> None:
+    """Evaluate web search results and suggest worthy ones as scrape targets."""
+    if not summaries:
+        return
+
+    tool_url, tool_model = _tool_model()
+    if not tool_url:
+        return
+
+    sources_text = "\n".join(
+        f"{i+1}. {title} ({url})\n   {summary[:300]}"
+        for i, (title, url, summary) in enumerate(summaries)
+    )
+    prompt = (
+        "You are evaluating web search results to find sources worth ONGOING "
+        "monitoring in a knowledge base. Most search results are NOT good "
+        "monitoring targets — be very selective.\n\n"
+        "A source MUST have ALL of:\n"
+        "- INSTITUTIONAL AUTHORITY: maintained by a recognised organisation\n"
+        "- REGULAR UPDATES: publishes new content on a recurring basis\n"
+        "- ORIGINAL CONTENT: primary source, not aggregator or reposter\n"
+        "- EDITORIAL STANDARDS: institutional accountability, not anonymous\n\n"
+        "ALWAYS REJECT: social media, forums, Medium/Substack (unless institutional), "
+        "paywalled sites, personal blogs, content farms, aggregators, YouTube, "
+        "one-off news articles (suggest the publication's section page instead).\n\n"
+        f"Search context: user asked about '{query}'\n\n"
+        f"RESULTS:\n{sources_text}\n\n"
+        "For each result worth monitoring long-term, return:\n"
+        "- index: the result number\n"
+        "- name: the organisation or publication\n"
+        "- category: one of documentation, news, competitive, regulatory, "
+        "  research, security, model_releases\n"
+        "- authority: WHO maintains this and WHY they are credible\n"
+        "- score: 1-10 (8+ = clearly authoritative, 7 = probably good)\n"
+        "- suggested_url: the best URL to monitor (may differ from the search "
+        "  result — prefer a section/feed page over a single article)\n\n"
+        "Return a JSON array. If NONE are worth monitoring, return []. "
+        "0 suggestions is the expected outcome for most searches."
+    )
+
+    try:
+        resp = httpx.post(
+            f"{tool_url}/v1/chat/completions",
+            json={
+                "model": tool_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 400,
+            },
+            timeout=FAST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        _log.debug("search suggestion evaluation failed", exc_info=True)
+        return
+
+    try:
+        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
+        items = json.loads(cleaned)
+    except Exception:
+        _log.debug("search suggestion unparseable: %s", raw[:200])
+        return
+    if not isinstance(items, list) or not items:
+        return
+
+    # Lazy import to avoid circular dependency (enrichment_agent imports from web_search)
+    try:
+        from workers.enrichment_agent import EnrichmentDB
+        db = EnrichmentDB()
+    except Exception:
+        _log.debug("could not init EnrichmentDB for search suggestions")
+        return
+
+    cycle_id = f"websearch_{int(time.time())}"
+    recorded = 0
+    for item in items[:3]:
+        try:
+            score = int(item.get("score") or 0)
+            if score < 7:
+                continue
+            category = str(item.get("category") or "").lower()
+            if category not in CATEGORY_COLLECTIONS:
+                continue
+            idx = int(item.get("index", 0)) - 1
+            if idx < 0 or idx >= len(summaries):
+                continue
+
+            url = str(item.get("suggested_url") or summaries[idx][1]).strip()
+            if not url.startswith("http"):
+                continue
+
+            authority = str(item.get("authority") or "")
+            name = str(item.get("name") or summaries[idx][0])
+            confidence = "high" if score >= 8 else "medium"
+
+            db.record_suggestion(
+                org_id=org_id,
+                url=url,
+                name=name,
+                category=category,
+                reason=f"Web search: {authority}"[:500],
+                confidence=confidence,
+                confidence_score=score,
+                suggested_by_url=summaries[idx][1],
+                suggested_by_cycle=cycle_id,
+            )
+            recorded += 1
+        except Exception:
+            _log.debug("search suggestion record failed", exc_info=True)
+
+    if recorded:
+        _log.info("search suggestions recorded=%d from query='%s'", recorded, query[:80])

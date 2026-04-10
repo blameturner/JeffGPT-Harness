@@ -135,6 +135,23 @@ class EnrichmentDB:
     def update_enrichment_agent(self, agent_id: int, data: dict) -> dict:
         return self._patch("enrichment_agents", agent_id, data)
 
+    def list_tracked_urls(self, org_id: int) -> set[str]:
+        """Return all URLs already tracked or pending suggestion for an org."""
+        tracked = self._get(
+            "scrape_targets",
+            params={"where": f"(org_id,eq,{org_id})", "limit": 1000},
+        ).get("list", [])
+        pending = self._get(
+            "suggested_scrape_targets",
+            params={
+                "where": f"(org_id,eq,{org_id})~and(status,eq,pending)",
+                "limit": 1000,
+            },
+        ).get("list", [])
+        urls = {r.get("url") for r in tracked if r.get("url")}
+        urls.update(r.get("url") for r in pending if r.get("url"))
+        return urls
+
     def list_due_sources(self, org_id: int, enrichment_agent_id: int | None = None) -> list[dict]:
         where = f"(org_id,eq,{org_id})~and(active,eq,1)"
         if enrichment_agent_id is not None:
@@ -444,6 +461,18 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
     return written, tokens
 
 
+def _verify_url_reachable(url: str) -> bool:
+    """Quick HEAD check to confirm a URL exists before suggesting it."""
+    try:
+        r = httpx.head(
+            url, timeout=10, follow_redirects=True,
+            headers={"User-Agent": "mst-harness/1.0"},
+        )
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
 def _discover_sources(
     text: str,
     source_url: str,
@@ -452,16 +481,45 @@ def _discover_sources(
     db: EnrichmentDB,
 ) -> int:
     _log.debug("discovering sources from %s  org=%d", source_url[:80], org_id)
+
+    try:
+        already_known = db.list_tracked_urls(org_id)
+    except Exception:
+        already_known = set()
+
     prompt = (
-        "Analyse the content for up to 5 NEW external sources worth "
-        "monitoring for ongoing updates (documentation sites, blogs, "
-        "research feeds, regulatory pages). For each, return JSON object "
-        'with keys: url, name, category (one of: documentation, news, '
-        "competitive, regulatory, research, security, model_releases), "
-        "reason, confidence_score (1-10). Return only a JSON array.\n\n"
+        "You are evaluating page content to find authoritative external sources "
+        "worth ONGOING monitoring in a knowledge base. Apply strict quality criteria:\n\n"
+        "REQUIRED — a source MUST have ALL of:\n"
+        "1. INSTITUTIONAL AUTHORITY: official organisation site, established publication, "
+        "   government/regulatory body, or recognised industry group. NOT personal blogs, "
+        "   social media profiles, or anonymous authors.\n"
+        "2. REGULAR UPDATES: publishes new content on a recurring basis (daily, weekly, "
+        "   monthly). NOT one-off articles, static pages, or archived content.\n"
+        "3. ORIGINAL CONTENT: primary source with original reporting, research, data, or "
+        "   documentation. NOT aggregators, scrapers, or sites that just repost others.\n"
+        "4. EDITORIAL STANDARDS: has editorial review or institutional accountability. "
+        "   NOT unmoderated user-generated content.\n\n"
+        "ALWAYS REJECT: social media (Twitter/X, Reddit, LinkedIn, Facebook, Instagram), "
+        "forums, Medium/Substack (unless from a known institution), paywalled sites, "
+        "SEO spam, content farms, aggregator/scraper sites, personal hobby blogs, "
+        "YouTube channels, podcast pages, GitHub repos (unless official project docs).\n\n"
+        "From the content below, identify up to 3 external sources that meet ALL "
+        "criteria. For each, return a JSON object with:\n"
+        "- url: the source's main page or feed URL (not a deep link to one article)\n"
+        "- name: the organisation or publication name\n"
+        "- category: one of documentation, news, competitive, regulatory, research, "
+        "  security, model_releases\n"
+        "- authority: WHO maintains this source and WHY they are authoritative "
+        "  (e.g. 'Official Apache Foundation docs, maintained by core committers')\n"
+        "- update_frequency: estimated publication cadence (e.g. 'weekly', 'daily')\n"
+        "- confidence_score: 1-10 where 8+ = clearly meets all criteria, "
+        "  7 = probably meets criteria, below 7 = uncertain or missing a criterion\n\n"
+        "If NO sources meet ALL criteria, return []. Be selective — 0 suggestions "
+        "is better than a weak suggestion.\n\n"
         f"CONTENT:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
     )
-    raw, tokens = _fast_call(prompt, max_tokens=500)
+    raw, tokens = _fast_call(prompt, max_tokens=600)
     if not raw:
         _log.debug("discover_sources returned empty from %s", source_url[:80])
         return tokens
@@ -469,35 +527,56 @@ def _discover_sources(
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         items = json.loads(cleaned)
     except Exception:
-        _log.warning("discover_sources unparseable from %s: %s", source_url[:80], raw[:200])
-        return tokens
+        items = _salvage_json_array(cleaned) if cleaned else None
+        if items is None:
+            _log.warning("discover_sources unparseable from %s: %s", source_url[:80], raw[:200])
+            return tokens
     if not isinstance(items, list):
         _log.warning("discover_sources non-list from %s", source_url[:80])
         return tokens
 
     recorded = 0
-    for item in items[:5]:
+    for item in items[:3]:
         try:
             score = int(item.get("confidence_score") or 0)
-            if score < 6:
+            if score < 7:
+                _log.debug("discover_sources skip low-score=%d url=%s", score, str(item.get("url", ""))[:80])
                 continue
-            confidence = "high" if score >= 8 else "medium" if score >= 6 else "low"
             category = str(item.get("category") or "").lower()
             if category not in CATEGORY_COLLECTIONS:
                 continue
-            url = str(item.get("url") or "")
+            url = str(item.get("url") or "").strip()
+            if not url or not url.startswith("http"):
+                continue
+
+            # Dedup against tracked and pending sources
+            if url in already_known:
+                _log.debug("discover_sources skip already-tracked url=%s", url[:80])
+                continue
+
+            # Verify the URL actually resolves
+            if not _verify_url_reachable(url):
+                _log.info("discover_sources skip unreachable url=%s", url[:80])
+                continue
+
+            authority = str(item.get("authority") or "")
+            freq = str(item.get("update_frequency") or "")
+            reason = f"{authority}. Updates: {freq}" if authority else str(item.get("reason") or "")
+
+            confidence = "high" if score >= 8 else "medium"
             _log.debug("suggesting source  url=%s category=%s score=%d from=%s", url[:80], category, score, source_url[:60])
             db.record_suggestion(
                 org_id=org_id,
                 url=url,
                 name=str(item.get("name") or url),
                 category=category,
-                reason=str(item.get("reason") or ""),
+                reason=reason[:500],
                 confidence=confidence,
                 confidence_score=score,
                 suggested_by_url=source_url,
                 suggested_by_cycle=cycle_id,
             )
+            already_known.add(url)
             recorded += 1
         except Exception:
             _log.error("suggestion record failed", exc_info=True)
@@ -530,7 +609,7 @@ def _process_source(
         db.log_event(cycle_id, "source_rejected", org_id, target_id, url, "robots.txt disallow")
         return 0
 
-    text = scrape_page(url)
+    text = scrape_page(url, source=source)
     if not text:
         _log.warning("source %s scrape failed: no text extracted from %s", target_id, url)
         db.log_event(cycle_id, "source_error", org_id, target_id, url, "scrape failed")
@@ -640,43 +719,112 @@ def _proactive_search(
     if not concepts:
         return 0
 
+    try:
+        already_known = db.list_tracked_urls(org_id)
+    except Exception:
+        already_known = set()
+
     total_tokens = 0
     for concept in concepts:
         if total_tokens >= budget_remaining:
             break
-        results = searxng_search(f"{concept} authoritative source", max_results=3)
-        for r in results[:3]:
-            prompt = (
-                "Score this source for authority and relevance as a monitoring "
-                f"target for the concept '{concept}'. Return JSON: "
-                '{"score": 1-10, "category": "...", "reason": "..."}.\n\n'
-                f"TITLE: {r.get('title')}\nURL: {r.get('url')}\n"
-                f"SNIPPET: {r.get('snippet')}"
-            )
-            raw, tokens = _fast_call(prompt, max_tokens=120)
-            total_tokens += tokens
-            if not raw:
+        # Use targeted search queries instead of generic "authoritative source"
+        queries = [
+            f'"{concept}" official documentation site',
+            f'"{concept}" research publications regulatory',
+        ]
+        candidates: list[dict] = []
+        for q in queries:
+            candidates.extend(searxng_search(q, max_results=3))
+            if len(candidates) >= 6:
+                break
+
+        # Dedupe and filter already-known URLs before spending tokens
+        seen: set[str] = set()
+        filtered: list[dict] = []
+        for r in candidates:
+            url = r.get("url", "")
+            if url in seen or url in already_known:
                 continue
+            seen.add(url)
+            filtered.append(r)
+
+        if not filtered:
+            continue
+
+        # Batch-evaluate candidates in a single LLM call
+        candidates_text = "\n".join(
+            f"{i+1}. TITLE: {r.get('title', '')}\n   URL: {r.get('url', '')}\n   SNIPPET: {r.get('snippet', '')}"
+            for i, r in enumerate(filtered[:5])
+        )
+        prompt = (
+            f"You are evaluating search results about '{concept}' to find sources "
+            "worth ONGOING monitoring in a knowledge base.\n\n"
+            "A good monitoring target MUST have ALL of:\n"
+            "- INSTITUTIONAL AUTHORITY: maintained by a recognised organisation, "
+            "  not a personal blog or social media\n"
+            "- REGULAR UPDATES: publishes new content on a recurring basis\n"
+            "- ORIGINAL CONTENT: primary source, not an aggregator or reposter\n"
+            "- RELEVANCE: directly covers this topic area with depth\n\n"
+            "REJECT: social media, forums, Medium/Substack, paywalled sites, "
+            "personal blogs, content farms, aggregators, YouTube, GitHub issues.\n\n"
+            f"CANDIDATES:\n{candidates_text}\n\n"
+            "For each candidate worth monitoring, return a JSON object with:\n"
+            "- index: the candidate number\n"
+            "- category: one of documentation, news, competitive, regulatory, "
+            "  research, security, model_releases\n"
+            "- authority: WHO maintains this and WHY they are credible\n"
+            "- score: 1-10 (8+ = clearly authoritative, 7 = probably good)\n\n"
+            "Return a JSON array. If NONE are worth monitoring, return []. "
+            "Be very selective — most search results are NOT good monitoring targets."
+        )
+        raw, tokens = _fast_call(prompt, max_tokens=400)
+        total_tokens += tokens
+        if not raw:
+            continue
+        try:
+            cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
+            evaluations = json.loads(cleaned)
+        except Exception:
+            evaluations = _salvage_json_array(cleaned) if cleaned else None
+            if evaluations is None:
+                continue
+        if not isinstance(evaluations, list):
+            continue
+
+        for ev in evaluations:
             try:
-                cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
-                obj = json.loads(cleaned)
-                score = int(obj.get("score") or 0)
+                score = int(ev.get("score") or 0)
                 if score < 7:
                     continue
-                category = str(obj.get("category") or "").lower()
+                idx = int(ev.get("index", 0)) - 1
+                if idx < 0 or idx >= len(filtered):
+                    continue
+                r = filtered[idx]
+                url = r.get("url", "")
+                category = str(ev.get("category") or "").lower()
                 if category not in CATEGORY_COLLECTIONS:
                     continue
+
+                # Verify URL is actually reachable before suggesting
+                if not _verify_url_reachable(url):
+                    _log.debug("proactive skip unreachable url=%s", url[:80])
+                    continue
+
+                authority = str(ev.get("authority") or "")
+                reason = f"Proactive: {authority}" if authority else f"Sparse coverage of {concept}"
                 db.record_suggestion(
                     org_id=org_id,
-                    url=r["url"],
-                    name=r.get("title") or r["url"],
+                    url=url,
+                    name=r.get("title") or url,
                     category=category,
-                    reason=str(obj.get("reason") or f"sparse coverage of {concept}"),
+                    reason=reason[:500],
                     confidence="high" if score >= 8 else "medium",
                     confidence_score=score,
                     suggested_by_url=None,
                     suggested_by_cycle=cycle_id,
                 )
+                already_known.add(url)
             except Exception:
                 continue
 
