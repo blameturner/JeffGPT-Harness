@@ -302,50 +302,11 @@ class CodeAgent(ChatAgent):
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s mode=%s model=%s in=%d out=%d %.1fs", conversation_id, self.mode, final_model, tokens_input, tokens_output, duration)
 
-        if conversation_id is not None:
-            try:
-                self.db.add_code_message(
-                    conversation_id=conversation_id,
-                    org_id=self.org_id,
-                    role="assistant",
-                    content=output,
-                    model=str(final_model),
-                    tokens_input=tokens_input,
-                    tokens_output=tokens_output,
-                    mode=self.mode,
-                    response_style=style_key,
-                )
-            except Exception as e:
-                _log.error("assistant message persist failed", exc_info=True)
-
-        if conversation_id is not None:
-            try:
-                remember(
-                    text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
-                    metadata={
-                        "conversation_id": conversation_id,
-                        "model": str(final_model),
-                        "mode": self.mode,
-                        "turn_time": time.time(),
-                    },
-                    org_id=self.org_id,
-                    collection_name=f"code_{conversation_id}",
-                )
-            except Exception as e:
-                _log.error("memory write failed", exc_info=True)
-
         if self.mode == "plan":
             fast_url, fast_model = self._tool_model_url()
             if fast_url:
                 steps = _parse_plan_checklist(output, fast_url, fast_model)
                 if steps:
-                    if conversation_id is not None:
-                        try:
-                            self.db.update_code_conversation(
-                                conversation_id, {"code_checklist": steps}
-                            )
-                        except Exception as e:
-                            _log.error("checklist persist failed", exc_info=True)
                     yield {"type": "plan_checklist", "steps": steps}
 
         yield {
@@ -357,4 +318,56 @@ class CodeAgent(ChatAgent):
             "tokens_output": tokens_output,
             "duration_seconds": duration,
             "output": output,
+            "response_style": style_key,
         }
+
+    def persist_from_events(self, events: list[dict]) -> None:
+        meta = next((e for e in events if e.get("type") == "meta"), None)
+        done = next((e for e in events if e.get("type") == "done"), None)
+        if not meta:
+            return
+        conversation_id = meta.get("conversation_id")
+        if not conversation_id:
+            return
+
+        output = "".join(e["text"] for e in events if e.get("type") == "chunk")
+        if not output:
+            return
+
+        model = (done or {}).get("model") or self.model
+        tokens_in = int((done or {}).get("tokens_input") or 0)
+        tokens_out = int((done or {}).get("tokens_output") or 0)
+        style_key = (done or {}).get("response_style")
+
+        try:
+            self.db.add_code_message(
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                role="assistant",
+                content=output,
+                model=str(model),
+                tokens_input=tokens_in,
+                tokens_output=tokens_out,
+                mode=self.mode,
+                response_style=style_key,
+            )
+            _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
+        except Exception:
+            _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
+
+        try:
+            remember(
+                text=f"USER ({self.mode}): ...\n\nASSISTANT: {output}",
+                metadata={"conversation_id": conversation_id, "model": str(model), "mode": self.mode, "turn_time": time.time()},
+                org_id=self.org_id,
+                collection_name=f"code_{conversation_id}",
+            )
+        except Exception:
+            _log.error("memory write failed", exc_info=True)
+
+        checklist = next((e for e in events if e.get("type") == "plan_checklist"), None)
+        if checklist and checklist.get("steps"):
+            try:
+                self.db.update_code_conversation(conversation_id, {"code_checklist": checklist["steps"]})
+            except Exception:
+                _log.error("checklist persist failed", exc_info=True)

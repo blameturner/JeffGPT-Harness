@@ -432,57 +432,7 @@ class ChatAgent:
         output = "".join(accumulated)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
-        _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs", conversation_id, final_model, tokens_input, tokens_output, duration)
-
-        try:
-            self.db.add_message(
-                conversation_id=conversation_id,
-                org_id=self.org_id,
-                role="assistant",
-                content=output,
-                model=str(final_model),
-                tokens_input=tokens_input,
-                tokens_output=tokens_output,
-                response_style=style_key,
-            )
-        except Exception as e:
-            _log.error("assistant message persist failed", exc_info=True)
-
-        if convo_rag_enabled:
-            try:
-                remember(
-                    text=f"USER: {user_message}\n\nASSISTANT: {output}",
-                    metadata={
-                        "conversation_id": conversation_id,
-                        "model": self.model,
-                        "turn_time": time.time(),
-                    },
-                    org_id=self.org_id,
-                    collection_name=collection_name,
-                )
-            except Exception as e:
-                _log.error("memory write failed", exc_info=True)
-
-        if convo_knowledge:
-            try:
-                remember(
-                    text=f"USER: {user_message}\n\nASSISTANT: {output}",
-                    metadata={
-                        "conversation_id": conversation_id,
-                        "model": self.model,
-                        "turn_time": time.time(),
-                    },
-                    org_id=self.org_id,
-                    collection_name="chat_knowledge",
-                )
-            except Exception as e:
-                _log.error("chat_knowledge write failed", exc_info=True)
-
-            threading.Thread(
-                target=self._extract_and_write_graph,
-                args=(user_message, output, conversation_id),
-                daemon=True,
-            ).start()
+        _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
         yield {
             "type": "done",
@@ -494,6 +444,83 @@ class ChatAgent:
             "rag_enabled": convo_rag_enabled,
             "context_chars": len(rag_context),
         }
+
+    def persist_from_events(self, events: list[dict]) -> None:
+        # Runs OUTSIDE the generator — called by the job store after
+        # the stream finishes (or crashes). Reconstructs the output from
+        # buffered chunk events and writes to NocoDB + memory.
+        meta = next((e for e in events if e.get("type") == "meta"), None)
+        done = next((e for e in events if e.get("type") == "done"), None)
+        if not meta:
+            return
+        conversation_id = meta.get("conversation_id")
+        if not conversation_id:
+            return
+
+        output = "".join(e["text"] for e in events if e.get("type") == "chunk")
+        if not output:
+            return
+
+        model = (done or {}).get("model") or self.model
+        tokens_in = int((done or {}).get("tokens_input") or 0)
+        tokens_out = int((done or {}).get("tokens_output") or 0)
+        style_key = (done or {}).get("response_style")
+
+        try:
+            self.db.add_message(
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                role="assistant",
+                content=output,
+                model=str(model),
+                tokens_input=tokens_in,
+                tokens_output=tokens_out,
+                response_style=style_key,
+            )
+            _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
+        except Exception:
+            _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
+
+        convo = self.db.get_conversation(conversation_id)
+        convo_rag = self._truthy((convo or {}).get("rag_enabled"))
+        convo_knowledge = self._truthy((convo or {}).get("knowledge_enabled"))
+        collection_name = (
+            ((convo or {}).get("rag_collection") or "").strip()
+            or self._default_collection(conversation_id)
+        )
+
+        user_message = ""
+        for e in events:
+            if e.get("type") == "meta":
+                continue
+            break
+        msgs = self.db.list_messages(conversation_id)
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
+        if user_msgs:
+            user_message = user_msgs[-1].get("content") or ""
+
+        if convo_rag:
+            try:
+                remember(
+                    text=f"USER: {user_message}\n\nASSISTANT: {output}",
+                    metadata={"conversation_id": conversation_id, "model": self.model, "turn_time": time.time()},
+                    org_id=self.org_id,
+                    collection_name=collection_name,
+                )
+            except Exception:
+                _log.error("memory write failed", exc_info=True)
+
+        if convo_knowledge:
+            try:
+                remember(
+                    text=f"USER: {user_message}\n\nASSISTANT: {output}",
+                    metadata={"conversation_id": conversation_id, "model": self.model, "turn_time": time.time()},
+                    org_id=self.org_id,
+                    collection_name="chat_knowledge",
+                )
+            except Exception:
+                _log.error("chat_knowledge write failed", exc_info=True)
+            self._extract_and_write_graph(user_message, output, conversation_id)
 
     def _call_model_streaming(
         self,
@@ -521,6 +548,7 @@ class ChatAgent:
                 timeout=600,
             ) as response:
                 response.raise_for_status()
+                response.encoding = "utf-8"
                 for raw_line in response.iter_lines(decode_unicode=True):
                     if not raw_line:
                         continue

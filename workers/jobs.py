@@ -75,18 +75,31 @@ class JobStore:
 STORE = JobStore()
 
 
-def run_in_background(job: Job, generator_factory: Callable[[], Iterator[dict]]):
+def run_in_background(
+    job: Job,
+    generator_factory: Callable[[], Iterator[dict]],
+    on_complete: Optional[Callable[[list[dict]], None]] = None,
+):
     _log.debug("job %s started", job.id)
 
     def _worker():
         try:
+            event_count = 0
             for event in generator_factory():
                 STORE.append(job, event)
+                event_count += 1
         except Exception as e:
+            _log.error("job %s generator crashed after %d events", job.id, event_count, exc_info=True)
             STORE.append(job, {"type": "error", "message": str(e)})
             STORE.finish(job, error=str(e))
-            return
-        STORE.finish(job)
+        else:
+            STORE.finish(job)
+
+        if on_complete:
+            try:
+                on_complete(job.events[:])
+            except Exception:
+                _log.error("job %s on_complete failed", job.id, exc_info=True)
 
     threading.Thread(target=_worker, daemon=True).start()
 

@@ -160,18 +160,22 @@ def chat(request: ChatRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     job = STORE.create()
-    run_in_background(job, lambda: agent.send_streaming(
-        user_message=request.message,
-        conversation_id=request.conversation_id,
-        system=request.system,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        rag_enabled=request.rag_enabled,
-        rag_collection=request.rag_collection,
-        knowledge_enabled=request.knowledge_enabled,
-        search_consent_declined=request.search_consent_declined,
-        response_style=request.response_style,
-    ))
+    run_in_background(
+        job,
+        lambda: agent.send_streaming(
+            user_message=request.message,
+            conversation_id=request.conversation_id,
+            system=request.system,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            rag_enabled=request.rag_enabled,
+            rag_collection=request.rag_collection,
+            knowledge_enabled=request.knowledge_enabled,
+            search_consent_declined=request.search_consent_declined,
+            response_style=request.response_style,
+        ),
+        on_complete=agent.persist_from_events,
+    )
     return {"job_id": job.id}
 
 
@@ -188,15 +192,19 @@ def code(request: CodeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     job = STORE.create()
-    run_in_background(job, lambda: agent.run_streaming(
-        user_message=request.message,
-        conversation_id=request.conversation_id,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        title=request.title,
-        codebase_collection=request.codebase_collection,
-        response_style=request.response_style,
-    ))
+    run_in_background(
+        job,
+        lambda: agent.run_streaming(
+            user_message=request.message,
+            conversation_id=request.conversation_id,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            title=request.title,
+            codebase_collection=request.codebase_collection,
+            response_style=request.response_style,
+        ),
+        on_complete=agent.persist_from_events,
+    )
     return {"job_id": job.id}
 
 

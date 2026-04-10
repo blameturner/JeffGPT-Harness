@@ -123,6 +123,7 @@ class Agent:
                 timeout=600,
             ) as response:
                 response.raise_for_status()
+                response.encoding = "utf-8"
                 for raw_line in response.iter_lines(decode_unicode=True):
                     if not raw_line:
                         continue
