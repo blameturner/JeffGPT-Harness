@@ -75,33 +75,20 @@ class JobStore:
 STORE = JobStore()
 
 
-def run_in_background(
-    job: Job,
-    generator_factory: Callable[[], Iterator[dict]],
-    on_complete: Optional[Callable[[list[dict]], None]] = None,
-):
+def run_in_background(job: Job, worker_fn: Callable[[Job], None]):
     _log.debug("job %s started", job.id)
 
-    def _worker():
+    def _thread():
         try:
-            event_count = 0
-            for event in generator_factory():
-                STORE.append(job, event)
-                event_count += 1
+            worker_fn(job)
         except Exception as e:
-            _log.error("job %s generator crashed after %d events", job.id, event_count, exc_info=True)
+            _log.error("job %s worker failed", job.id, exc_info=True)
             STORE.append(job, {"type": "error", "message": str(e)})
             STORE.finish(job, error=str(e))
-        else:
-            STORE.finish(job)
+            return
+        STORE.finish(job)
 
-        if on_complete:
-            try:
-                on_complete(job.events[:])
-            except Exception:
-                _log.error("job %s on_complete failed", job.id, exc_info=True)
-
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_thread, daemon=True).start()
 
 
 def stream_events(job_id: str, cursor: int = 0) -> Iterator[str]:

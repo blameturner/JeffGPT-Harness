@@ -19,7 +19,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
-from workers.enrichment_agent import run_enrichment_cycle, run_log_cleanup
+from workers.enrichment_agent import run_enrichment_cycle, run_log_cleanup, EnrichmentDB
 
 _scheduler: BackgroundScheduler | None = None
 AGENT_JOB_PREFIX = "agent_schedule_"
@@ -107,6 +107,43 @@ def _register_agent_schedules(sched: BackgroundScheduler) -> int:
     return count
 
 
+ENRICHMENT_JOB_PREFIX = "enrichment_agent_"
+
+
+def _register_enrichment_agents(sched: BackgroundScheduler) -> int:
+    for job in list(sched.get_jobs()):
+        if job.id.startswith(ENRICHMENT_JOB_PREFIX):
+            sched.remove_job(job.id)
+    count = 0
+    try:
+        db = EnrichmentDB()
+        agents = db.list_enrichment_agents()
+    except Exception:
+        _log.warning("could not load enrichment_agents table, skipping")
+        return 0
+    for agent in agents:
+        try:
+            cron = (agent.get("cron_expression") or "").strip()
+            agent_id = agent["Id"]
+            if not cron:
+                continue
+            tz = agent.get("timezone") or "Australia/Sydney"
+            trigger = CronTrigger.from_crontab(cron, timezone=tz)
+            sched.add_job(
+                run_enrichment_cycle,
+                trigger,
+                id=f"{ENRICHMENT_JOB_PREFIX}{agent_id}",
+                args=[agent_id],
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            count += 1
+        except Exception:
+            _log.warning("enrichment_agent row %s invalid", agent.get("Id"), exc_info=True)
+    return count
+
+
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
     sched = BackgroundScheduler(timezone="UTC")
@@ -128,7 +165,8 @@ def start_scheduler() -> BackgroundScheduler:
     )
     sched.start()
     registered = _register_agent_schedules(sched)
-    _log.info("registered %d agent schedules", registered)
+    enrichment_registered = _register_enrichment_agents(sched)
+    _log.info("registered %d agent schedules, %d enrichment agents", registered, enrichment_registered)
     _scheduler = sched
     return sched
 

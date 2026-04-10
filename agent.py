@@ -120,7 +120,7 @@ class Agent:
                 f"{url}/v1/chat/completions",
                 json=payload,
                 stream=True,
-                timeout=600,
+                timeout=(10, 600),
             ) as response:
                 response.raise_for_status()
                 response.encoding = "utf-8"

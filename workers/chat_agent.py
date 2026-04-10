@@ -3,8 +3,9 @@ import logging
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 
 import requests
 
@@ -13,7 +14,7 @@ from nocodb_client import NocodbClient
 from rag import retrieve
 from memory import remember
 from graph import write_relationship
-from workers.web_search import run_web_search, needs_web_search
+from workers.web_search import run_web_search, needs_web_search, _tool_model
 from workers.styles import chat_style_prompt
 
 _log = logging.getLogger("chat")
@@ -78,14 +79,9 @@ class ChatAgent:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return False
 
-    def _tool_model_url(self) -> tuple[str | None, str | None]:
-        entry = MODELS.get("tool")
-        if isinstance(entry, dict):
-            return entry.get("url"), entry.get("model_id") or "tool"
-        entry = MODELS.get("fast")
-        if isinstance(entry, dict):
-            return entry.get("url"), entry.get("model_id") or "fast"
-        return None, None
+    @staticmethod
+    def _tool_model_url() -> tuple[str | None, str | None]:
+        return _tool_model()
 
     def _maybe_summarise(self, history: list[dict]) -> tuple[list[dict], dict | None]:
         """If history is too large, replace the oldest portion with a summary.
@@ -231,8 +227,9 @@ class ChatAgent:
             except Exception as e:
                 _log.warning("graph write failed (%s-%s->%s): %s", a, rel, b, e)
 
-    def send_streaming(
+    def run_job(
         self,
+        job,
         user_message: str,
         conversation_id: int | None = None,
         system: str | None = None,
@@ -243,16 +240,12 @@ class ChatAgent:
         knowledge_enabled: bool | None = None,
         search_consent_declined: bool = False,
         response_style: str | None = None,
-    ) -> Iterator[dict]:
-        """Yield SSE-ready event dicts for a single chat turn.
+    ) -> None:
+        from workers.jobs import STORE
 
-        Events:
-          {"type": "meta", "conversation_id": int}
-          {"type": "summarised", ...}
-          {"type": "chunk", "text": str}
-          {"type": "done", "tokens_input": int, "tokens_output": int, ...}
-          {"type": "error", "message": str}
-        """
+        def emit(event: dict):
+            STORE.append(job, event)
+
         if conversation_id is None:
             convo = self.db.create_conversation(
                 org_id=self.org_id,
@@ -266,7 +259,7 @@ class ChatAgent:
         else:
             convo = self.db.get_conversation(conversation_id)
             if not convo:
-                yield {"type": "error", "message": f"Conversation {conversation_id} not found"}
+                emit({"type": "error", "message": f"Conversation {conversation_id} not found"})
                 return
             history = [
                 {"role": m["role"], "content": m["content"]}
@@ -280,27 +273,32 @@ class ChatAgent:
         )
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
 
+        try:
+            self.db.update_conversation(conversation_id, {"status": "processing"})
+        except Exception:
+            _log.warning("status update to processing failed  conv=%s", conversation_id)
+
         _log.debug("turn start  conv=%s model=%s org=%d", conversation_id, self.model, self.org_id)
-        yield {"type": "meta", "conversation_id": conversation_id}
+        emit({"type": "meta", "conversation_id": conversation_id})
 
         search_context = ""
         search_sources: list[str] = []
         search_note = ""
         search_errored = False
         if self.search_enabled:
-            yield {"type": "searching"}
+            emit({"type": "searching"})
             try:
                 search_context, search_sources = run_web_search(user_message, self.org_id)
-            except Exception as e:
+            except Exception:
                 _log.error("web search failed", exc_info=True)
                 search_context, search_sources = "", []
                 search_errored = True
-            yield {
+            emit({
                 "type": "search_complete",
                 "source_count": len(search_sources),
                 "sources": search_sources,
                 "ok": bool(search_sources),
-            }
+            })
             if not search_sources:
                 search_note = (
                     "SEARCH STATUS: You attempted a live web search for this "
@@ -316,16 +314,16 @@ class ChatAgent:
         elif not search_consent_declined:
             try:
                 needs, reason = needs_web_search(user_message)
-            except Exception as e:
-                _log.warning("needs_web_search classifier failed: %s", e)
+            except Exception:
+                _log.warning("needs_web_search classifier failed", exc_info=True)
                 needs, reason = False, ""
             if needs:
-                yield {
+                emit({
                     "type": "search_consent_required",
                     "query": user_message,
                     "reason": reason or "question appears to need live information",
-                }
-                yield {
+                })
+                emit({
                     "type": "done",
                     "conversation_id": conversation_id,
                     "awaiting": "search_consent",
@@ -335,7 +333,7 @@ class ChatAgent:
                     "duration_seconds": 0.0,
                     "rag_enabled": False,
                     "context_chars": 0,
-                }
+                })
                 return
         else:
             search_note = (
@@ -357,7 +355,7 @@ class ChatAgent:
                 model=self.model,
                 response_style=style_key,
             )
-        except Exception as e:
+        except Exception:
             _log.error("user message persist failed", exc_info=True)
 
         rag_context = ""
@@ -370,28 +368,22 @@ class ChatAgent:
                     n_results=10,
                     top_k=3,
                 )
-            except Exception as e:
+            except Exception:
                 _log.error("RAG retrieval failed", exc_info=True)
                 rag_context = ""
 
         history, summary_event = self._maybe_summarise(history)
         if summary_event:
-            yield summary_event
+            emit(summary_event)
 
         payload: list[dict] = []
         payload.append({"role": "system", "content": style_prompt})
         if system:
             payload.append({"role": "system", "content": system})
         if search_context:
-            payload.append({
-                "role": "system",
-                "content": search_context,
-            })
+            payload.append({"role": "system", "content": search_context})
         if search_note:
-            payload.append({
-                "role": "system",
-                "content": search_note,
-            })
+            payload.append({"role": "system", "content": search_note})
         if rag_context:
             payload.append({
                 "role": "system",
@@ -406,100 +398,41 @@ class ChatAgent:
 
         _log.debug("model call   conv=%s messages=%d temp=%.1f max_tokens=%d", conversation_id, len(payload), temperature, max_tokens)
         start = time.time()
-        accumulated: list[str] = []
-        final_usage: dict = {}
-        final_model = self.model
-        errored = False
 
-        for event in self._call_model_streaming(payload, temperature, max_tokens):
-            etype = event.get("type")
-            if etype == "chunk":
-                accumulated.append(event["text"])
-                yield event
-            elif etype == "done":
-                final_usage = event.get("usage") or {}
-                final_model = event.get("model") or final_model
-                break
-            elif etype == "error":
-                errored = True
-                yield event
-                return
-
-        if errored:
+        try:
+            chunks, final_usage, final_model = self._call_model(payload, temperature, max_tokens, emit)
+        except Exception:
+            _log.error("model call failed  conv=%s", conversation_id, exc_info=True)
+            try:
+                self.db.update_conversation(conversation_id, {"status": "error"})
+            except Exception:
+                pass
+            emit({"type": "error", "message": "model call failed"})
             return
 
         duration = round(time.time() - start, 2)
-        output = "".join(accumulated)
+        output = "".join(chunks)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
-        yield {
-            "type": "done",
-            "conversation_id": conversation_id,
-            "model": str(final_model),
-            "tokens_input": tokens_input,
-            "tokens_output": tokens_output,
-            "duration_seconds": duration,
-            "rag_enabled": convo_rag_enabled,
-            "context_chars": len(rag_context),
-        }
+        if output:
+            try:
+                self.db.add_message(
+                    conversation_id=conversation_id,
+                    org_id=self.org_id,
+                    role="assistant",
+                    content=output,
+                    model=str(final_model),
+                    tokens_input=tokens_input,
+                    tokens_output=tokens_output,
+                    response_style=style_key,
+                )
+                _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
+            except Exception:
+                _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
-    def persist_from_events(self, events: list[dict]) -> None:
-        # Runs OUTSIDE the generator — called by the job store after
-        # the stream finishes (or crashes). Reconstructs the output from
-        # buffered chunk events and writes to NocoDB + memory.
-        meta = next((e for e in events if e.get("type") == "meta"), None)
-        done = next((e for e in events if e.get("type") == "done"), None)
-        if not meta:
-            return
-        conversation_id = meta.get("conversation_id")
-        if not conversation_id:
-            return
-
-        output = "".join(e["text"] for e in events if e.get("type") == "chunk")
-        if not output:
-            return
-
-        model = (done or {}).get("model") or self.model
-        tokens_in = int((done or {}).get("tokens_input") or 0)
-        tokens_out = int((done or {}).get("tokens_output") or 0)
-        style_key = (done or {}).get("response_style")
-
-        try:
-            self.db.add_message(
-                conversation_id=conversation_id,
-                org_id=self.org_id,
-                role="assistant",
-                content=output,
-                model=str(model),
-                tokens_input=tokens_in,
-                tokens_output=tokens_out,
-                response_style=style_key,
-            )
-            _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
-        except Exception:
-            _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
-
-        convo = self.db.get_conversation(conversation_id)
-        convo_rag = self._truthy((convo or {}).get("rag_enabled"))
-        convo_knowledge = self._truthy((convo or {}).get("knowledge_enabled"))
-        collection_name = (
-            ((convo or {}).get("rag_collection") or "").strip()
-            or self._default_collection(conversation_id)
-        )
-
-        user_message = ""
-        for e in events:
-            if e.get("type") == "meta":
-                continue
-            break
-        msgs = self.db.list_messages(conversation_id)
-        user_msgs = [m for m in msgs if m.get("role") == "user"]
-        if user_msgs:
-            user_message = user_msgs[-1].get("content") or ""
-
-        if convo_rag:
+        if convo_rag_enabled and output:
             try:
                 remember(
                     text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -510,7 +443,7 @@ class ChatAgent:
             except Exception:
                 _log.error("memory write failed", exc_info=True)
 
-        if convo_knowledge:
+        if convo_knowledge and output:
             try:
                 remember(
                     text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -522,13 +455,62 @@ class ChatAgent:
                 _log.error("chat_knowledge write failed", exc_info=True)
             self._extract_and_write_graph(user_message, output, conversation_id)
 
-    def _call_model_streaming(
+        try:
+            self.db.update_conversation(conversation_id, {"status": "complete"})
+        except Exception:
+            _log.warning("status update to complete failed  conv=%s", conversation_id)
+
+        emit({
+            "type": "done",
+            "conversation_id": conversation_id,
+            "model": str(final_model),
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "duration_seconds": duration,
+            "rag_enabled": convo_rag_enabled,
+            "context_chars": len(rag_context),
+        })
+
+    def send_streaming(
+        self,
+        user_message: str,
+        conversation_id: int | None = None,
+        system: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        rag_enabled: bool | None = None,
+        rag_collection: str | None = None,
+        knowledge_enabled: bool | None = None,
+        search_consent_declined: bool = False,
+        response_style: str | None = None,
+    ) -> Iterator[dict]:
+        """Sync wrapper — collects events from run_job for callers that need a generator."""
+        from workers.jobs import Job, STORE
+        job = Job(uuid.uuid4().hex)
+        self.run_job(
+            job,
+            user_message=user_message,
+            conversation_id=conversation_id,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            rag_enabled=rag_enabled,
+            rag_collection=rag_collection,
+            knowledge_enabled=knowledge_enabled,
+            search_consent_declined=search_consent_declined,
+            response_style=response_style,
+        )
+        yield from job.events
+
+    def _call_model(
         self,
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-    ) -> Iterator[dict]:
-        """Stream from llama.cpp-compatible chat-completions endpoint."""
+        emit: Callable[[dict], None],
+    ) -> tuple[list[str], dict, str]:
+        # Tight loop — reads the full model SSE stream without suspending.
+        # Each chunk is pushed to emit() immediately for real-time delivery.
         payload = {
             "model": self.model,
             "messages": messages,
@@ -538,47 +520,46 @@ class ChatAgent:
             "stream_options": {"include_usage": True},
         }
 
+        chunks: list[str] = []
         final_usage: dict = {}
         final_model: str = self.model
-        try:
-            with requests.post(
-                f"{self.url}/v1/chat/completions",
-                json=payload,
-                stream=True,
-                timeout=600,
-            ) as response:
-                response.raise_for_status()
-                response.encoding = "utf-8"
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    if not raw_line:
-                        continue
-                    if not raw_line.startswith("data:"):
-                        continue
-                    data = raw_line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
 
-                    if event.get("model"):
-                        final_model = event["model"]
-                    usage = event.get("usage")
-                    if usage:
-                        final_usage = usage
+        with requests.post(
+            f"{self.url}/v1/chat/completions",
+            json=payload,
+            stream=True,
+            timeout=(10, 600),
+        ) as response:
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data:"):
+                    continue
+                data = raw_line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
 
-                    choices = event.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta") or {}
-                        text = delta.get("content")
-                        if text:
-                            yield {"type": "chunk", "text": text}
-        except Exception as e:
-            yield {"type": "error", "message": str(e)}
-            return
+                if event.get("model"):
+                    final_model = event["model"]
+                usage = event.get("usage")
+                if usage:
+                    final_usage = usage
 
-        yield {"type": "done", "usage": final_usage, "model": final_model}
+                choices = event.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    text = delta.get("content")
+                    if text:
+                        chunks.append(text)
+                        emit({"type": "chunk", "text": text})
+
+        return chunks, final_usage, final_model
 
     def send(
         self,

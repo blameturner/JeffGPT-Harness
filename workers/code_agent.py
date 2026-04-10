@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Iterator, Literal
 
 import requests
@@ -164,8 +165,9 @@ class CodeAgent(ChatAgent):
                     continue
         return []
 
-    def run_streaming(
+    def run_job(
         self,
+        job,
         user_message: str,
         conversation_id: int | None = None,
         temperature: float = 0.2,
@@ -173,7 +175,12 @@ class CodeAgent(ChatAgent):
         title: str | None = None,
         codebase_collection: str | None = None,
         response_style: str | None = None,
-    ) -> Iterator[dict]:
+    ) -> None:
+        from workers.jobs import STORE
+
+        def emit(event: dict):
+            STORE.append(job, event)
+
         system_prompt = _SYSTEMS[self.mode]
         style_key, style_prompt = code_style_prompt(response_style)
 
@@ -189,13 +196,15 @@ class CodeAgent(ChatAgent):
                 )
                 conversation_id = convo["Id"]
                 is_new = True
-            except Exception as e:
+            except Exception:
                 _log.error("create_code_conversation failed", exc_info=True)
+                emit({"type": "error", "message": "failed to create conversation"})
+                return
         else:
             try:
                 convo = self.db.get_code_conversation(conversation_id)
                 if not convo:
-                    yield {"type": "error", "message": f"Code conversation {conversation_id} not found"}
+                    emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
                     return
                 history = [
                     {"role": m["role"], "content": m["content"]}
@@ -203,19 +212,25 @@ class CodeAgent(ChatAgent):
                 ]
                 if not self.files:
                     self.files = self._load_workspace(conversation_id)
-            except Exception as e:
-                _log.error("load history failed", exc_info=True)
+            except Exception:
+                _log.error("load code conversation failed", exc_info=True)
+                emit({"type": "error", "message": "failed to load conversation"})
+                return
 
         if conversation_id is not None and not is_new:
             try:
-                self.db.update_code_conversation(
-                    conversation_id, {"rag_collection": self.mode}
-                )
-            except Exception as e:
-                _log.warning("mode patch failed: %s", e)
+                self.db.update_code_conversation(conversation_id, {"rag_collection": self.mode})
+            except Exception:
+                _log.warning("mode patch failed", exc_info=True)
+
+        if conversation_id is not None:
+            try:
+                self.db.update_code_conversation(conversation_id, {"status": "processing"})
+            except Exception:
+                _log.warning("status update to processing failed  conv=%s", conversation_id)
 
         _log.debug("turn start  conv=%s mode=%s model=%s org=%d", conversation_id, self.mode, self.model, self.org_id)
-        yield {"type": "meta", "mode": self.mode, "conversation_id": conversation_id}
+        emit({"type": "meta", "mode": self.mode, "conversation_id": conversation_id})
 
         files_block = _render_files_block(self.files)
         pieces: list[str] = []
@@ -236,9 +251,8 @@ class CodeAgent(ChatAgent):
                     n_results=10,
                     top_k=5,
                 )
-            except Exception as e:
+            except Exception:
                 _log.error("codebase RAG retrieve failed", exc_info=True)
-                codebase_context = ""
 
         storage_files = _files_to_storage(self.files)
         if conversation_id is not None:
@@ -253,7 +267,7 @@ class CodeAgent(ChatAgent):
                     files_json=storage_files or None,
                     response_style=style_key,
                 )
-            except Exception as e:
+            except Exception:
                 _log.error("user message persist failed", exc_info=True)
 
         payload: list[dict] = [
@@ -274,42 +288,72 @@ class CodeAgent(ChatAgent):
 
         _log.debug("model call   conv=%s messages=%d temp=%.1f max_tokens=%d", conversation_id, len(payload), temperature, max_tokens)
         start = time.time()
-        accumulated: list[str] = []
-        final_usage: dict = {}
-        final_model = self.model
-        errored = False
 
-        for event in self._call_model_streaming(payload, temperature, max_tokens):
-            etype = event.get("type")
-            if etype == "chunk":
-                accumulated.append(event["text"])
-                yield event
-            elif etype == "done":
-                final_usage = event.get("usage") or {}
-                final_model = event.get("model") or final_model
-                break
-            elif etype == "error":
-                errored = True
-                yield event
-                return
-
-        if errored:
+        try:
+            chunks, final_usage, final_model = self._call_model(payload, temperature, max_tokens, emit)
+        except Exception:
+            _log.error("model call failed  conv=%s", conversation_id, exc_info=True)
+            if conversation_id is not None:
+                try:
+                    self.db.update_code_conversation(conversation_id, {"status": "error"})
+                except Exception:
+                    pass
+            emit({"type": "error", "message": "model call failed"})
             return
 
         duration = round(time.time() - start, 2)
-        output = "".join(accumulated)
+        output = "".join(chunks)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s mode=%s model=%s in=%d out=%d %.1fs", conversation_id, self.mode, final_model, tokens_input, tokens_output, duration)
 
-        if self.mode == "plan":
-            fast_url, fast_model = self._tool_model_url()
-            if fast_url:
-                steps = _parse_plan_checklist(output, fast_url, fast_model)
-                if steps:
-                    yield {"type": "plan_checklist", "steps": steps}
+        if output and conversation_id is not None:
+            try:
+                self.db.add_code_message(
+                    conversation_id=conversation_id,
+                    org_id=self.org_id,
+                    role="assistant",
+                    content=output,
+                    model=str(final_model),
+                    tokens_input=tokens_input,
+                    tokens_output=tokens_output,
+                    mode=self.mode,
+                    response_style=style_key,
+                )
+                _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
+            except Exception:
+                _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
-        yield {
+            try:
+                remember(
+                    text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
+                    metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
+                    org_id=self.org_id,
+                    collection_name=f"code_{conversation_id}",
+                )
+            except Exception:
+                _log.error("memory write failed", exc_info=True)
+
+        checklist_steps = None
+        if self.mode == "plan" and output:
+            tool_url, tool_model = self._tool_model_url()
+            if tool_url:
+                checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
+                if checklist_steps:
+                    emit({"type": "plan_checklist", "steps": checklist_steps})
+                    if conversation_id is not None:
+                        try:
+                            self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
+                        except Exception:
+                            _log.error("checklist persist failed", exc_info=True)
+
+        if conversation_id is not None:
+            try:
+                self.db.update_code_conversation(conversation_id, {"status": "complete"})
+            except Exception:
+                _log.warning("status update to complete failed  conv=%s", conversation_id)
+
+        emit({
             "type": "done",
             "mode": self.mode,
             "conversation_id": conversation_id,
@@ -318,56 +362,29 @@ class CodeAgent(ChatAgent):
             "tokens_output": tokens_output,
             "duration_seconds": duration,
             "output": output,
-            "response_style": style_key,
-        }
+        })
 
-    def persist_from_events(self, events: list[dict]) -> None:
-        meta = next((e for e in events if e.get("type") == "meta"), None)
-        done = next((e for e in events if e.get("type") == "done"), None)
-        if not meta:
-            return
-        conversation_id = meta.get("conversation_id")
-        if not conversation_id:
-            return
-
-        output = "".join(e["text"] for e in events if e.get("type") == "chunk")
-        if not output:
-            return
-
-        model = (done or {}).get("model") or self.model
-        tokens_in = int((done or {}).get("tokens_input") or 0)
-        tokens_out = int((done or {}).get("tokens_output") or 0)
-        style_key = (done or {}).get("response_style")
-
-        try:
-            self.db.add_code_message(
-                conversation_id=conversation_id,
-                org_id=self.org_id,
-                role="assistant",
-                content=output,
-                model=str(model),
-                tokens_input=tokens_in,
-                tokens_output=tokens_out,
-                mode=self.mode,
-                response_style=style_key,
-            )
-            _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
-        except Exception:
-            _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
-
-        try:
-            remember(
-                text=f"USER ({self.mode}): ...\n\nASSISTANT: {output}",
-                metadata={"conversation_id": conversation_id, "model": str(model), "mode": self.mode, "turn_time": time.time()},
-                org_id=self.org_id,
-                collection_name=f"code_{conversation_id}",
-            )
-        except Exception:
-            _log.error("memory write failed", exc_info=True)
-
-        checklist = next((e for e in events if e.get("type") == "plan_checklist"), None)
-        if checklist and checklist.get("steps"):
-            try:
-                self.db.update_code_conversation(conversation_id, {"code_checklist": checklist["steps"]})
-            except Exception:
-                _log.error("checklist persist failed", exc_info=True)
+    def run_streaming(
+        self,
+        user_message: str,
+        conversation_id: int | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 8192,
+        title: str | None = None,
+        codebase_collection: str | None = None,
+        response_style: str | None = None,
+    ) -> Iterator[dict]:
+        """Sync wrapper for callers that need a generator."""
+        from workers.jobs import Job
+        job = Job(uuid.uuid4().hex)
+        self.run_job(
+            job,
+            user_message=user_message,
+            conversation_id=conversation_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            title=title,
+            codebase_collection=codebase_collection,
+            response_style=response_style,
+        )
+        yield from job.events

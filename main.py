@@ -76,7 +76,12 @@ def run_agent_stream(request: RunRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     job = STORE.create()
-    run_in_background(job, lambda: agent.run_streaming(request.task, request.product))
+
+    def worker(j):
+        for event in agent.run_streaming(request.task, request.product):
+            STORE.append(j, event)
+
+    run_in_background(job, worker)
     return {"job_id": job.id}
 
 
@@ -160,22 +165,19 @@ def chat(request: ChatRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     job = STORE.create()
-    run_in_background(
-        job,
-        lambda: agent.send_streaming(
-            user_message=request.message,
-            conversation_id=request.conversation_id,
-            system=request.system,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            rag_enabled=request.rag_enabled,
-            rag_collection=request.rag_collection,
-            knowledge_enabled=request.knowledge_enabled,
-            search_consent_declined=request.search_consent_declined,
-            response_style=request.response_style,
-        ),
-        on_complete=agent.persist_from_events,
-    )
+    run_in_background(job, lambda j: agent.run_job(
+        j,
+        user_message=request.message,
+        conversation_id=request.conversation_id,
+        system=request.system,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        rag_enabled=request.rag_enabled,
+        rag_collection=request.rag_collection,
+        knowledge_enabled=request.knowledge_enabled,
+        search_consent_declined=request.search_consent_declined,
+        response_style=request.response_style,
+    ))
     return {"job_id": job.id}
 
 
@@ -192,19 +194,16 @@ def code(request: CodeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     job = STORE.create()
-    run_in_background(
-        job,
-        lambda: agent.run_streaming(
-            user_message=request.message,
-            conversation_id=request.conversation_id,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            title=request.title,
-            codebase_collection=request.codebase_collection,
-            response_style=request.response_style,
-        ),
-        on_complete=agent.persist_from_events,
-    )
+    run_in_background(job, lambda j: agent.run_job(
+        j,
+        user_message=request.message,
+        conversation_id=request.conversation_id,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        title=request.title,
+        codebase_collection=request.codebase_collection,
+        response_style=request.response_style,
+    ))
     return {"job_id": job.id}
 
 
@@ -497,7 +496,7 @@ def scheduler_trigger():
 
 @app.get("/scheduler/status")
 def scheduler_status():
-    from workers.enrichment_agent import sources_due_count
+    from workers.enrichment_agent import sources_due_count, get_last_run
     sched = getattr(app.state, "scheduler", None)
     running = bool(sched and sched.running)
     next_run = None
@@ -508,7 +507,88 @@ def scheduler_status():
     return {
         "running": running,
         "next_run": next_run,
+        "last_run": get_last_run(),
         "sources_due": sources_due_count(),
+    }
+
+
+class EnrichmentAgentCreate(BaseModel):
+    org_id: int
+    name: str
+    description: str | None = None
+    category: str | None = None
+    token_budget: int = 50000
+    cron_expression: str | None = None
+    timezone: str = "Australia/Sydney"
+    active: bool = True
+
+
+class EnrichmentAgentUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    category: str | None = None
+    token_budget: int | None = None
+    cron_expression: str | None = None
+    timezone: str | None = None
+    active: bool | None = None
+
+
+@app.get("/enrichment/agents")
+def list_enrichment_agents(org_id: int | None = None):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        return {"agents": db.list_enrichment_agents(org_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/agents")
+def create_enrichment_agent(body: EnrichmentAgentCreate):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        agent = db.create_enrichment_agent(body.model_dump())
+        return agent
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/enrichment/agents/{agent_id}")
+def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate):
+    from workers.enrichment_agent import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        if not updates:
+            return db.get_enrichment_agent(agent_id)
+        return db.update_enrichment_agent(agent_id, updates)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/enrichment/agents/{agent_id}/trigger")
+def trigger_enrichment_agent(agent_id: int):
+    import threading
+    from workers.enrichment_agent import run_enrichment_cycle
+    threading.Thread(target=run_enrichment_cycle, args=[agent_id], daemon=True).start()
+    return {"status": "triggered", "agent_id": agent_id}
+
+
+@app.get("/enrichment/agents/{agent_id}/status")
+def enrichment_agent_status(agent_id: int):
+    from workers.enrichment_agent import sources_due_count, get_last_run
+    sched = getattr(app.state, "scheduler", None)
+    next_run = None
+    if sched:
+        job = sched.get_job(f"enrichment_agent_{agent_id}")
+        if job and job.next_run_time:
+            next_run = job.next_run_time.isoformat()
+    return {
+        "agent_id": agent_id,
+        "next_run": next_run,
+        "last_run": get_last_run(agent_id),
+        "sources_due": sources_due_count(agent_id),
     }
 
 

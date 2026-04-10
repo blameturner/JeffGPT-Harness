@@ -35,6 +35,8 @@ FAST_TIMEOUT = 60
 POLITE_DELAY_SECONDS = 2
 ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser] = {}
 
+_last_runs: dict[str | None, dict] = {}
+
 
 class EnrichmentDB:
 
@@ -105,11 +107,42 @@ class EnrichmentDB:
         )
         return bool(data.get("list"))
 
-    def list_due_sources(self, org_id: int) -> list[dict]:
+    def list_enrichment_agents(self, org_id: int | None = None) -> list[dict]:
+        if "enrichment_agents" not in self.tables:
+            return []
+        where = "(active,eq,1)"
+        if org_id is not None:
+            where = f"(org_id,eq,{org_id})~and(active,eq,1)"
+        return self._get("enrichment_agents", params={"where": where, "limit": 200}).get("list", [])
+
+    def get_enrichment_agent(self, agent_id: int) -> dict | None:
+        if "enrichment_agents" not in self.tables:
+            return None
+        try:
+            r = requests.get(
+                f"{self.base}/{self.tables['enrichment_agents']}/{agent_id}",
+                headers=self.headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    def create_enrichment_agent(self, data: dict) -> dict:
+        return self._post("enrichment_agents", data)
+
+    def update_enrichment_agent(self, agent_id: int, data: dict) -> dict:
+        return self._patch("enrichment_agents", agent_id, data)
+
+    def list_due_sources(self, org_id: int, enrichment_agent_id: int | None = None) -> list[dict]:
+        where = f"(org_id,eq,{org_id})~and(active,eq,1)"
+        if enrichment_agent_id is not None:
+            where += f"~and(enrichment_agent_id,eq,{enrichment_agent_id})"
         data = self._get(
             "scrape_targets",
             params={
-                "where": f"(org_id,eq,{org_id})~and(active,eq,1)",
+                "where": where,
                 "limit": 500,
             },
         )
@@ -609,22 +642,32 @@ def _proactive_search(
     return total_tokens
 
 
-def run_enrichment_cycle() -> None:
+def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
     cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    _log.info("cycle %s starting", cycle_id)
+    label = f"agent={enrichment_agent_id}" if enrichment_agent_id else "all"
+    _log.info("cycle %s starting (%s)", cycle_id, label)
     started = time.time()
     try:
         db = EnrichmentDB()
-    except Exception as e:
+    except Exception:
         _log.error("DB init failed", exc_info=True)
         return
+
+    agent_config: dict = {}
+    if enrichment_agent_id is not None:
+        agent_config = db.get_enrichment_agent(enrichment_agent_id) or {}
+        if not agent_config:
+            _log.error("enrichment agent %d not found", enrichment_agent_id)
+            return
+
+    token_budget = int(agent_config.get("token_budget") or ENRICHMENT_TOKEN_BUDGET)
 
     if db.has_running_inferences():
         _log.info("cycle %s deferred — active agent_runs", cycle_id)
         db.log_event(cycle_id, "deferred", message="active agent_runs")
         return
 
-    db.log_event(cycle_id, "cycle_start")
+    db.log_event(cycle_id, "cycle_start", message=label)
     tokens_used = 0
 
     try:
@@ -638,8 +681,10 @@ def run_enrichment_cycle() -> None:
 
     for org in orgs:
         org_id = int(org.get("Id") or org.get("id") or 1)
+        if enrichment_agent_id and agent_config.get("org_id") and int(agent_config["org_id"]) != org_id:
+            continue
         try:
-            sources = db.list_due_sources(org_id)
+            sources = db.list_due_sources(org_id, enrichment_agent_id=enrichment_agent_id)
         except Exception as e:
             db.log_event(
                 cycle_id, "sources_query_failed",
@@ -655,7 +700,7 @@ def run_enrichment_cycle() -> None:
             )
 
         for source in sources:
-            remaining = ENRICHMENT_TOKEN_BUDGET - tokens_used
+            remaining = token_budget - tokens_used
             if remaining <= 0:
                 db.log_event(cycle_id, "budget_exhausted", org_id=org_id)
                 break
@@ -670,20 +715,27 @@ def run_enrichment_cycle() -> None:
                 )
             time.sleep(POLITE_DELAY_SECONDS)
 
-        remaining = ENRICHMENT_TOKEN_BUDGET - tokens_used
+        remaining = token_budget - tokens_used
         if remaining > PROACTIVE_BUDGET_THRESHOLD:
             try:
                 tokens_used += _proactive_search(org_id, cycle_id, db, remaining)
-            except Exception as e:
+            except Exception:
                 _log.error("proactive_search failed", exc_info=True)
 
     elapsed = round(time.time() - started, 1)
-    _log.info("cycle %s done  tokens=%d %.1fs", cycle_id, tokens_used, elapsed)
+    _log.info("cycle %s done  tokens=%d %.1fs (%s)", cycle_id, tokens_used, elapsed, label)
     db.log_event(
         cycle_id, "cycle_end",
         tokens_used=tokens_used,
         duration_seconds=elapsed,
     )
+
+    _last_runs[enrichment_agent_id] = {
+        "cycle_id": cycle_id,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "tokens_used": tokens_used,
+        "duration_seconds": elapsed,
+    }
 
 
 def run_log_cleanup() -> None:
@@ -695,13 +747,17 @@ def run_log_cleanup() -> None:
         _log.error("log cleanup failed", exc_info=True)
 
 
-def sources_due_count() -> int:
+def get_last_run(enrichment_agent_id: int | None = None) -> dict | None:
+    return _last_runs.get(enrichment_agent_id)
+
+
+def sources_due_count(enrichment_agent_id: int | None = None) -> int:
     try:
         db = EnrichmentDB()
         total = 0
         for org in db.list_orgs():
             org_id = int(org.get("Id") or org.get("id") or 1)
-            total += len(db.list_due_sources(org_id))
+            total += len(db.list_due_sources(org_id, enrichment_agent_id=enrichment_agent_id))
         return total
     except Exception:
         return 0
