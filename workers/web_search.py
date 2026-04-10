@@ -494,51 +494,94 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
             break
     raw_results = _dedupe(raw_results)[:max_candidates]
 
-    summaries: list[tuple[str, str, str]] = []
+    results: list[dict] = []
     scrape_failures = 0
     for r in raw_results:
-        if len(summaries) >= MAX_SOURCES:
+        if len(results) >= MAX_SOURCES:
             break
         text = scrape_page(r["url"], snippet=r.get("snippet", ""))
         if not text:
             scrape_failures += 1
             continue
-        summary = summarise_page(text, query)
-        if not summary:
+        assessed = summarise_page(text, query)
+        if not assessed:
             continue
-        summaries.append((r["title"] or r["url"], r["url"], summary))
+        entry = {
+            "title": r["title"] or r["url"],
+            "url": r["url"],
+            "summary": assessed["summary"],
+            "relevance": assessed.get("relevance", "unknown"),
+            "source_type": assessed.get("source_type", "unknown"),
+        }
+        results.append(entry)
 
         try:
             remember(
-                text=f"{r['title']}\n\n{summary}",
+                text=f"{entry['title']}\n\n{entry['summary']}",
                 metadata={
                     "url": r["url"],
                     "title": r["title"],
                     "query": query,
+                    "relevance": entry["relevance"],
+                    "source_type": entry["source_type"],
                     "fetched_at": time.time(),
                 },
                 org_id=org_id,
                 collection_name="web_search",
             )
-        except Exception as e:
+        except Exception:
             _log.error("chroma write failed for %s", r["url"], exc_info=True)
 
-    if summaries:
+    if results:
+        high = [r for r in results if r["relevance"] == "high"]
+        medium = [r for r in results if r["relevance"] == "medium"]
+        low = [r for r in results if r["relevance"] not in ("high", "medium")]
+
+        if high:
+            confidence = "high"
+            confidence_note = f"{len(high)} highly relevant source(s) found."
+        elif medium:
+            confidence = "medium"
+            confidence_note = f"No directly relevant sources, but {len(medium)} related source(s) found."
+        else:
+            confidence = "low"
+            confidence_note = "Only tangentially related sources found."
+
+        sorted_results = high + medium + low
+
+        source_types = sorted({e["source_type"] for e in results if e["source_type"] != "unknown"})
+        type_note = f" Source types: {', '.join(source_types)}." if source_types else ""
+
         context_parts = [
-            "The following web search results were retrieved for the user's question. "
-            "Cite them inline where relevant.\n"
+            f"WEB SEARCH RESULTS — confidence: {confidence}. {confidence_note}{type_note}\n"
+            "In your answer:\n"
+            "- Cite sources inline by number [1], [2], etc.\n"
+            "- Prioritise high-relevance sources from authoritative source types "
+            "(official_docs, research_paper, government) over blog posts or forums.\n"
+            "- Briefly explain to the user WHY you trust certain sources more — "
+            "e.g. 'According to the official documentation [1]...' or "
+            "'A blog post [3] suggests X, though this is less authoritative.'\n"
+            "- If overall confidence is medium or low, tell the user explicitly "
+            "and explain what's missing or uncertain.\n"
+            "- For research or exploratory questions where the results leave gaps, "
+            "suggest specific follow-up topics or source types worth investigating. "
+            "Do NOT suggest follow-ups for simple factual lookups.\n"
         ]
-        for i, (title, url, summary) in enumerate(summaries, start=1):
-            context_parts.append(f"[{i}] {title} ({url})\n{summary}\n")
+        for i, entry in enumerate(sorted_results, start=1):
+            rel_tag = f"[relevance: {entry['relevance']}, type: {entry['source_type']}]"
+            context_parts.append(
+                f"[{i}] {entry['title']} ({entry['url']}) {rel_tag}\n{entry['summary']}\n"
+            )
         context_block = "\n".join(context_parts)
-        sources = [f"{title}: {url}" for title, url, _ in summaries]
+        sources = [f"{e['title']}: {e['url']}" for e in sorted_results]
     elif raw_results:
         _log.warning("scraping failed on all %d candidates, returning raw SearxNG results", len(raw_results))
         context_parts = [
-            "Web search found the following results but full page content could not be retrieved. "
+            "WEB SEARCH RESULTS — confidence: low. "
+            "Search found results but full page content could not be retrieved. "
             "Use the titles, URLs, and snippets below to inform your answer. "
             "Cite the URLs so the user can visit them directly. "
-            "Note that you could not verify the full page content.\n"
+            "Caveat that you could not verify the full page content.\n"
         ]
         for i, r in enumerate(raw_results[:MAX_SOURCES], start=1):
             title = r.get("title") or r["url"]
@@ -550,13 +593,14 @@ def run_web_search(query: str, org_id: int) -> tuple[str, list[str]]:
         _log.warning("search returned no results for query=%s", query[:100])
         return "", []
 
-    _log.info("search done   queries=%d candidates=%d summaries=%d scrape_failures=%d",
-              len(queries), len(raw_results), len(summaries), scrape_failures)
+    _log.info("search done   queries=%d candidates=%d results=%d scrape_failures=%d",
+              len(queries), len(raw_results), len(results), scrape_failures)
 
-    if summaries:
+    if results:
+        summaries_for_suggest = [(e["title"], e["url"], e["summary"]) for e in results]
         threading.Thread(
             target=_suggest_sources_from_search,
-            args=(summaries, query, org_id),
+            args=(summaries_for_suggest, query, org_id),
             daemon=True,
         ).start()
 
