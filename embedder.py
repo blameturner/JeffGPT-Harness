@@ -6,9 +6,16 @@ from config import EMBEDDER_URL
 
 _log = logging.getLogger("embedder")
 
+EMBED_MAX_WORDS = 180
+
+
 def embed(text: str) -> list[float]:
-    text_len = len(text.split())
-    _log.debug("embed  words=%d url=%s", text_len, EMBEDDER_URL)
+    words = text.split()
+    text_len = len(words)
+    if text_len > EMBED_MAX_WORDS:
+        text = " ".join(words[:EMBED_MAX_WORDS])
+        _log.debug("embed  truncated %d -> %d words", text_len, EMBED_MAX_WORDS)
+    _log.debug("embed  words=%d url=%s", min(text_len, EMBED_MAX_WORDS), EMBEDDER_URL)
     started = time.time()
     try:
         response = requests.post(
