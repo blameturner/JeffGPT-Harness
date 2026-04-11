@@ -111,6 +111,11 @@ class ChatRequest(BaseModel):
 class ConversationUpdate(BaseModel):
     title: str | None = None
     code_checklist: list | None = None
+    # §7 — per-conversation opt-out for contextual enrichment. Default
+    # behaviour is opt-in (True); the frontend properties screen exposes
+    # a toggle. When False, messages classified as contextual_enrichment
+    # are downgraded to chitchat in chat_agent and no search fires.
+    contextual_grounding_enabled: bool | None = None
 
 
 class CodeRequest(BaseModel):
@@ -490,6 +495,8 @@ def update_conversation(conversation_id: int, body: ConversationUpdate):
         updates: dict = {}
         if body.title is not None:
             updates["title"] = body.title.strip() or "Untitled"
+        if body.contextual_grounding_enabled is not None:
+            updates["contextual_grounding_enabled"] = bool(body.contextual_grounding_enabled)
         if not updates:
             return convo
         return db.update_conversation(conversation_id, updates)

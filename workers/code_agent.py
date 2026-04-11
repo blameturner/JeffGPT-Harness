@@ -10,6 +10,8 @@ from typing import Iterator, Literal
 
 import requests
 
+from config import BASE_SYSTEM_PROMPT
+from workers.web_search import build_temporal_context
 from memory import remember
 from rag import retrieve
 from workers.chat_agent import ChatAgent
@@ -276,7 +278,9 @@ class CodeAgent(ChatAgent):
                 _log.error("user message persist failed", exc_info=True)
 
         payload: list[dict] = [
-            {"role": "system", "content": style_prompt},
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            # Current date/time injection — see workers.web_search.build_temporal_context
+            {"role": "system", "content": build_temporal_context()},
             {"role": "system", "content": system_prompt},
         ]
         if codebase_context:
@@ -288,6 +292,10 @@ class CodeAgent(ChatAgent):
                     "guessing.\n\n" + codebase_context
                 ),
             })
+        # style last: closest to history without breaking turn alternation.
+        # If the model's template supports interleaved system messages, move
+        # this append to immediately before the user turn instead.
+        payload.append({"role": "system", "content": style_prompt})
         payload.extend(history)
         payload.append({"role": "user", "content": composed_message})
 

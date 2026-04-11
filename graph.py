@@ -37,6 +37,43 @@ def write_relationship(
         _log.error("write failed  (%s)-[%s]->(%s)  graph=%s", from_name, relationship, to_name, graph_name, exc_info=True)
         raise
 
+def get_sparse_concepts(org_id: int, limit: int = 10, max_degree: int = 3) -> list[str]:
+    """Return concept names with graph degree < ``max_degree``, starved-first.
+
+    "Sparse" here means the graph has fewer than ``max_degree`` edges
+    attached to the concept — a signal that we should preferentially crawl
+    pages likely to cover that topic.
+
+    Used by :func:`workers.crawler.select_crawl_paths` to bias link
+    ranking toward coverage gaps (§5 of the crawler refactor plan), and
+    by :func:`workers.enrichment_agent._proactive_search` to pick which
+    concepts to search the open web for.
+
+    Returns an empty list if the graph is missing or the query fails —
+    caller should treat sparse-concept hints as best-effort.
+    """
+    if limit <= 0:
+        return []
+    try:
+        graph = get_graph(org_id)
+        result = graph.query(
+            "MATCH (n:Concept) "
+            "OPTIONAL MATCH (n)-[r]-() "
+            "WITH n, count(r) AS deg "
+            "WHERE deg < $max_degree "
+            "RETURN n.name, deg "
+            "ORDER BY deg ASC "
+            "LIMIT $limit",
+            {"max_degree": int(max_degree), "limit": int(limit)},
+        )
+    except Exception:
+        _log.debug("get_sparse_concepts failed org=%s", org_id, exc_info=True)
+        return []
+    concepts = [row[0] for row in result.result_set if row and row[0]]
+    _log.debug("get_sparse_concepts  org=%s found=%d", org_id, len(concepts))
+    return concepts
+
+
 def get_connections(org_id: int, node_name: str) -> list[dict]:
     graph_name = scoped_graph(org_id)
     graph = get_graph(org_id)
