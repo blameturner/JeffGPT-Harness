@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.schemas import ConversationUpdate
 from nocodb_client import NocodbClient
 from workers.code_agent import CodeAgent
 from workers.jobs import STORE, run_in_background
@@ -26,12 +27,6 @@ class CodeRequest(BaseModel):
     knowledge_enabled: bool | None = None
     temperature: float = 0.2
     max_tokens: int = 8192
-
-
-class ConversationUpdate(BaseModel):
-    title: str | None = None
-    code_checklist: list | None = None
-    contextual_grounding_enabled: bool | None = None
 
 
 class CodebaseCreate(BaseModel):

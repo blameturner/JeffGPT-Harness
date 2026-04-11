@@ -4,7 +4,7 @@ import logging
 
 import requests
 
-from workers.web_search import _tool_model
+from workers.search.models import _tool_model
 
 _log = logging.getLogger("chat.history")
 

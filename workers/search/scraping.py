@@ -296,7 +296,7 @@ def scrape_page(
             target_id = source.get("Id")
             if target_id:
                 try:
-                    from workers.enrichment_agent import EnrichmentDB
+                    from workers.enrichment.db import EnrichmentDB
                     EnrichmentDB().update_scrape_target(target_id, use_playwright=True)
                     _log.info("auto-promoted to playwright_direct id=%s", target_id)
                 except Exception as e:

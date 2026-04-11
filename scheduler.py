@@ -12,7 +12,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
-from workers.enrichment_agent import run_enrichment_cycle, run_log_cleanup, EnrichmentDB
+from workers.enrichment.cycle import run_enrichment_cycle, run_log_cleanup
+from workers.enrichment.db import EnrichmentDB
 
 _scheduler: BackgroundScheduler | None = None
 AGENT_JOB_PREFIX = "agent_schedule_"

@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.schemas import ConversationUpdate
 from nocodb_client import NocodbClient
 from workers.chat_agent import ChatAgent
 from workers.jobs import STORE, run_in_background
@@ -26,13 +27,6 @@ class ChatRequest(BaseModel):
     search_enabled: bool = False
     search_consent_declined: bool = False
     response_style: str | None = None
-
-
-class ConversationUpdate(BaseModel):
-    title: str | None = None
-    code_checklist: list | None = None
-    # §7 per-conversation opt-out for contextual enrichment; when False chat_agent downgrades contextual_enrichment messages to chitchat
-    contextual_grounding_enabled: bool | None = None
 
 
 def _distinct_nonempty(rows: list[dict], field: str) -> list[str]:

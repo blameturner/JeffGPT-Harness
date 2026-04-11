@@ -101,12 +101,12 @@ def _extract_one_page(
     if not page_text or not page_text.strip():
         return None
 
-    # Deferred import — enrichment_agent pulls in FalkorDB/NocoDB/crawler.
+    # deferred: workers.enrichment pulls FalkorDB/NocoDB/crawler at import time
     try:
-        from workers.enrichment_agent import (
-            _fast_call,
-            _heuristic_quality_gate,
+        from workers.enrichment.models import _fast_call
+        from workers.enrichment.quality import (
             _classify_content_type,
+            _heuristic_quality_gate,
         )
     except Exception as e:
         _log.warning("extraction helpers import failed: %s", e)
@@ -182,7 +182,7 @@ def _extract_one_page(
 
 def _background_graph_write(text: str, org_id: int, url: str) -> None:
     try:
-        from workers.enrichment_agent import _extract_relationships
+        from workers.enrichment.relationships import _extract_relationships
     except Exception as e:
         _log.debug("graph write skipped  import failed: %s", e)
         return

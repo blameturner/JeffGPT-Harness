@@ -6,7 +6,7 @@ import time
 import httpx
 
 from config import MODELS, REASONER_ROLE
-from workers.web_search import _fast_model, _tool_model
+from workers.search.models import _fast_model, _tool_model
 
 _log = logging.getLogger("enrichment_agent.models")
 

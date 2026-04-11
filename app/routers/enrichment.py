@@ -65,7 +65,7 @@ class BulkSuggestionAction(BaseModel):
 
 @router.get("/enrichment/agents")
 def list_enrichment_agents(org_id: int | None = None):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return {"agents": db.list_enrichment_agents(org_id)}
@@ -75,7 +75,7 @@ def list_enrichment_agents(org_id: int | None = None):
 
 @router.post("/enrichment/agents")
 def create_enrichment_agent(body: EnrichmentAgentCreate):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         agent = db.create_enrichment_agent(body.model_dump())
@@ -86,7 +86,7 @@ def create_enrichment_agent(body: EnrichmentAgentCreate):
 
 @router.patch("/enrichment/agents/{agent_id}")
 def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -100,14 +100,14 @@ def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate):
 @router.post("/enrichment/agents/{agent_id}/trigger")
 def trigger_enrichment_agent(agent_id: int):
     import threading
-    from workers.enrichment_agent import run_enrichment_cycle
+    from workers.enrichment.cycle import run_enrichment_cycle
     threading.Thread(target=run_enrichment_cycle, args=[agent_id], daemon=True).start()
     return {"status": "triggered", "agent_id": agent_id}
 
 
 @router.get("/enrichment/agents/{agent_id}/status")
 def enrichment_agent_status(agent_id: int, request: Request):
-    from workers.enrichment_agent import sources_due_count, get_last_run
+    from workers.enrichment.cycle import get_last_run, sources_due_count
     sched = getattr(request.app.state, "scheduler", None)
     next_run = None
     if sched:
@@ -124,7 +124,7 @@ def enrichment_agent_status(agent_id: int, request: Request):
 
 @router.get("/enrichment/sources")
 def list_sources(org_id: int, agent_id: int | None = None, active_only: bool = False):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return {"sources": db.list_sources(org_id, enrichment_agent_id=agent_id, active_only=active_only)}
@@ -134,7 +134,7 @@ def list_sources(org_id: int, agent_id: int | None = None, active_only: bool = F
 
 @router.post("/enrichment/sources")
 def create_source(body: SourceCreate):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return db.create_source(body.model_dump())
@@ -144,7 +144,7 @@ def create_source(body: SourceCreate):
 
 @router.get("/enrichment/sources/{source_id}")
 def get_source(source_id: int):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         source = db.get_source(source_id)
@@ -159,7 +159,7 @@ def get_source(source_id: int):
 
 @router.patch("/enrichment/sources/{source_id}")
 def update_source(source_id: int, body: SourceUpdate):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -173,7 +173,7 @@ def update_source(source_id: int, body: SourceUpdate):
 
 @router.delete("/enrichment/sources/{source_id}")
 def delete_source(source_id: int):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         db.delete_source(source_id)
@@ -184,7 +184,7 @@ def delete_source(source_id: int):
 
 @router.post("/enrichment/sources/{source_id}/flush")
 def flush_source(source_id: int):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return db.flush_source(source_id)
@@ -194,7 +194,7 @@ def flush_source(source_id: int):
 
 @router.get("/enrichment/sources/{source_id}/log")
 def source_log(source_id: int, limit: int = 50):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return {"log": db.list_log(scrape_target_id=source_id, limit=limit)}
@@ -204,7 +204,7 @@ def source_log(source_id: int, limit: int = 50):
 
 @router.get("/enrichment/log")
 def enrichment_log(org_id: int | None = None, limit: int = 100):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return {"log": db.list_log(org_id=org_id, limit=limit)}
@@ -214,7 +214,7 @@ def enrichment_log(org_id: int | None = None, limit: int = 100):
 
 @router.get("/enrichment/suggestions")
 def list_suggestions(org_id: int, status: str | None = None):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return {"suggestions": db.list_suggestions(org_id, status=status)}
@@ -224,7 +224,7 @@ def list_suggestions(org_id: int, status: str | None = None):
 
 @router.get("/enrichment/suggestions/{suggestion_id}")
 def get_suggestion(suggestion_id: int):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         suggestion = db.get_suggestion(suggestion_id)
@@ -239,7 +239,7 @@ def get_suggestion(suggestion_id: int):
 
 @router.patch("/enrichment/suggestions/{suggestion_id}")
 def update_suggestion(suggestion_id: int, body: SuggestionUpdate):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -252,7 +252,7 @@ def update_suggestion(suggestion_id: int, body: SuggestionUpdate):
 
 @router.post("/enrichment/suggestions/{suggestion_id}/approve")
 def approve_suggestion(suggestion_id: int, body: SuggestionApprove | None = None):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         suggestion = db.get_suggestion(suggestion_id)
@@ -272,7 +272,7 @@ def approve_suggestion(suggestion_id: int, body: SuggestionApprove | None = None
 
 @router.post("/enrichment/suggestions/{suggestion_id}/reject")
 def reject_suggestion(suggestion_id: int):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     try:
         db = EnrichmentDB()
         return db.update_suggestion(suggestion_id, {"status": "rejected"})
@@ -282,7 +282,7 @@ def reject_suggestion(suggestion_id: int):
 
 @router.post("/enrichment/suggestions/approve-by-parent")
 def approve_suggestions_by_parent(body: BulkSuggestionAction):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     from config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
     try:
         db = EnrichmentDB()
@@ -307,7 +307,7 @@ def approve_suggestions_by_parent(body: BulkSuggestionAction):
 
 @router.post("/enrichment/suggestions/reject-by-parent")
 def reject_suggestions_by_parent(body: BulkSuggestionAction):
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
     from config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
     try:
         db = EnrichmentDB()

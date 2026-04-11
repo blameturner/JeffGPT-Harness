@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 from config import MODEL_PARALLEL_SLOTS
 
 if TYPE_CHECKING:
-    from workers.enrichment_agent import EnrichmentDB
+    from workers.enrichment.db import EnrichmentDB
 
 _log = logging.getLogger("crawler")
 
@@ -98,9 +98,8 @@ def check_robots(url: str) -> bool:
 
 def extract_internal_links(url: str, source: dict | None = None) -> list[str]:
     # Deferred import to avoid a module-load-time dependency on web_search.
-    from workers.web_search import (
-        BROWSER_HEADERS, SCRAPE_TIMEOUT, _is_safe_url, _is_blocklisted,
-    )
+    from workers.search.engine import SCRAPE_TIMEOUT
+    from workers.search.urls import BROWSER_HEADERS, _is_blocklisted, _is_safe_url
     parsed_base = urlparse(url)
     base_domain = parsed_base.netloc.lower()
 

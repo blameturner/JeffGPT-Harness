@@ -5,13 +5,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from workers.web_search import (
-    run_web_search,
-    classify_message_intent,
+from workers.search.intent import (
     CHAT_INTENT_CHITCHAT,
     CHAT_INTENT_CONTEXTUAL,
     SEARCH_POLICY_NONE,
+    classify_message_intent,
 )
+from workers.search.orchestrator import run_web_search
 
 _log = logging.getLogger("chat.search_phase")
 
@@ -61,12 +61,8 @@ def run_search_phase(
             result.intent_dict = None
         span("intent_classify_ms", _t_classifier)
 
-        # contextual_grounding_enabled defaults to True when column is absent
-        grounding_ok = _truthy(
-            convo.get("contextual_grounding_enabled", True)
-            if convo.get("contextual_grounding_enabled") is not None
-            else True
-        )
+        _grounding = convo.get("contextual_grounding_enabled")
+        grounding_ok = _truthy(_grounding if _grounding is not None else True)
         if (
             result.intent_dict
             and result.intent_dict.get("intent") == CHAT_INTENT_CONTEXTUAL

@@ -199,7 +199,7 @@ MAX_SUMMARY_INPUT_CHARS = 6000  # tool model has 8k context
 PROACTIVE_BUDGET_THRESHOLD = 5000
 
 # Reasoner role is reserved for interactive chat; the enrichment/crawl pipeline
-# must never resolve to it — see workers.web_search._resolve_safe_model.
+# must never resolve to it — see workers.search.models._resolve_safe_model.
 REASONER_ROLE = "reasoner"
 
 # Bounds concurrent in-flight model calls to match llama.cpp's --parallel N.

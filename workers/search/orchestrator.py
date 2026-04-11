@@ -111,11 +111,9 @@ def _run_search_inner(
 
     to_scrape = kept[: budget["max_scrape"]]
     scraped_pages: list[dict] = []
-    scrape_failures = 0
     for r in to_scrape:
         text = scrape_page(r["url"], snippet=r.get("snippet", ""))
         if not text:
-            scrape_failures += 1
             continue
         scraped_pages.append({"result": r, "text": text})
 
@@ -346,9 +344,9 @@ def _suggest_sources_from_search(
     if not isinstance(items, list) or not items:
         return
 
-    # Lazy import: enrichment_agent imports from web_search.
+    # deferred to keep workers.enrichment off the search-package import graph
     try:
-        from workers.enrichment_agent import EnrichmentDB
+        from workers.enrichment.db import EnrichmentDB
         db = EnrichmentDB()
     except Exception:
         _log.debug("could not init EnrichmentDB for search suggestions")

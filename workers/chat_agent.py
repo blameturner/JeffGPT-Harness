@@ -10,7 +10,7 @@ import requests
 from config import MODELS, get_model_url, refresh_models
 from nocodb_client import NocodbClient
 from memory import remember
-from workers.web_search import _tool_model
+from workers.search.models import _tool_model
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise
 from workers.chat.graph import extract_and_write_graph

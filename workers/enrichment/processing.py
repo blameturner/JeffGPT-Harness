@@ -15,7 +15,7 @@ from workers.enrichment.quality import _content_hash, _validate_content
 from workers.enrichment.relationships import _extract_relationships
 from workers.enrichment.sources import _discover_sources
 from workers.enrichment.summarise import _summarise
-from workers.web_search import scrape_page
+from workers.search.scraping import scrape_page
 
 _log = logging.getLogger("enrichment_agent.processing")
 

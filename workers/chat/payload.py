@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from config import BASE_SYSTEM_PROMPT
-from workers.web_search import build_temporal_context
+from workers.search.temporal import build_temporal_context
 
 _log = logging.getLogger("chat.payload")
 

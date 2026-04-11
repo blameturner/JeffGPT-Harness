@@ -196,7 +196,7 @@ def stats_usage(org_id: int, period: str = "30d"):
         "suggestions_generated": 0, "suggestions_approved": 0,
     }
     try:
-        from workers.enrichment_agent import EnrichmentDB
+        from workers.enrichment.db import EnrichmentDB
         edb = EnrichmentDB()
         logs = edb.list_log(org_id=org_id, limit=5000)
         enrichment_stats["total_cycles"] = sum(1 for l in logs if l.get("event_type") == "cycle_start")

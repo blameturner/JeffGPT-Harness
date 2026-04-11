@@ -99,14 +99,14 @@ def scheduler_reload():
 @router.post("/scheduler/trigger")
 def scheduler_trigger():
     import threading
-    from workers.enrichment_agent import run_enrichment_cycle
+    from workers.enrichment.cycle import run_enrichment_cycle
     threading.Thread(target=run_enrichment_cycle, daemon=True).start()
     return {"status": "triggered"}
 
 
 @router.get("/scheduler/status")
 def scheduler_status(request: Request):
-    from workers.enrichment_agent import sources_due_count, get_last_run
+    from workers.enrichment.cycle import get_last_run, sources_due_count
     sched = getattr(request.app.state, "scheduler", None)
     running = bool(sched and sched.running)
     next_run = None

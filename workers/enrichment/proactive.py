@@ -10,7 +10,7 @@ from workers.enrichment.db import EnrichmentDB
 from workers.enrichment.models import _tool_call
 from workers.enrichment.sources import _verify_url_reachable
 from workers.enrichment.summarise import _salvage_json_array
-from workers.web_search import searxng_search
+from workers.search.engine import searxng_search
 
 _log = logging.getLogger("enrichment_agent.proactive")
 
