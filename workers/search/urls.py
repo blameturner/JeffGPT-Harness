@@ -19,6 +19,7 @@ SCRAPE_BLOCKLIST = {
     "nytimes.com",
     "wsj.com",
     "ft.com",
+    "goodreads.com",
 }
 
 
@@ -37,17 +38,65 @@ BROWSER_HEADERS = {
 }
 
 _INJECTION_PATTERNS = [
-    re.compile(r"<\s*/?\s*(?:system|assistant|user|s|\|im_start\||\|im_end\|)[^>]*>", re.I),
-    re.compile(r"ignore (?:all )?(?:previous|prior|above|earlier) (?:instructions|messages|context|prompts?)", re.I),
-    re.compile(r"disregard (?:all )?(?:prior|previous|above|earlier) (?:instructions|messages|context|prompts?)", re.I),
-    re.compile(r"(?:you are|act as|pretend (?:you are|to be)|roleplay as|behave as) (?:a |an )?[a-z ]{3,30}", re.I),
-    re.compile(r"new (?:instructions?|rules?|persona|role):", re.I),
-    re.compile(r"(?:system|admin|root|developer) (?:prompt|message|override|mode):", re.I),
-    re.compile(r"(?:forget|override|bypass|skip) (?:all |your )?(?:previous |prior )?(?:instructions|rules|guidelines|safety)", re.I),
+    # chat template tags
+    re.compile(r"<\s*/?\s*(?:system|assistant|user|\|im_start\||\|im_end\|)[^>]*>", re.I),
+    # llama2 instruction markers
     re.compile(r"\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>", re.I),
-    re.compile(r"human:|assistant:|###\s*(?:system|instruction|human|assistant)", re.I),
-    re.compile(r"(?:do not|don'?t) (?:follow|obey|listen to) (?:your |the )?(?:previous|original|system)", re.I),
-    re.compile(r"(?:reveal|show|print|output|repeat) (?:your |the )?(?:system ?prompt|instructions|rules)", re.I),
+    # markdown-heading role prefix (e.g. '### Human:' / '### System:')
+    re.compile(r"(?:^|\n)\s*#{2,}\s*(?:system|instruction|human|user|assistant|ai)\s*[:.]", re.I),
+    # fake-conversation injection — Human: … Assistant: on separate lines
+    re.compile(
+        r"(?:^|\n)\s*(?:human|user)\s*:\s.{0,2000}?(?:^|\n)\s*(?:assistant|ai|gpt|chatbot)\s*:\s?",
+        re.I | re.DOTALL | re.MULTILINE,
+    ),
+    # "ignore/disregard [all] previous/above/prior instructions"
+    re.compile(
+        r"\b(?:ignore|disregard|forget|erase) (?:all |the |your )?(?:previous|prior|above|earlier|original|preceding) "
+        r"(?:instructions?|messages?|context|prompts?|rules?|system)",
+        re.I,
+    ),
+    # "new instructions:" / "new rules:" — requires explicit colon
+    re.compile(r"\bnew (?:instructions?|rules?|persona|role|system prompt)\s*:", re.I),
+    # "system prompt:" / "admin override:" / "developer mode:"
+    re.compile(
+        r"\b(?:system|admin|root|developer) (?:prompt|message|override|mode|instructions?|directives?)\s*:",
+        re.I,
+    ),
+    # "override/bypass/disable your previous/safety instructions"
+    re.compile(
+        r"\b(?:override|bypass|skip|disable|turn off|switch off) "
+        r"(?:all |your |the )?(?:previous |prior |safety |content )?"
+        r"(?:instructions?|rules?|guidelines?|filters?|safety|restrictions?)",
+        re.I,
+    ),
+    # "don't follow your previous/system instructions"
+    re.compile(
+        r"\b(?:do not|don'?t|stop) (?:follow|obey|listen to|respect) "
+        r"(?:your |the )?(?:previous|original|system|prior) "
+        r"(?:instructions?|prompt|rules?|guidelines?)",
+        re.I,
+    ),
+    # "reveal/show your system prompt/instructions"
+    re.compile(
+        r"\b(?:reveal|show|print|output|repeat|leak|disclose) "
+        r"(?:your |the )?(?:system ?prompt|system instructions?|hidden prompt|initial instructions?)",
+        re.I,
+    ),
+    # persona injection — requires temporal setup + role switch (tight)
+    re.compile(
+        r"\b(?:from now on|henceforth|going forward|starting now|"
+        r"from this (?:point|moment)|in this (?:conversation|chat|session|task))"
+        r"[\s,]*"
+        r"(?:you (?:are|will be|will now|must now|shall|have become)|"
+        r"act as|pretend (?:you are|to be)|roleplay as|become)",
+        re.I,
+    ),
+    # common jailbreak persona names
+    re.compile(
+        r"\b(?:jailbreak|dan mode|developer mode|god mode|admin mode|"
+        r"unrestricted mode|sudo mode|do anything now)\b",
+        re.I,
+    ),
 ]
 
 

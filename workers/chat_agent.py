@@ -253,10 +253,14 @@ class ChatAgent:
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
+        _log.info("post-model begin  conv=%s output_chars=%d tokens_in=%d tokens_out=%d", conversation_id, len(output), tokens_input, tokens_output)
+
+        persist_ok = False
         if output:
             if not _user_msg_written.wait(timeout=10.0):
                 _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
-            persist_assistant_message(
+            _log.info("persist begin  conv=%s", conversation_id)
+            persist_ok = persist_assistant_message(
                 db=self.db,
                 conversation_id=conversation_id,
                 org_id=self.org_id,
@@ -271,8 +275,15 @@ class ChatAgent:
                 search_context=search_context,
                 intent_dict=intent_dict,
             )
+            _log.info("persist done  conv=%s ok=%s", conversation_id, persist_ok)
+            if not persist_ok:
+                emit({
+                    "type": "error",
+                    "message": "assistant message persist failed — check harness logs for NocoDB error body",
+                })
 
         if convo_rag_enabled and output:
+            _log.info("memory rag begin  conv=%s", conversation_id)
             try:
                 remember(
                     text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -282,8 +293,10 @@ class ChatAgent:
                 )
             except Exception:
                 _log.error("memory write failed", exc_info=True)
+            _log.info("memory rag done  conv=%s", conversation_id)
 
         if convo_knowledge and output:
+            _log.info("memory knowledge begin  conv=%s", conversation_id)
             try:
                 remember(
                     text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -293,13 +306,22 @@ class ChatAgent:
                 )
             except Exception:
                 _log.error("chat_knowledge write failed", exc_info=True)
-            extract_and_write_graph(user_message, output, conversation_id, self.org_id)
+            _log.info("memory knowledge done  conv=%s", conversation_id)
+            _log.info("graph begin  conv=%s", conversation_id)
+            try:
+                extract_and_write_graph(user_message, output, conversation_id, self.org_id)
+            except Exception:
+                _log.error("graph extraction wrapper raised  conv=%s", conversation_id, exc_info=True)
+            _log.info("graph done  conv=%s", conversation_id)
 
+        _log.info("status complete begin  conv=%s", conversation_id)
         try:
             self.db.update_conversation(conversation_id, {"status": "complete"})
         except Exception:
             _log.warning("status update to complete failed  conv=%s", conversation_id)
+        _log.info("status complete done  conv=%s", conversation_id)
 
+        _log.info("emit done  conv=%s", conversation_id)
         emit({
             "type": "done",
             "conversation_id": conversation_id,

@@ -52,7 +52,10 @@ class NocodbClient:
             timeout=10
         )
         if response.status_code >= 400:
-            _log.error("db write %s failed  %d: %s", table, response.status_code, response.text[:300])
+            _log.error(
+                "db write %s failed  %d  body=%s  payload_keys=%s",
+                table, response.status_code, response.text[:2000], sorted(data.keys()),
+            )
         response.raise_for_status()
         result = response.json()
         _log.debug("db write ok  %s id=%s", table, result.get("Id"))
@@ -67,7 +70,10 @@ class NocodbClient:
             timeout=10
         )
         if response.status_code >= 400:
-            _log.error("db update %s/%d failed  %d: %s", table, row_id, response.status_code, response.text[:300])
+            _log.error(
+                "db update %s/%d failed  %d  body=%s  payload_keys=%s",
+                table, row_id, response.status_code, response.text[:2000], sorted(data.keys()),
+            )
         response.raise_for_status()
         return response.json()
 

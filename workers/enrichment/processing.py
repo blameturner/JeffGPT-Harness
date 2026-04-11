@@ -116,6 +116,7 @@ def _process_source(
 
     vr = _validate_content(text)
     total_tokens += vr["tokens"]
+    text = vr.get("clean_text", text)
     head = re.sub(r"\s+", " ", text[:200]).strip()
     tail = re.sub(r"\s+", " ", text[-200:]).strip() if len(text) > 400 else ""
     validator_flags = [f"fetch_path:{fetch_path}"] + vr["flags"]
@@ -159,26 +160,30 @@ def _process_source(
         db.log_event(cycle_id, "budget_exhausted", org_id, target_id, url)
         return total_tokens
 
-    # fan-out: summarise, extract_relationships, discover_sources write to different destinations; safe to run concurrently
+    # summarise + relationships share the fast model — serialise them so the
+    # harness-side slot semaphore doesn't fight itself. discover_sources hits
+    # the tool model and runs concurrently with the fast-model pair via fan_out.
+    def _fast_pair():
+        s = _summarise(text)
+        r = _extract_relationships(text, org_id)
+        return s, r
+
     fanout_results = fan_out(
         [
-            lambda: _summarise(text),
-            lambda: _extract_relationships(text, org_id),
+            _fast_pair,
             lambda: _discover_sources(text, url, org_id, cycle_id, db),
         ],
         label="process_source",
-        max_workers=3,
+        max_workers=2,
     )
-    summary_result, rels_result, disc_result = fanout_results
+    fast_pair_result, disc_result = fanout_results
 
-    if summary_result is None:
-        summary, s_tokens = "", 0
+    if fast_pair_result is None:
+        summary, s_tokens, rels, r_tokens = "", 0, 0, 0
     else:
-        summary, s_tokens = summary_result
-    if rels_result is None:
-        rels, r_tokens = 0, 0
-    else:
-        rels, r_tokens = rels_result
+        summary_result, rels_result = fast_pair_result
+        summary, s_tokens = summary_result if summary_result else ("", 0)
+        rels, r_tokens = rels_result if rels_result else (0, 0)
     d_tokens = disc_result if isinstance(disc_result, int) else 0
     total_tokens += s_tokens + r_tokens + d_tokens
 

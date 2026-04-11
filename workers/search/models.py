@@ -1,14 +1,40 @@
 from __future__ import annotations
 
 import logging
+import threading
+from contextlib import contextmanager
 
-from config import MODELS
+from config import MODEL_PARALLEL_SLOTS, MODELS
 
 _log = logging.getLogger("web_search.models")
 
 
 # Enrichment / crawl helpers must NEVER resolve to the reasoner model.
 _ENRICHMENT_SAFE_ROLES = ("tool", "fast")
+
+# slot semaphores bound harness-side concurrency to the llama.cpp --parallel N
+# value so the backend queue never builds up; MODEL_PARALLEL_SLOTS must match
+# the llama-server --parallel flag for each role
+_FAST_SLOT_SEM = threading.Semaphore(MODEL_PARALLEL_SLOTS)
+_TOOL_SLOT_SEM = threading.Semaphore(MODEL_PARALLEL_SLOTS)
+
+
+@contextmanager
+def fast_slot():
+    _FAST_SLOT_SEM.acquire()
+    try:
+        yield
+    finally:
+        _FAST_SLOT_SEM.release()
+
+
+@contextmanager
+def tool_slot():
+    _TOOL_SLOT_SEM.acquire()
+    try:
+        yield
+    finally:
+        _TOOL_SLOT_SEM.release()
 
 
 def _resolve_safe_model(preferred_role: str) -> tuple[str | None, str | None]:

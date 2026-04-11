@@ -23,6 +23,48 @@ from workers.search.urls import (
 _log = logging.getLogger("web_search.scraping")
 
 
+def _looks_like_real_text(text: str) -> bool:
+    if not text or len(text) < 200:
+        return False
+    printable = sum(1 for c in text if c.isprintable() or c.isspace())
+    if printable / len(text) < 0.90:
+        return False
+    words = text.split()
+    if len(words) < 50:
+        return False
+    avg_word_len = sum(len(w) for w in words) / len(words)
+    if avg_word_len > 25 or avg_word_len < 2:
+        return False
+    return True
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    lower = url.lower().split("?", 1)[0].split("#", 1)[0]
+    return lower.endswith(".pdf")
+
+
+def _extract_pdf_text(url: str) -> str:
+    try:
+        import io
+        import pdfplumber
+        resp = httpx.get(url, headers=BROWSER_HEADERS, timeout=SCRAPE_TIMEOUT, follow_redirects=True)
+        resp.raise_for_status()
+        if len(resp.content) > MAX_RESPONSE_BYTES:
+            _log.warning("pdf too large  url=%s bytes=%d", url, len(resp.content))
+            return ""
+        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+            pages = [p.extract_text() or "" for p in pdf.pages]
+        text = "\n\n".join(pages).strip()
+        _log.info("pdf extracted  url=%s pages=%d chars=%d", url, len(pages), len(text))
+        return text[:PER_PAGE_CHAR_CAP] if text else ""
+    except ImportError:
+        _log.warning("pdfplumber not installed; skipping pdf  url=%s", url)
+        return ""
+    except Exception:
+        _log.warning("pdf extraction failed  url=%s", url, exc_info=True)
+        return ""
+
+
 def _nocodb_truthy(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -39,6 +81,49 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
 Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
 window.chrome = {runtime: {}};
 """
+
+_COOKIE_BANNER_NUKE = """
+() => {
+    const sel = [
+        '[id*="cookie"]', '[class*="cookie"]', '[id*="consent"]', '[class*="consent"]',
+        '[id*="gdpr"]', '[class*="gdpr"]', '[aria-label*="cookie" i]',
+        '#onetrust-banner-sdk', '.onetrust-banner', '.ot-sdk-container',
+        '[id*="CybotCookiebot"]', '[class*="CybotCookiebot"]',
+        '[class*="cc-banner"]', '[class*="cookieconsent"]',
+    ];
+    sel.forEach(s => {
+        try { document.querySelectorAll(s).forEach(el => el.remove()); } catch (e) {}
+    });
+}
+"""
+
+_MAIN_CONTENT_EXTRACT = """
+() => {
+    const candidates = [
+        'main', 'article', '[role=main]', '#content', '#main',
+        '.content', '.main-content', '.post-content', '.markdown-body',
+        '.article-body', '.entry-content',
+    ];
+    for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText && el.innerText.length > 300) return el.innerText;
+    }
+    return document.body ? document.body.innerText : '';
+}
+"""
+
+
+def _looks_like_antibot(text: str) -> bool:
+    if not text or len(text) >= 2000:
+        return False
+    lower = text.lower()
+    markers = (
+        "checking your browser", "cloudflare", "ddos protection",
+        "enable javascript", "please enable cookies", "verify you are human",
+        "captcha", "access denied", "just a moment", "attention required",
+        "one more step", "needs to review the security",
+    )
+    return any(m in lower for m in markers)
 
 
 # sync_playwright() is pinned to the thread that called .start(). All playwright
@@ -135,9 +220,17 @@ def _playwright_worker_main() -> None:
                     else route.abort()
                 ))
 
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    pass
+                # SPA lazy-render: wait for body to accumulate real text.
+                try:
+                    page.wait_for_function(
+                        "() => document.body && document.body.innerText.length > 500",
+                        timeout=5_000,
+                    )
                 except Exception:
                     pass
 
@@ -147,7 +240,25 @@ def _playwright_worker_main() -> None:
                     fut.set_result("")
                     continue
 
-                text = page.inner_text("body")
+                # Remove cookie/consent/GDPR overlays before extraction.
+                try:
+                    page.evaluate(_COOKIE_BANNER_NUKE)
+                except Exception:
+                    pass
+
+                # Prefer main/article content over full body (strips nav/footer).
+                try:
+                    text = page.evaluate(_MAIN_CONTENT_EXTRACT) or ""
+                except Exception:
+                    text = page.inner_text("body")
+
+                if _looks_like_antibot(text):
+                    elapsed = round(time.time() - started, 2)
+                    _log.warning("playwright_fetch anti-bot wall  url=%s chars=%d %.2fs", url[:120], len(text), elapsed)
+                    fut.set_result("")
+                    continue
+
+                text = re.sub(r"\n{3,}", "\n\n", text)
                 text = _strip_injection_patterns(text)[:PER_PAGE_CHAR_CAP]
                 elapsed = round(time.time() - started, 2)
                 _log.info("playwright_fetch ok  url=%s chars=%d %.2fs", url[:120], len(text), elapsed)
@@ -246,6 +357,9 @@ def _scrape_with_httpx(url: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _strip_injection_patterns(text)
     text = text[:PER_PAGE_CHAR_CAP]
+    if text and not _looks_like_real_text(text):
+        _log.info("scrape httpx output failed quality check, falling through to playwright  url=%s len=%d", url, len(text))
+        return ""
     if not text:
         _log.warning("scrape empty after extraction for %s (raw html was %d chars)", url, len(resp.text))
     else:
@@ -274,6 +388,16 @@ def scrape_page(
     if _is_blocklisted(url):
         _log.debug("scrape skip  blocklisted %s", url)
         _set_meta("blocked", len(fallback))
+        return fallback
+
+    if _looks_like_pdf_url(url):
+        pdf_text = _extract_pdf_text(url)
+        if pdf_text:
+            _log.info("path=pdf  url=%s chars=%d", url[:120], len(pdf_text))
+            _set_meta("pdf", len(pdf_text))
+            return pdf_text
+        _log.info("path=pdf  url=%s failed", url[:120])
+        _set_meta("pdf_failed", len(fallback))
         return fallback
 
     if source and _nocodb_truthy(source.get("use_playwright")):

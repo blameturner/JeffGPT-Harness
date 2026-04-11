@@ -7,10 +7,54 @@ import time
 
 import httpx
 
-from workers.search.models import _tool_model
+from workers.search.models import _tool_model, tool_slot
 from workers.search.temporal import build_prompt_date_header
 
 _log = logging.getLogger("web_search.intent")
+
+
+_CHITCHAT_TRIGGER_WORDS = re.compile(
+    r"\b(today|tonight|this (?:week|weekend|month|year)|"
+    r"right now|currently|latest|recent|news|price|score|weather|"
+    r"stock|standings?|results?|fixtures?|schedule|"
+    r"search|google|look up|lookup|find|check|who won|"
+    r"what happened|what's happening|documentation|docs|"
+    r"version|release|changelog|cve|vulnerability)\b",
+    re.I,
+)
+_CHITCHAT_WH_QUESTION = re.compile(
+    r"\b(who|what|when|where|which|how many|how much)\b.*\?",
+    re.I,
+)
+_CHITCHAT_CODE_PREFIXES = (
+    "def ", "class ", "import ", "from ", "function ", "const ",
+    "let ", "var ", "$ ", "# ", "SELECT ", "UPDATE ",
+)
+_CHITCHAT_OPENER = re.compile(
+    r"^\s*(hi|hello|hey|yo|good (?:morning|afternoon|evening)|howdy|"
+    r"thanks|thank you|ty|tyvm|please|"
+    r"ok|okay|cool|nice|great|awesome|sweet|sure|alright|fine|"
+    r"lol|haha|hehe|hmm|mhm|ah|oh|wow|"
+    r"yes|yeah|yep|yup|no|nah|nope)\b",
+    re.I,
+)
+
+
+def _definitely_chitchat(message: str, history: list[dict] | None) -> bool:
+    msg = message.strip()
+    if not msg:
+        return True
+    if len(msg) > 80:
+        return False
+    if "```" in msg or msg.lstrip().startswith(_CHITCHAT_CODE_PREFIXES):
+        return False
+    if _CHITCHAT_TRIGGER_WORDS.search(msg):
+        return False
+    if _CHITCHAT_WH_QUESTION.search(msg):
+        return False
+    # require a positive chitchat opener so we never misroute code or factual
+    # questions that happen not to contain trigger words ("can you explain...")
+    return bool(_CHITCHAT_OPENER.match(msg))
 
 
 INTENT_ROUTE_CHAT = "chat"
@@ -258,6 +302,13 @@ def classify_message_intent(
     if not msg:
         return _fallback_intent()
 
+    if _definitely_chitchat(msg, history):
+        _log.info("intent classifier: heuristic skip (definite chitchat)")
+        result = _fallback_intent()
+        result["confidence"] = "high"
+        result["classifier_raw"] = "heuristic_skip"
+        return result
+
     tool_url, tool_model = _tool_model()
     if not tool_url:
         _log.warning("intent classifier: no tool model available, using fallback")
@@ -271,18 +322,19 @@ def classify_message_intent(
 
     started = time.time()
     try:
-        resp = httpx.post(
-            f"{tool_url}/v1/chat/completions",
-            json={
-                "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 200,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        with tool_slot():
+            resp = httpx.post(
+                f"{tool_url}/v1/chat/completions",
+                json={
+                    "model": tool_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 200,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         _log.warning("intent classifier call failed: %s", e)
         return _fallback_intent()

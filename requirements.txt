@@ -5,6 +5,7 @@ APScheduler==3.11.2
 attrs==26.1.0
 bcrypt==5.0.0
 beautifulsoup4==4.14.3
+brotli>=1.0.0
 build==1.4.2
 certifi==2026.2.25
 charset-normalizer==3.4.7
@@ -47,6 +48,7 @@ opentelemetry-semantic-conventions==0.61b0
 orjson==3.11.8
 overrides==7.7.0
 packaging==26.0
+pdfplumber>=0.10.0
 playwright==1.44.0
 protobuf==6.33.6
 pybase64==1.4.3

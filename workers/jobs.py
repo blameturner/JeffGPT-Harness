@@ -7,7 +7,7 @@ from typing import Callable, Iterator, Optional
 
 _log = logging.getLogger("jobs")
 
-_GC_AFTER_SECONDS = 300
+_GC_AFTER_SECONDS = 1800
 _MAX_EVENTS_PER_JOB = 10_000
 _WAIT_TIMEOUT = 15.0
 

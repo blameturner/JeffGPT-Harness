@@ -3,7 +3,20 @@ from __future__ import annotations
 import logging
 import threading
 
+import requests
+
 _log = logging.getLogger("chat.persistence")
+
+
+def _log_db_exception(context: str, conversation_id: int, exc: BaseException) -> None:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        _log.error(
+            "%s  conv=%s status=%s body=%s",
+            context, conversation_id, exc.response.status_code, exc.response.text[:2000],
+            exc_info=True,
+        )
+    else:
+        _log.error("%s  conv=%s", context, conversation_id, exc_info=True)
 
 
 def schedule_status_processing_write(db, conversation_id: int) -> None:
@@ -39,8 +52,8 @@ def schedule_user_message_write(
                 model=model,
                 response_style=style_key,
             )
-        except Exception:
-            _log.error("user message persist failed", exc_info=True)
+        except Exception as e:
+            _log_db_exception("user message persist failed", conversation_id, e)
         finally:
             written.set()
 
@@ -62,11 +75,20 @@ def persist_assistant_message(
     search_confidence: str,
     search_context: str,
     intent_dict: dict | None,
-) -> None:
+) -> bool:
     intent_meta: dict = {}
     if intent_dict:
-        # NocoDB JSON columns — pass native lists, not json.dumps'd strings.
+        # classification is a nested JSON column the frontend reads as
+        # msg.classification.intent; flat intent/intent_entities are kept for legacy consumers
+        classification = {
+            "route": intent_dict.get("route"),
+            "intent": intent_dict.get("intent"),
+            "secondary_intent": intent_dict.get("secondary_intent"),
+            "entities": intent_dict.get("entities") or [],
+            "confidence": intent_dict.get("confidence"),
+        }
         intent_meta = {
+            "classification": classification,
             "intent": intent_dict.get("intent"),
             "intent_entities": intent_dict.get("entities") or [],
             "search_queries": (
@@ -98,15 +120,19 @@ def persist_assistant_message(
             **intent_meta,
         )
         _log.info("persisted assistant message  conv=%s chars=%d", conversation_id, len(output))
-        if search_sources and msg_row.get("Id"):
-            try:
-                db.add_message_search_sources(
-                    message_id=msg_row["Id"],
-                    conversation_id=conversation_id,
-                    org_id=org_id,
-                    sources=search_sources,
-                )
-            except Exception:
-                _log.error("search sources persist failed  conv=%s", conversation_id, exc_info=True)
-    except Exception:
-        _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
+    except Exception as e:
+        _log_db_exception("assistant message persist failed", conversation_id, e)
+        return False
+
+    if search_sources and msg_row.get("Id"):
+        try:
+            db.add_message_search_sources(
+                message_id=msg_row["Id"],
+                conversation_id=conversation_id,
+                org_id=org_id,
+                sources=search_sources,
+            )
+        except Exception as e:
+            _log_db_exception("search sources persist failed", conversation_id, e)
+
+    return True

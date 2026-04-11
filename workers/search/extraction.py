@@ -196,6 +196,9 @@ def _background_graph_write(text: str, org_id: int, url: str) -> None:
         _log.warning("search graph write failed  url=%s", url[:120], exc_info=True)
 
 
+_BATCH_PER_PAGE_CHAR_CAP = 3000
+
+
 def extract_from_pages(
     pages: list[dict],
     query: str,
@@ -207,28 +210,108 @@ def extract_from_pages(
         return []
 
     try:
-        from workers.crawler import fan_out
-    except Exception:
-        _log.warning("fan_out unavailable — falling back to sequential extraction")
-        return [_extract_one_page(p.get("text", ""), query, intent_dict) for p in pages]
+        from workers.enrichment.models import _fast_call
+        from workers.enrichment.quality import (
+            _classify_content_type,
+            _heuristic_quality_gate,
+        )
+    except Exception as e:
+        _log.warning("extraction helpers import failed: %s", e)
+        return [None] * len(pages)
 
-    def _make_worker(page: dict):
+    results: list[dict | None] = [None] * len(pages)
+    candidates: list[tuple[int, str, str]] = []
+
+    for i, page in enumerate(pages):
         text = page.get("text", "")
-        return lambda: _extract_one_page(text, query, intent_dict)
+        if not text or not text.strip():
+            continue
+        passed, gate_reason, gate_metrics = _heuristic_quality_gate(text)
+        if not passed:
+            _log.debug("extraction drop  gate=%s metrics=%s", gate_reason, gate_metrics)
+            continue
+        content_type, _raw, _cls_tokens = _classify_content_type(text)
+        if content_type is None:
+            content_type = "UNCLEAR"
+        if content_type not in _ACCEPTABLE_CONTENT_TYPES and content_type not in _SOFT_CONTENT_TYPES:
+            _log.debug("extraction drop  content_type=%s", content_type)
+            continue
+        candidates.append((i, text, content_type))
 
-    workers = [_make_worker(p) for p in pages]
+    if not candidates:
+        _log.info("extract_from_pages  pages=%d candidates=0 (all dropped pre-model)", len(pages))
+        return results
+
     started = time.time()
-    results = fan_out(
-        workers,
-        label="extract_from_pages",
-        max_workers=min(len(pages), 4),
+    goal = _extraction_goal_for(intent_dict)
+    pages_block_parts = []
+    for idx, (_, text, _) in enumerate(candidates, 1):
+        excerpt = text[:_BATCH_PER_PAGE_CHAR_CAP]
+        pages_block_parts.append(f"--- PAGE {idx} ---\n{excerpt}")
+    pages_block = "\n\n".join(pages_block_parts)
+
+    prompt = (
+        f"{build_prompt_date_header()}\n\n"
+        f"You are extracting information from {len(candidates)} web pages for a user who asked:\n"
+        f"'{query[:500]}'\n\n"
+        f"GOAL (apply to every page): {goal}\n\n"
+        f"Return ONLY a JSON array with {len(candidates)} objects — one per page in the same "
+        "order as the pages appear below. Each object has these fields:\n"
+        "- summary: the extracted content per the GOAL above\n"
+        '- relevance: "high" | "medium" | "low"\n'
+        '- source_type: one of "official_docs", "news_article", "blog_post", '
+        '"research_paper", "forum", "product_page", "government", "unknown"\n\n'
+        'If a page is genuinely useless, return {"irrelevant": true} for it.\n'
+        "No prose outside the array. First character `[`, last character `]`.\n\n"
+        f"{pages_block}"
+    )
+
+    raw, tokens = _fast_call(
+        prompt,
+        max_tokens=SUMMARY_MAX_TOKENS * len(candidates),
+        temperature=0.2,
     )
     elapsed = round(time.time() - started, 2)
 
+    if not raw:
+        _log.warning("extract_from_pages  batch empty response (pages=%d %.2fs)", len(candidates), elapsed)
+        return results
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned).rstrip("`").strip()
+    array_match = re.search(r"\[[\s\S]*\]", cleaned)
+    if not array_match:
+        _log.warning("extract_from_pages  no JSON array in response: %s", raw[:200])
+        return results
+    try:
+        parsed = json.loads(array_match.group(0))
+    except json.JSONDecodeError:
+        _log.warning("extract_from_pages  JSON parse failed: %s", raw[:200])
+        return results
+
+    if not isinstance(parsed, list):
+        return results
+
+    per_page_tokens = tokens // max(1, len(candidates))
+    for (i, _text, content_type), data in zip(candidates, parsed):
+        if not isinstance(data, dict) or data.get("irrelevant"):
+            continue
+        summary = str(data.get("summary") or "").strip()
+        if not summary:
+            continue
+        results[i] = {
+            "summary": summary,
+            "relevance": str(data.get("relevance") or "unknown").lower(),
+            "source_type": str(data.get("source_type") or "unknown").lower(),
+            "content_type": content_type,
+            "tokens": per_page_tokens,
+        }
+
     kept = sum(1 for r in results if r is not None)
     _log.info(
-        "extract_from_pages  pages=%d accepted=%d dropped=%d %.2fs",
-        len(pages), kept, len(pages) - kept, elapsed,
+        "extract_from_pages BATCH  pages=%d candidates=%d accepted=%d tokens=%d %.2fs",
+        len(pages), len(candidates), kept, tokens, elapsed,
     )
 
     if fire_graph_writes and org_id is not None:

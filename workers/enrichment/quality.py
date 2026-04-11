@@ -7,12 +7,13 @@ from collections import Counter
 from typing import Any
 
 from workers.enrichment.models import _tool_call
+from workers.search.urls import _strip_injection_patterns
 
 _log = logging.getLogger("enrichment_agent.quality")
 
 CONTENT_TYPE_ACCEPT = {"REFERENCE", "ARTICLE", "ENCYCLOPEDIC", "FORUM"}
-CONTENT_TYPE_SOFT_ACCEPT = {"PRODUCT", "UNCLEAR"}
-CONTENT_TYPE_REJECT = {"NAVIGATION", "BOILERPLATE", "GENERATED", "PAYWALL"}
+CONTENT_TYPE_SOFT_ACCEPT = {"PRODUCT", "UNCLEAR", "NAVIGATION", "GENERATED"}
+CONTENT_TYPE_REJECT = {"BOILERPLATE", "PAYWALL"}
 CONTENT_TYPE_ENUM = CONTENT_TYPE_ACCEPT | CONTENT_TYPE_SOFT_ACCEPT | CONTENT_TYPE_REJECT
 
 VALIDATOR_MIN_LEN = 300
@@ -156,8 +157,15 @@ def _validate_content(text: str) -> dict:
         "flags": ["validator"],
         "classification": None,
         "metrics": {},
+        "clean_text": text,
     }
     _log.debug("validating content  text_len=%d", len(text))
+
+    cleaned = _strip_injection_patterns(text)
+    if cleaned != text:
+        result["flags"].append("injection_redacted")
+    text = cleaned
+    result["clean_text"] = text
 
     passed, code, metrics = _heuristic_quality_gate(text)
     result["metrics"] = metrics
@@ -205,14 +213,8 @@ def _validate_content(text: str) -> dict:
         is_adversarial, check_code, check_tokens = _looks_like_injection(text)
         result["tokens"] += check_tokens
         result["flags"].append(f"injection_check:{check_code}")
-        if is_adversarial:
-            result["reason_code"] = "injection_adversarial"
-            result["message"] = f"injection sanity check: {check_code}"
-            _log.info(
-                "validate  ok=False stage=injection type=%s tokens=%d",
-                classification, result["tokens"],
-            )
-            return result
+        if is_adversarial and "injection_redacted" not in result["flags"]:
+            result["flags"].append("injection_redacted")
 
     result["ok"] = True
     if classification in CONTENT_TYPE_SOFT_ACCEPT:

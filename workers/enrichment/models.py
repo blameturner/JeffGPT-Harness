@@ -6,11 +6,11 @@ import time
 import httpx
 
 from config import MODELS, REASONER_ROLE
-from workers.search.models import _fast_model, _tool_model
+from workers.search.models import _fast_model, _tool_model, fast_slot, tool_slot
 
 _log = logging.getLogger("enrichment_agent.models")
 
-FAST_TIMEOUT = 60
+FAST_TIMEOUT = 180
 
 
 def _assert_not_reasoner(url: str | None) -> None:
@@ -86,9 +86,11 @@ def _model_call(
 
 def _tool_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
     url, model_id = _tool_model()
-    return _model_call("tool_call", url, model_id, prompt, max_tokens, temperature)
+    with tool_slot():
+        return _model_call("tool_call", url, model_id, prompt, max_tokens, temperature)
 
 
 def _fast_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
     url, model_id = _fast_model()
-    return _model_call("fast_call", url, model_id, prompt, max_tokens, temperature)
+    with fast_slot():
+        return _model_call("fast_call", url, model_id, prompt, max_tokens, temperature)
