@@ -624,18 +624,20 @@ class ChatAgent:
             # created_at preserves user→assistant ordering in list_messages.
             if not _user_msg_written.wait(timeout=10.0):
                 _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
-            # Classification metadata for the message row. NocoDB
-            # silently drops unknown fields so these land only if the
-            # corresponding columns have been added to the schema (see
-            # plan §8 — messages table additions).
+            # Classification metadata for the message row. The
+            # intent_entities and search_queries columns are JSON-typed
+            # in NocoDB — pass native Python lists, not json.dumps'd
+            # strings. `requests.post(json=payload, ...)` in NocodbClient
+            # will serialise them to real JSON arrays on the wire.
             intent_meta: dict = {}
             if intent_dict:
                 intent_meta = {
                     "intent": intent_dict.get("intent"),
-                    "intent_entities": json.dumps(intent_dict.get("entities") or []),
-                    "search_queries": json.dumps(
-                        [] if not search_sources else
+                    "intent_entities": intent_dict.get("entities") or [],
+                    "search_queries": (
                         [s.get("url") for s in search_sources if s.get("url")]
+                        if search_sources
+                        else []
                     ),
                 }
                 if search_status == "failed":
