@@ -91,15 +91,8 @@ class Agent:
         url: str | None = None,
         model: str | None = None,
     ) -> Iterator[dict]:
-        """Stream chat completions from a llama.cpp-compatible server.
-
-        Yields:
-          {"type": "chunk", "text": str}
-          {"type": "done", "usage": {...}, "model": str}
-          {"type": "error", "message": str}  (terminal, on failure)
-
-        Never raises — callers consume until the generator is exhausted.
-        """
+        # Yields {"type": "chunk"|"done"|"error", ...}. Never raises — the
+        # error event is terminal.
         url = url or self._get_model_url()
         model = model or self.config["model"]
         temperature = temperature if temperature is not None else self.config.get("temperature", 0.7)
@@ -228,12 +221,6 @@ class Agent:
         )
 
     def run_streaming(self, task: str, product: str = "") -> Iterator[dict]:
-        """Streaming variant of run().
-
-        Yields the same event shapes as `_call_model_streaming`, plus
-        persists the run to NocoDB + Chroma after the `done` event arrives.
-        Token counts come from the final streaming chunk — never zero.
-        """
         _log.debug("run_streaming start  agent=%s org=%d", self.config.get("name"), self.org_id)
         context = ""
         context_tokens = 0

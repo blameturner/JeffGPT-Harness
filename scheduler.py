@@ -1,10 +1,3 @@
-"""APScheduler setup for enrichment + user-defined agent schedules.
-
-Agent schedules live in the Nocodb `agent_schedules` table. Each row fires a
-POST /run against the harness for its configured agent_name/org_id on its
-cron expression. The schedule list is loaded at startup and can be refreshed
-at runtime via POST /scheduler/reload (wired in main.py).
-"""
 from __future__ import annotations
 
 import logging

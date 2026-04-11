@@ -190,26 +190,19 @@ BASE_SYSTEM_PROMPT = (
     "Be honest, be concise, and match the tone of the conversation."
 )
 
-# Wall-clock timezone used for the current-date system message injected
-# on every chat turn. Keeps the model grounded in the user's current time
-# instead of reasoning from its training cutoff.
 CHAT_TIMEZONE = os.getenv("CHAT_TIMEZONE", "Australia/Sydney")
 
 
 ENRICHMENT_TOKEN_BUDGET = int(os.getenv("ENRICHMENT_TOKEN_BUDGET", "50000"))
 ENRICHMENT_LOG_RETENTION_DAYS = int(os.getenv("ENRICHMENT_LOG_RETENTION_DAYS", "30"))
-MAX_SUMMARY_INPUT_CHARS = 6000  # tuned for the small tool model's 8k context window
+MAX_SUMMARY_INPUT_CHARS = 6000  # tool model has 8k context
 PROACTIVE_BUDGET_THRESHOLD = 5000
 
-# The reasoner role is reserved for interactive chat and future synthesis
-# agents. The enrichment/crawl pipeline must never resolve to it — see
-# workers.web_search._resolve_safe_model and the reasoner guard in
-# workers.enrichment_agent._tool_call / _fast_call.
+# Reasoner role is reserved for interactive chat; the enrichment/crawl pipeline
+# must never resolve to it — see workers.web_search._resolve_safe_model.
 REASONER_ROLE = "reasoner"
 
-# llama.cpp is run with --parallel N on the fast/tool models. The crawler's
-# fan_out() helper bounds concurrent in-flight model calls by this number so
-# we don't over-schedule the slot pool.
+# Bounds concurrent in-flight model calls to match llama.cpp's --parallel N.
 MODEL_PARALLEL_SLOTS = int(os.getenv("MODEL_PARALLEL_SLOTS", "4"))
 CATEGORY_COLLECTIONS = {
     "documentation": "scraped_documentation",

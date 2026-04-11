@@ -7,9 +7,6 @@ from typing import Callable, Iterator, Optional
 
 _log = logging.getLogger("jobs")
 
-# Single-process job store. To scale to multiple workers, back this with Redis
-# (streams or pub/sub + list) — the public API here is designed to swap.
-
 _GC_AFTER_SECONDS = 300
 _MAX_EVENTS_PER_JOB = 10_000
 _WAIT_TIMEOUT = 15.0

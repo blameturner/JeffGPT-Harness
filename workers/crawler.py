@@ -1,23 +1,5 @@
-"""Knowledge crawler: frontier management, link discovery, staleness, fan-out.
-
-This module owns everything about *which URLs to fetch next* and *when*. It
-is deliberately separate from the content pipeline (validate/summarise/graph/
-chroma) which lives in :mod:`workers.enrichment_agent`.
-
-Rules this module lives by:
-
-1. **MUST NOT call the reasoner model.** The reasoner is reserved for
-   interactive chat and future synthesis agents. LLM-calling helpers
-   (:func:`select_crawl_paths`, :func:`expand_frontier`) take a ``tool_call``
-   callable as a parameter so this module imports *nothing* model-related at
-   runtime. The call-site in :mod:`workers.enrichment_agent` passes its own
-   ``_tool_call`` which enforces the reasoner guard.
-2. **Thread-safe.** Polite-delay state and the robots cache are protected by
-   locks because :func:`fan_out` can run crawler calls concurrently.
-3. **No circular imports.** :class:`workers.enrichment_agent.EnrichmentDB` is
-   only referenced under ``TYPE_CHECKING``; at runtime the ``db`` parameter
-   is duck-typed.
-"""
+# MUST NOT call the reasoner model: LLM-using helpers take a tool_call callable
+# so this module never imports model helpers directly (avoids circular imports).
 from __future__ import annotations
 
 import json
@@ -43,8 +25,6 @@ if TYPE_CHECKING:
 _log = logging.getLogger("crawler")
 
 
-# --- Crawl policy constants -------------------------------------------------
-
 MAX_CRAWL_DEPTH = 5
 CRAWL_LINK_CAP = 50
 
@@ -53,10 +33,8 @@ POLITE_DELAY_MAX = 5
 POLITE_SAME_DOMAIN_MIN = 4
 POLITE_SAME_DOMAIN_MAX = 8
 
-ROBOTS_CACHE_TTL = 3600  # re-check robots.txt after 1 hour
+ROBOTS_CACHE_TTL = 3600
 
-
-# --- Module state (all mutations protected by the relevant lock) -----------
 
 _last_domain_hit: dict[str, float] = {}
 _polite_lock = threading.Lock()
@@ -65,19 +43,9 @@ ROBOTS_CACHE: dict[str, tuple[urllib.robotparser.RobotFileParser, float]] = {}
 _robots_lock = threading.Lock()
 
 
-# --- Polite-delay helper ----------------------------------------------------
-
+# Thread-safe: publishes projected wake time under lock so concurrent callers
+# for the same domain see the slot as in-progress, not idle.
 def apply_polite_delay(domain: str) -> float:
-    """Sleep for a random polite interval scaled by same-domain recency.
-
-    Returns the delay actually applied (seconds). Thread-safe: the
-    ``_last_domain_hit`` timestamp is updated to the *projected wake time*
-    BEFORE sleeping, so concurrent callers for the same domain see the
-    slot as already taken and compute their own delay on top of it. This
-    matters once §6-style fan-out is extended to run multiple sources
-    concurrently — without this, two threads could pick the same domain
-    at the same moment and both treat it as idle.
-    """
     if not domain:
         delay = random.uniform(POLITE_DELAY_MIN, POLITE_DELAY_MAX)
         time.sleep(delay)
@@ -89,23 +57,14 @@ def apply_polite_delay(domain: str) -> float:
             delay = random.uniform(POLITE_SAME_DOMAIN_MIN, POLITE_SAME_DOMAIN_MAX)
         else:
             delay = random.uniform(POLITE_DELAY_MIN, POLITE_DELAY_MAX)
-        # Publish the projected wake time *under the lock* so any other
-        # thread that observes _last_domain_hit next sees this slot as
-        # in-progress, not idle.
         _last_domain_hit[domain] = now + delay
     time.sleep(delay)
     return delay
 
 
-# --- robots.txt -------------------------------------------------------------
-
+# Fails open (returns True) on any robots.txt error — a flaky server must
+# not halt crawling.
 def check_robots(url: str) -> bool:
-    """Return True if our crawler is allowed to fetch this URL.
-
-    Caches the parsed ``RobotFileParser`` per host for ``ROBOTS_CACHE_TTL``
-    seconds. Fails **open** (returns True) when robots.txt is unreachable or
-    malformed — we don't want a flaky server to halt crawling.
-    """
     parsed = urlparse(url)
     host = f"{parsed.scheme}://{parsed.netloc}"
     now = time.time()
@@ -137,15 +96,7 @@ def check_robots(url: str) -> bool:
         return True
 
 
-# --- Link discovery ---------------------------------------------------------
-
 def extract_internal_links(url: str, source: dict | None = None) -> list[str]:
-    """Fetch a page and return de-duped internal (same-domain) links.
-
-    Capped at :data:`CRAWL_LINK_CAP` to keep prompts bounded. The
-    ``source`` argument is reserved for future per-target customisation and
-    is currently unused.
-    """
     # Deferred import to avoid a module-load-time dependency on web_search.
     from workers.web_search import (
         BROWSER_HEADERS, SCRAPE_TIMEOUT, _is_safe_url, _is_blocklisted,
@@ -191,8 +142,6 @@ def extract_internal_links(url: str, source: dict | None = None) -> list[str]:
     return links
 
 
-# --- Link ranking (tool LLM, dependency-injected) ---------------------------
-
 def select_crawl_paths(
     links: list[str],
     source_url: str,
@@ -200,17 +149,6 @@ def select_crawl_paths(
     tool_call: Callable[[str, int, float], tuple[str, int]],
     sparse_concepts: list[str] | None = None,
 ) -> tuple[list[str], int]:
-    """Rank internal links by content value using the tool model.
-
-    ``tool_call`` is injected so this module doesn't import the model
-    helpers directly — keeps the circular-import surface at zero.
-
-    If ``sparse_concepts`` is provided, the prompt is extended with a
-    hint biasing selection toward links that might cover those topics.
-    This implements §5 (graph-aware link ranking).
-
-    Returns ``(selected_urls, tokens_used)``.
-    """
     if not links:
         return [], 0
 
@@ -256,30 +194,18 @@ def select_crawl_paths(
     return filtered, tokens
 
 
-# --- Staleness --------------------------------------------------------------
-
+# Exponential backoff capped at 16x (caller must reset consecutive_unchanged
+# on content change).
 def compute_next_crawl_at(
     last_scraped_at: datetime,
     base_hours: float,
     consecutive_unchanged: int,
 ) -> datetime:
-    """Exponential backoff scheduler.
-
-    ``next = last + base_hours * 2^min(n, 4)``. Caps at 16× so a 1-hour
-    source never stretches past 16 hours; a 24-hour source never past
-    ~16 days. Reset to zero on content change — caller's responsibility.
-    """
     multiplier = 2 ** min(max(consecutive_unchanged, 0), 4)
     return last_scraped_at + timedelta(hours=base_hours * multiplier)
 
 
 def should_recrawl(row: dict, now: datetime | None = None) -> bool:
-    """Return True if a ``scrape_targets`` row is due for re-crawl.
-
-    Prefers ``next_crawl_at`` when set (the new adaptive-staleness path);
-    falls back to ``last_scraped_at + frequency_hours`` for legacy rows
-    where the new column is NULL.
-    """
     if not row.get("active"):
         return False
     now = now or datetime.now(timezone.utc)
@@ -292,24 +218,22 @@ def should_recrawl(row: dict, now: datetime | None = None) -> bool:
                 target = target.replace(tzinfo=timezone.utc)
             return target <= now
         except Exception:
-            pass  # fall through to legacy path
+            pass
 
     last = row.get("last_scraped_at")
     if not last:
-        return True  # never scraped
+        return True
     try:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
     except Exception:
         return True
-    # NocoDB's scrape_targets schema uses `frequency` as the column name in
-    # some deployments and `frequency_hours` in others. Tolerate both.
+    # NocoDB schema uses `frequency` in some deployments and `frequency_hours`
+    # in others.
     freq = float(row.get("frequency_hours") or row.get("frequency") or 24)
     return last_dt + timedelta(hours=freq) <= now
 
-
-# --- Frontier expansion (§3: auto-crawl same-domain children) --------------
 
 def expand_frontier(
     parent: dict,
@@ -320,14 +244,6 @@ def expand_frontier(
     tool_call: Callable[[str, int, float], tuple[str, int]],
     sparse_concepts: list[str] | None = None,
 ) -> tuple[int, int]:
-    """Discover same-domain sub-pages from a trusted parent and auto-create
-    them as ``scrape_targets`` rows (inside the trust envelope).
-
-    External-domain discoveries continue to go through the suggestions
-    queue — see ``_discover_sources`` in ``workers.enrichment_agent``.
-
-    Returns ``(children_created, tokens_used)``.
-    """
     parent_id = parent.get("Id")
     parent_url = parent.get("url") or ""
     parent_depth = int(parent.get("depth") or 0)
@@ -371,9 +287,6 @@ def expand_frontier(
             _log.debug("frontier skip robots  %s", child_url[:120])
             continue
         try:
-            # Reuse the existing EnrichmentDB.create_source path that the UI
-            # and suggestion-approval flow also go through. This keeps all
-            # scrape_targets inserts on one code path.
             db.create_source({
                 "org_id": org_id,
                 "url": child_url,
@@ -403,32 +316,14 @@ def expand_frontier(
     return created, tokens
 
 
-# --- Concurrent fan-out (§6) -----------------------------------------------
-
+# Bounded by MODEL_PARALLEL_SLOTS so llama.cpp's parallel slot pool isn't
+# over-scheduled. Per-call exceptions become None in the results list.
 def fan_out(
     calls: list[Callable[[], Any]],
     *,
     max_workers: int | None = None,
     label: str = "fan_out",
 ) -> list[Any]:
-    """Run zero-arg callables concurrently, preserving input order.
-
-    Bounded by :data:`config.MODEL_PARALLEL_SLOTS` by default so
-    llama.cpp's parallel slot pool isn't over-scheduled. Exceptions from
-    individual calls are logged and replaced with ``None`` in the results
-    list — the caller decides how to handle partial failure.
-
-    Example::
-
-        [summary_tuple, rels_tuple, disc_tokens] = fan_out(
-            [
-                lambda: _summarise(text),
-                lambda: _extract_relationships(text, org_id),
-                lambda: _discover_sources(text, url, org_id, cycle_id, db),
-            ],
-            label="process_source",
-        )
-    """
     if not calls:
         return []
     workers = max_workers or MODEL_PARALLEL_SLOTS

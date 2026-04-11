@@ -208,14 +208,8 @@ class NocodbClient:
         search_context_text: str = "",
         **extra_fields,
     ) -> dict:
-        """Persist a message row.
-
-        Extra keyword arguments (e.g. ``intent``, ``intent_entities``,
-        ``search_queries``, ``search_status_reason``) are passed through
-        verbatim if non-empty. Unknown columns are silently dropped by
-        NocoDB, which is fine — the caller can pass schema-optional
-        fields safely without a migration being strictly required first.
-        """
+        # Extra kwargs are passed through verbatim if non-empty; NocoDB
+        # silently drops unknown columns so schema-optional fields are safe.
         _log.info("add_message  conv=%d role=%s model=%s content_len=%d", conversation_id, role, model, len(content))
         payload = {
             "conversation_id": conversation_id,
@@ -238,8 +232,6 @@ class NocodbClient:
             payload["search_source_count"] = search_source_count
         if search_context_text:
             payload["search_context_text"] = search_context_text
-        # Passthrough for the new §8 fields (intent, intent_entities,
-        # search_queries, search_status_reason) and any future extensions.
         for key, value in extra_fields.items():
             if value is None or value == "":
                 continue
@@ -253,7 +245,6 @@ class NocodbClient:
         org_id: int,
         sources: list[dict],
     ) -> list[dict]:
-        """Write individual source rows to the message_search_sources table."""
         rows: list[dict] = []
         for i, src in enumerate(sources):
             payload = {
@@ -265,7 +256,8 @@ class NocodbClient:
                 "url": src.get("url") or "",
                 "relevance": src.get("relevance") or "unknown",
                 "source_type": src.get("source_type") or "unknown",
-                "snippet": src.get("summary") or "",
+                "content_type": src.get("content_type") or "UNCLEAR",
+                "snippet": src.get("snippet") or src.get("summary") or "",
                 "used_in_answer": 1 if src.get("used_in_answer") else 0,
             }
             try:

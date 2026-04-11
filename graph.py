@@ -38,20 +38,6 @@ def write_relationship(
         raise
 
 def get_sparse_concepts(org_id: int, limit: int = 10, max_degree: int = 3) -> list[str]:
-    """Return concept names with graph degree < ``max_degree``, starved-first.
-
-    "Sparse" here means the graph has fewer than ``max_degree`` edges
-    attached to the concept — a signal that we should preferentially crawl
-    pages likely to cover that topic.
-
-    Used by :func:`workers.crawler.select_crawl_paths` to bias link
-    ranking toward coverage gaps (§5 of the crawler refactor plan), and
-    by :func:`workers.enrichment_agent._proactive_search` to pick which
-    concepts to search the open web for.
-
-    Returns an empty list if the graph is missing or the query fails —
-    caller should treat sparse-concept hints as best-effort.
-    """
     if limit <= 0:
         return []
     try:

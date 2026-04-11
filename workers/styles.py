@@ -169,21 +169,8 @@ def list_code_styles() -> list[dict]:
     return [{"key": k, "prompt": v} for k, v in CODE_STYLES.items()]
 
 
-# --- Search context templates (style-adaptive) ----------------------------
-#
-# These templates replace the old fixed search-context block in
-# workers.web_search.run_web_search. The intent classifier picks an
-# intent; the intent maps to a template key (see workers.web_search.
-# INTENT_RESPONSE_TEMPLATE); this dict supplies the actual system-message
-# body the chat model sees alongside the extracted facts.
-#
-# UNIVERSAL RULE: none of these templates instruct the model to emit
-# numbered citations like "[1]" or "[2]" inline in its response. Source
-# attribution is now handled by the frontend (rendered as chips / a side
-# panel) — the chat response itself stays pure prose. Each template
-# enforces this explicitly so the model can't fall back to its default
-# citation behaviour.
-
+# Templates never instruct the model to emit numbered citations; the UI
+# renders source attribution separately from the prose.
 _NO_INLINE_CITATIONS = (
     "Do NOT include numbered citations like [1] or [2] in your response. "
     "Do NOT list sources at the end of your reply. The UI renders source "
@@ -191,7 +178,6 @@ _NO_INLINE_CITATIONS = (
 )
 
 SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
-    # contextual_enrichment — facts woven in invisibly, friend-who-knows
     "conversational_weave": (
         "BACKGROUND FACTS (from web search): the user mentioned real-world "
         "things in their message. The facts below are available for "
@@ -204,7 +190,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         + _NO_INLINE_CITATIONS
     ),
 
-    # factual_lookup — direct answer style
     "direct_answer": (
         "SEARCH RESULTS: the user asked for a specific fact. Lead with the "
         "answer in one sentence. One follow-up sentence of context if "
@@ -213,7 +198,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "no bullets, no preamble. " + _NO_INLINE_CITATIONS
     ),
 
-    # explanatory — progressive build-up
     "explanatory": (
         "SEARCH RESULTS: the user asked to understand a concept. Build "
         "progressively — core idea first, then mechanism, then a concrete "
@@ -222,7 +206,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "where it matters for trust. " + _NO_INLINE_CITATIONS
     ),
 
-    # recommendation — casual options list in prose
     "recommendation": (
         "SEARCH RESULTS: the user is looking for options. Suggest 2-4 "
         "choices, one casual sentence per option explaining why it might "
@@ -232,7 +215,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "where the sources provide them. " + _NO_INLINE_CITATIONS
     ),
 
-    # comparison — structured comparison with optional small table
     "comparison": (
         "SEARCH RESULTS: the user is comparing options. Cover each "
         "option's strengths and tradeoffs in plain prose. Use a small "
@@ -242,7 +224,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         + _NO_INLINE_CITATIONS
     ),
 
-    # research_synthesis — formal authority-weighted synthesis
     "research_synthesis": (
         "SEARCH RESULTS: the user is researching a non-trivial topic. "
         "Synthesise across the sources below into an authority-weighted "
@@ -253,7 +234,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "carry information. " + _NO_INLINE_CITATIONS
     ),
 
-    # troubleshooting — diagnostic flow
     "troubleshooting": (
         "SEARCH RESULTS: the user has a problem. Lead with the most "
         "likely cause based on the sources. Give the specific fix or "
@@ -262,7 +242,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "with general advice. " + _NO_INLINE_CITATIONS
     ),
 
-    # code_lookup — actual signature first
     "code_lookup": (
         "SEARCH RESULTS: the user is looking up an API or syntax. Lead "
         "with the actual signature or example code in a fenced code "
@@ -271,7 +250,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "only. " + _NO_INLINE_CITATIONS
     ),
 
-    # code_debug — fix-focused
     "code_debug": (
         "SEARCH RESULTS: the user has a code error. Lead with the "
         "diagnosed cause from the sources. Show the fix in a fenced code "
@@ -279,7 +257,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "lecture on best practices. " + _NO_INLINE_CITATIONS
     ),
 
-    # code_build — example-driven
     "code_build": (
         "SEARCH RESULTS: the user is building something with a named "
         "library. Use the example code from the sources as a reference "
@@ -287,15 +264,12 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "reply. " + _NO_INLINE_CITATIONS
     ),
 
-    # task_confirm — for task routes (no search context body needed,
-    # but kept here so the lookup never raises KeyError)
     "task_confirm": (
         "TASK CONTEXT: the user gave you a command. Confirm what you "
         "did in one sentence. No preamble."
     ),
 
-    # Intents that never fire search — empty body means the caller
-    # skips the payload append entirely. Included for completeness so
+    # Empty bodies for intents that never fire search — kept so
     # search_context_for() never raises KeyError.
     "chitchat_casual": "",
     "code_explain": "",
@@ -308,11 +282,6 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
 
 
 def search_context_for(template_key: str) -> str:
-    """Return the search-context system message body for an intent template.
-
-    Falls back to ``direct_answer`` for unknown keys (safe default — direct
-    answers are usable for any intent).
-    """
     return SEARCH_CONTEXT_TEMPLATES.get(
         template_key,
         SEARCH_CONTEXT_TEMPLATES["direct_answer"],

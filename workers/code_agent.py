@@ -74,8 +74,6 @@ def _render_files_block(files: list[dict] | None) -> str:
 
 
 def _files_to_storage(files: list[dict] | None) -> list[dict]:
-    """Normalise an incoming files payload to plain {name, content} for
-    persistence. Accepts either base64 (`content_b64`) or plain (`content`)."""
     if not files:
         return []
     out: list[dict] = []
@@ -89,8 +87,6 @@ def _files_to_storage(files: list[dict] | None) -> list[dict]:
 
 
 def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> list[str]:
-    """Fast-model parse of a plan into an ordered checklist of step strings.
-    Returns [] on failure — caller should tolerate."""
     if not plan_text.strip():
         return []
     prompt = (
@@ -142,9 +138,6 @@ class CodeAgent(ChatAgent):
         self.files = files or []
 
     def _load_workspace(self, conversation_id: int) -> list[dict]:
-        """Pull the most recent non-empty files_json from this conversation's
-        user messages. Used to re-hydrate the file workspace on follow-up
-        turns so the client doesn't need to resend attachments."""
         try:
             msgs = self.db.list_code_messages(conversation_id)
         except Exception as e:
@@ -279,7 +272,6 @@ class CodeAgent(ChatAgent):
 
         payload: list[dict] = [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
-            # Current date/time injection — see workers.web_search.build_temporal_context
             {"role": "system", "content": build_temporal_context()},
             {"role": "system", "content": system_prompt},
         ]
@@ -292,9 +284,8 @@ class CodeAgent(ChatAgent):
                     "guessing.\n\n" + codebase_context
                 ),
             })
-        # style last: closest to history without breaking turn alternation.
-        # If the model's template supports interleaved system messages, move
-        # this append to immediately before the user turn instead.
+        # style placed last so it sits closest to the user turn without
+        # breaking history/turn alternation.
         payload.append({"role": "system", "content": style_prompt})
         payload.extend(history)
         payload.append({"role": "user", "content": composed_message})
@@ -399,7 +390,6 @@ class CodeAgent(ChatAgent):
         codebase_collection: str | None = None,
         response_style: str | None = None,
     ) -> Iterator[dict]:
-        """Sync wrapper for callers that need a generator."""
         from workers.jobs import Job
         job = Job(uuid.uuid4().hex)
         self.run_job(
