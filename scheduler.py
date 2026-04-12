@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
+from workers.batch_summarise import run_batch_summarise
 from workers.enrichment.cycle import run_enrichment_cycle, run_log_cleanup
 from workers.enrichment.db import EnrichmentDB
 
@@ -156,6 +157,14 @@ def start_scheduler() -> BackgroundScheduler:
         run_log_cleanup,
         CronTrigger(hour=2, minute=0),
         id="enrichment_log_cleanup",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    sched.add_job(
+        run_batch_summarise,
+        CronTrigger(hour=18, minute=0),  # 4am AEST = 18:00 UTC
+        id="batch_summarise",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

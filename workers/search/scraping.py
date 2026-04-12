@@ -24,13 +24,13 @@ _log = logging.getLogger("web_search.scraping")
 
 
 def _looks_like_real_text(text: str) -> bool:
-    if not text or len(text) < 200:
+    if not text or len(text) < 80:
         return False
     printable = sum(1 for c in text if c.isprintable() or c.isspace())
-    if printable / len(text) < 0.90:
+    if printable / len(text) < 0.85:
         return False
     words = text.split()
-    if len(words) < 50:
+    if len(words) < 15:
         return False
     avg_word_len = sum(len(w) for w in words) / len(words)
     if avg_word_len > 25 or avg_word_len < 2:
@@ -338,7 +338,7 @@ def _scrape_with_httpx(url: str) -> str:
         _log.warning("scrape %d  url=%s (%s)", e.response.status_code, url[:80], e.response.reason_phrase)
         return ""
     except httpx.TimeoutException:
-        _log.warning("scrape timeout after 30s  url=%s", url[:80])
+        _log.warning("scrape timeout after 60s  url=%s", url[:80])
         return ""
     except Exception as e:
         _log.warning("scrape failed  url=%s: %s (%s)", url[:80], type(e).__name__, e)
@@ -436,23 +436,20 @@ def scrape_page(
         _set_meta("scraper", len(text))
         return text
 
-    if source is not None:
-        pw_text = playwright_fetch(url)
-        if pw_text:
-            target_id = source.get("Id")
-            if target_id:
-                try:
-                    from workers.enrichment.db import EnrichmentDB
-                    EnrichmentDB().update_scrape_target(target_id, use_playwright=True)
-                    _log.info("auto-promoted to playwright_direct id=%s", target_id)
-                except Exception as e:
-                    _log.warning("playwright promotion failed id=%s: %s", target_id, e)
-            _log.info("path=playwright_auto  url=%s chars=%d", url[:120], len(pw_text))
-            _set_meta("playwright_auto", len(pw_text))
-            return pw_text
-        _log.info("path=playwright_auto  url=%s failed", url[:120])
-        _set_meta("playwright_auto_failed", len(fallback))
-        return fallback
+    # Playwright fallback for JS-heavy sites — runs for both enrichment and web search.
+    pw_text = playwright_fetch(url)
+    if pw_text:
+        if source and source.get("Id"):
+            try:
+                from workers.enrichment.db import EnrichmentDB
+                EnrichmentDB().update_scrape_target(source["Id"], use_playwright=True)
+                _log.info("auto-promoted to playwright_direct id=%s", source["Id"])
+            except Exception as e:
+                _log.warning("playwright promotion failed id=%s: %s", source.get("Id"), e)
+        _log.info("path=playwright_auto  url=%s chars=%d", url[:120], len(pw_text))
+        _set_meta("playwright_auto", len(pw_text))
+        return pw_text
 
-    _set_meta("fallback", len(fallback))
+    _log.info("path=playwright_auto_failed  url=%s", url[:120])
+    _set_meta("playwright_auto_failed", len(fallback))
     return fallback
