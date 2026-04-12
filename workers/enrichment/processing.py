@@ -75,8 +75,8 @@ def _process_source(
         return 0
 
     _log.info(
-        "source %s stage=scrape done  chars=%d path=%s",
-        target_id, len(text), url, fetch_path,
+        "source %s stage=scrape done  url=%s chars=%d path=%s",
+        target_id, url[:60], len(text), fetch_path,
     )
     new_hash = _content_hash(text)
     is_parent = source.get("parent_target") is None
