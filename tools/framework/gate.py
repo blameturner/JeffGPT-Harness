@@ -57,8 +57,52 @@ _FOLLOW_UP = re.compile(
     re.I,
 )
 
+# Code-mode signals. These apply ONLY when the caller passes mode="code" so
+# the chat flow's behaviour is unchanged. The patterns are intentionally
+# broad because the code agent will be heavily tooled — false positives cost
+# one planner call, false negatives cost stale API documentation.
+_CODE_API_LOOKUP = re.compile(
+    # "how do I X in Python", "what's the syntax for Y", "is there a Z function in <lib>"
+    r"\b(how (do|to)|what(?:'s| is) the (syntax|api|signature)|is there (a|an)|does \w+ (have|support)|"
+    r"which (method|function|class|api|flag))\b"
+    # library / api reference style
+    r"|\b(docs? for|documentation for|reference for|api reference|man page for)\b"
+    # specific libraries the planner should search for
+    r"|\b(asyncio|fastapi|pydantic|sqlalchemy|numpy|pandas|django|flask|react|pytorch|tensorflow|"
+    r"httpx|requests|playwright|langchain|openai sdk|anthropic sdk)\b",
+    re.I,
+)
 
-def gate_check(message: str, conversation_context: str = "") -> set[str]:
+_CODE_ERROR_SIGNALS = re.compile(
+    # python-style errors
+    r"\b(TypeError|ValueError|KeyError|AttributeError|NameError|ImportError|RuntimeError|"
+    r"IndexError|AssertionError|ZeroDivisionError|StopIteration|RecursionError|"
+    r"ModuleNotFoundError|FileNotFoundError|PermissionError|UnicodeDecodeError)\b"
+    # JS-style
+    r"|\b(ReferenceError|SyntaxError|Uncaught|undefined is not a function|cannot read propert)\b"
+    # generic
+    r"|\bstack\s*trace\b|Traceback \(most recent call last\)"
+    # command / shell errors
+    r"|\bcommand not found\b|permission denied|segmentation fault",
+    re.I,
+)
+
+_CODE_RUN_REQUEST = re.compile(
+    # direct run requests ("run this", "execute this") already covered by _CODE_EXEC,
+    # but also: "what's the output of", "what does this function return", "test this snippet"
+    r"\b(what(?:'s| does| is) (the )?(output|result) of"
+    # allow zero or more intervening nouns between this/that/it and the verb
+    r"|what does (this|it|that) (?:\w+\s+){0,3}(print|return|output|give|produce|yield)"
+    r"|test (this|it|that) (?:\w+\s+){0,2}(function|snippet|script|code))\b",
+    re.I,
+)
+
+
+def gate_check(
+    message: str,
+    conversation_context: str = "",
+    mode: str = "chat",
+) -> set[str]:
     """
     Return the set of tool names that *might* be needed.
 
@@ -66,6 +110,10 @@ def gate_check(message: str, conversation_context: str = "") -> set[str]:
     assistant turn). If it contains markers of a prior tool-using turn
     (e.g. "[Tool results"), we drop the threshold for follow-up searches
     like "and what about X?" that otherwise wouldn't trigger.
+
+    mode defaults to "chat". Pass mode="code" from the code agent path to
+    enable additional patterns for API lookups, error traces, and test/run
+    phrasing that the chat-focused heuristics miss.
 
     Examples:
         gate_check("thanks")                                    -> set()
@@ -75,10 +123,14 @@ def gate_check(message: str, conversation_context: str = "") -> set[str]:
         gate_check("and what about Melbourne?",
                    conversation_context="[Tool results — Sydney weather]")
                                                                 -> {"web_search"}
+        gate_check("how do I use asyncio.gather?", mode="code") -> {"web_search"}
+        gate_check("TypeError: cannot ...", mode="code")        -> {"web_search","rag_lookup"}
     """
     msg = (message or "").strip()
     if not msg:
         return set()
+
+    is_code = (mode or "chat").lower() == "code"
 
     # Definitely-no-search still allows rag_lookup + code_exec on short conversational turns.
     if _definitely_no_search(msg):
@@ -91,6 +143,15 @@ def gate_check(message: str, conversation_context: str = "") -> set[str]:
         if conversation_context and _FOLLOW_UP.search(msg):
             if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
                 hints.add("web_search")
+        # Code-mode extras — API/doc lookups can appear in short turns too.
+        if is_code:
+            if _CODE_API_LOOKUP.search(msg):
+                hints.add("web_search")
+            if _CODE_ERROR_SIGNALS.search(msg):
+                hints.add("web_search")
+                hints.add("rag_lookup")
+            if _CODE_RUN_REQUEST.search(msg):
+                hints.add("code_exec")
         return hints
 
     hints: set[str] = set()
@@ -100,6 +161,16 @@ def gate_check(message: str, conversation_context: str = "") -> set[str]:
         hints.add("rag_lookup")
     if _CODE_EXEC.search(msg) or "```" in msg:
         hints.add("code_exec")
+
+    # Code-mode augments — broader coverage for API lookups and error traces.
+    if is_code:
+        if _CODE_API_LOOKUP.search(msg):
+            hints.add("web_search")
+        if _CODE_ERROR_SIGNALS.search(msg):
+            hints.add("web_search")
+            hints.add("rag_lookup")
+        if _CODE_RUN_REQUEST.search(msg):
+            hints.add("code_exec")
 
     # Context-aware follow-up: pulls in web_search for vague continuations.
     if "web_search" not in hints and conversation_context and _FOLLOW_UP.search(msg):

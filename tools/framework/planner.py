@@ -63,6 +63,12 @@ User: Write me a Python function that calculates fibonacci
 User: What did we discuss about the Prodigi auth migration?
 {"actions":[{"tool":"rag_lookup","params":{"query":"Prodigi auth migration"},"reason":"retrieve prior context"}],"summary":"Searching our previous discussions..."}
 
+User: How do I use asyncio.gather with a semaphore in Python?
+{"actions":[{"tool":"web_search","params":{"queries":["asyncio.gather semaphore pattern python","asyncio bounded concurrency example","python asyncio Semaphore with gather"]},"reason":"API usage lookup"}],"summary":"Looking up the asyncio.gather + semaphore pattern..."}
+
+User: TypeError: 'NoneType' object is not subscriptable — in get_user()
+{"actions":[{"tool":"rag_lookup","params":{"query":"get_user None subscriptable TypeError"},"reason":"check prior context on this function"},{"tool":"web_search","params":{"queries":["python TypeError NoneType object is not subscriptable common cause","python None return value unpacking"]},"reason":"diagnose error class"}],"summary":"Checking past discussion and common causes..."}
+
 User: Compare the latest iPhone vs Samsung Galaxy pricing in Australia
 {"actions":[{"tool":"web_search","params":{"queries":["iPhone latest price Australia 2026","Samsung Galaxy latest price Australia 2026","iPhone vs Samsung comparison review"]},"reason":"current pricing + reviews"}],"summary":"Checking current Australian pricing on both phones..."}
 

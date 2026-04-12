@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -10,10 +11,14 @@ from typing import Iterator, Literal
 
 import requests
 
-from config import BASE_SYSTEM_PROMPT
+from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED
 from workers.search.temporal import build_temporal_context
 from memory import remember
 from rag import retrieve
+from tools.framework.contract import ToolContext
+from tools.framework.dispatcher import execute_plan
+from tools.framework.gate import gate_check
+from tools.framework.planner import generate_plan
 from workers.chat_agent import ChatAgent
 from workers.styles import code_style_prompt
 
@@ -254,6 +259,66 @@ class CodeAgent(ChatAgent):
             except Exception:
                 _log.error("codebase RAG retrieve failed", exc_info=True)
 
+        # Tools framework — gate → plan → dispatch. Shares the same flag as chat
+        # so ops can disable the whole pipeline in one place. Emits tool_status
+        # events through the same STORE channel the frontend already handles.
+        tool_context: ToolContext = ToolContext()
+        if TOOLS_FRAMEWORK_ENABLED:
+            last_assistant = ""
+            for turn in reversed(history):
+                if turn.get("role") == "assistant":
+                    last_assistant = (turn.get("content") or "")[:800]
+                    break
+            hints = gate_check(
+                user_message,
+                conversation_context=last_assistant,
+                mode="code",
+            )
+            _log.info("tools gate  conv=%s mode=%s hints=%s",
+                      conversation_id, self.mode, sorted(hints) or "[]")
+
+            if hints:
+                async def _plan_and_run() -> ToolContext:
+                    convo_summary = ""
+                    if history:
+                        last = history[-1].get("content") or ""
+                        convo_summary = last[:200]
+                    plan = await generate_plan(
+                        user_message=user_message,
+                        hints=hints,
+                        conversation_summary=convo_summary,
+                    )
+                    if plan is None:
+                        return ToolContext()
+                    # Inject scope into each action's params. Code sessions have
+                    # their own memory collection plus the attached codebase (if
+                    # any); rag_lookup uses whichever it receives in params.
+                    code_collection = f"code_{conversation_id}" if conversation_id else "code_knowledge"
+                    for a in plan.actions:
+                        a.params["_org_id"] = self.org_id
+                        a.params["_collection"] = code_collection
+                        # Widen rag_lookup to the cross-session code collections
+                        # plus the attached codebase_collection if present.
+                        if a.tool.value == "rag_lookup" and "collections" not in a.params:
+                            cols = [code_collection, "code_knowledge"]
+                            if codebase_collection:
+                                cols.append(codebase_collection)
+                            a.params["collections"] = cols
+                    emit({
+                        "type": "tool_status",
+                        "phase": "planning",
+                        "summary": plan.summary,
+                        "tools": [a.tool.value for a in plan.actions],
+                    })
+                    return await execute_plan(plan, emit)
+
+                try:
+                    tool_context = asyncio.run(_plan_and_run())
+                except Exception:
+                    _log.error("tools framework failed  conv=%s",
+                               conversation_id, exc_info=True)
+                    tool_context = ToolContext()
+
         storage_files = _files_to_storage(self.files)
         if conversation_id is not None:
             try:
@@ -284,6 +349,9 @@ class CodeAgent(ChatAgent):
                     "guessing.\n\n" + codebase_context
                 ),
             })
+        tool_block = tool_context.to_system_block()
+        if tool_block:
+            payload.append({"role": "system", "content": tool_block})
         # style placed last so it sits closest to the user turn without
         # breaking history/turn alternation.
         payload.append({"role": "system", "content": style_prompt})
