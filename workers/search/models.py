@@ -221,3 +221,48 @@ def tool_slot() -> Iterator[None]:
     """Deprecated — prefer `acquire_model("tool")`."""
     with acquire_model("tool"):
         yield
+
+
+# ---------- Config-driven role acquisition ----------
+
+@contextmanager
+def acquire_role(role: str, priority: bool = False) -> Iterator[tuple[str | None, str | None]]:
+    """
+    Acquire a slot for a specific model role (from config.json).
+
+    Unlike acquire_model(pool), this targets a single named role directly
+    rather than picking from a pool. Used by the config-driven model_call()
+    dispatch.
+
+    Yields (url, model_id). If the role isn't in the model catalog,
+    yields (None, None) without acquiring a slot.
+    """
+    entry = MODELS.get(role)
+    if not isinstance(entry, dict) or not entry.get("url"):
+        _log.error(
+            "acquire_role: role=%s not in catalog. available=%s",
+            role,
+            sorted({v.get("role") for v in MODELS.values() if isinstance(v, dict)}),
+        )
+        yield None, None
+        return
+
+    if priority:
+        _user_requests_waiting.set()
+
+    sem = _sem_for(role)
+    if not sem.acquire(blocking=False):
+        _log.info("role=%s slot busy — blocking (priority=%s)", role, priority)
+        sem.acquire(blocking=True)
+
+    if priority:
+        _user_requests_waiting.clear()
+
+    url = entry.get("url")
+    model_id = entry.get("model_id") or role
+    free_now = _free_slots(sem)
+    _log.info("role=%s acquired free_after=%d (priority=%s)", role, free_now, priority)
+    try:
+        yield url, model_id
+    finally:
+        sem.release()

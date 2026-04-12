@@ -6,7 +6,8 @@ import re
 from collections import Counter
 from typing import Any
 
-from workers.enrichment.models import _tool_call
+from config import get_function_config
+from workers.enrichment.models import model_call
 from workers.search.urls import _strip_injection_patterns
 
 _log = logging.getLogger("enrichment_agent.quality")
@@ -19,7 +20,7 @@ CONTENT_TYPE_ENUM = CONTENT_TYPE_ACCEPT | CONTENT_TYPE_SOFT_ACCEPT | CONTENT_TYP
 VALIDATOR_MIN_LEN = 150
 VALIDATOR_MIN_UNIQUE_RATIO = 0.15
 VALIDATOR_MAX_TOP5_LINE_RATIO = 0.40
-VALIDATOR_CLASSIFIER_CHAR_BUDGET = 1500
+VALIDATOR_CLASSIFIER_CHAR_BUDGET = get_function_config("enrichment_quality").get("max_input_chars", 1500)
 
 _INJECTION_RESIDUE = re.compile(
     r"\[redacted\]|<\|im_(?:start|end)\|>|\[/?INST\]|<<SYS>>|<</SYS>>",
@@ -103,7 +104,7 @@ def _classify_content_type(text: str) -> tuple[str | None, str, int]:
     excerpt = text[:VALIDATOR_CLASSIFIER_CHAR_BUDGET].strip()
     excerpt = re.sub(r"\s+", " ", excerpt)
     prompt = _CLASSIFIER_PROMPT_TEMPLATE.format(excerpt=excerpt)
-    raw, tokens = _tool_call(prompt, max_tokens=6, temperature=0.0)
+    raw, tokens = model_call("enrichment_quality", prompt)
     if not raw:
         return None, "", 0
     cleaned = raw.strip().strip("`\"' ").upper()
@@ -138,7 +139,7 @@ def _looks_like_injection(text: str) -> tuple[bool, str, int]:
     end = min(len(text), m.end() + 200)
     span = text[start:end].strip()
     prompt = _INJECTION_CHECK_PROMPT.format(span=span[:800])
-    raw, tokens = _tool_call(prompt, max_tokens=4, temperature=0.0)
+    raw, tokens = model_call("enrichment_quality", prompt, max_tokens=4)
     if not raw:
         # fail open — don't reject valid content because model is unavailable
         return False, "injection_check_unavailable", 0

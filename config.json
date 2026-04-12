@@ -1,0 +1,24 @@
+{
+  "models": {
+    "chat":                       { "role": "t1_primary" },
+    "code":                       { "role": "t1_primary" },
+    "tool_planner":               { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 200,  "max_input_chars": 1000 },
+    "intent_classifier":          { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 300,  "max_input_chars": 2000 },
+    "search_extraction":          { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500,  "max_input_chars": 12000 },
+    "search_source_suggestion":   { "role": "t3_tool",    "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000 },
+    "enrichment_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000 },
+    "enrichment_relationships":   { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 1200, "max_input_chars": 8000 },
+    "enrichment_quality":         { "role": "t3_tool",    "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500 },
+    "enrichment_source_discovery": { "role": "t3_tool",   "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000 },
+    "batch_summarise":            { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 800,  "max_input_chars": 24000 }
+  },
+  "features": {
+    "web_search": true,
+    "enrichment": true,
+    "tools_framework": true,
+    "batch_summarise": true,
+    "search_extraction": true,
+    "search_source_suggestion": true,
+    "intent_classifier": true
+  }
+}

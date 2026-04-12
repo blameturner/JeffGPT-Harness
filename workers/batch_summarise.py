@@ -12,17 +12,16 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import no_think_params
+from config import get_function_config
 from nocodb_client import NocodbClient
 from workers.enrichment.db import EnrichmentDB
-from workers.search.models import acquire_model
+from workers.enrichment.models import model_call
 
 _log = logging.getLogger("batch.summarise")
 
 SUMMARY_MIN_MESSAGES = 10
 SUMMARY_MIN_CHARS = 8000
 MAX_CONVERSATIONS_PER_RUN = 20
-MAX_TRANSCRIPT_CHARS = 16_000
 
 
 def _summarise_conversation(
@@ -33,6 +32,9 @@ def _summarise_conversation(
     table_type: str,
 ) -> bool:
     """Summarise a single conversation. Returns True on success."""
+    cfg = get_function_config("batch_summarise")
+    max_transcript = cfg.get("max_input_chars", 24000)
+
     keep_tail = 4
     old = messages[:-keep_tail] if len(messages) > keep_tail else []
     if not old:
@@ -42,45 +44,21 @@ def _summarise_conversation(
     chars = 0
     for m in old:
         line = f"{m.get('role', 'user').upper()}: {m.get('content') or ''}\n"
-        if chars + len(line) > MAX_TRANSCRIPT_CHARS:
+        if chars + len(line) > max_transcript:
             break
         transcript_parts.append(line)
         chars += len(line)
     transcript = "".join(transcript_parts)
 
-    try:
-        with acquire_model("tool") as (url, model_id):
-            if not url:
-                _log.warning("batch summarise: no tool model available")
-                return False
+    prompt = (
+        "Compress this chat history into a concise factual summary "
+        "(<= 400 words). Preserve names, decisions, open questions, "
+        "and instructions. No preamble.\n\n"
+        f"{transcript}"
+    )
 
-            import httpx
-            resp = httpx.post(
-                f"{url}/v1/chat/completions",
-                json={
-                    "model": model_id,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Compress this chat history into a concise factual summary "
-                                "(<= 400 words). Preserve names, decisions, open questions, "
-                                "and instructions. No preamble."
-                            ),
-                        },
-                        {"role": "user", "content": transcript},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 800,
-                    **no_think_params(),
-                },
-                timeout=3600,
-            )
-            resp.raise_for_status()
-            msg = resp.json()["choices"][0]["message"]
-            summary = (msg.get("content") or "").strip()
-            if not summary and msg.get("reasoning_content"):
-                summary = msg["reasoning_content"].strip()
+    try:
+        summary, _tokens = model_call("batch_summarise", prompt)
     except Exception:
         _log.error("batch summarise model call failed  %s conv=%s", table_type, conv_id, exc_info=True)
         return False

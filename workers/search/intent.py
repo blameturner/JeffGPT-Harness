@@ -5,10 +5,7 @@ import logging
 import re
 import time
 
-import httpx
-
-from config import no_think_params
-from workers.search.models import acquire_model
+from config import is_feature_enabled
 from workers.search.temporal import build_prompt_date_header
 
 _log = logging.getLogger("web_search.intent")
@@ -310,32 +307,26 @@ def classify_message_intent(
         result["classifier_raw"] = "heuristic_skip"
         return result
 
+    if not is_feature_enabled("intent_classifier"):
+        _log.info("intent classifier disabled, using heuristic fallback")
+        return _fallback_intent()
+
+    from config import get_function_config
+    cfg = get_function_config("intent_classifier")
+
     prompt = _INTENT_CLASSIFIER_PROMPT.format(
         date_header=build_prompt_date_header(),
         history=_format_history_for_classifier(history),
-        message=msg[:1500],
+        message=msg[:cfg.get("max_input_chars", 2000)],
     )
 
     started = time.time()
     try:
-        with acquire_model("tool") as (tool_url, tool_model):
-            if not tool_url:
-                _log.warning("intent classifier: no tool model available, using fallback")
-                return _fallback_intent()
-            _log.info("intent classify start  model=%s", tool_model)
-            resp = httpx.post(
-                f"{tool_url}/v1/chat/completions",
-                json={
-                    "model": tool_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 200,
-                    **no_think_params(),
-                },
-                timeout=3600,
-            )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
+        from workers.enrichment.models import model_call
+        raw, _tokens = model_call("intent_classifier", prompt)
+        if not raw:
+            _log.warning("intent classifier: empty response, using fallback")
+            return _fallback_intent()
     except Exception as e:
         _log.warning("intent classifier failed: %s", e)
         return _fallback_intent()

@@ -7,7 +7,7 @@ import re
 from config import CATEGORY_COLLECTIONS
 from graph import get_sparse_concepts
 from workers.enrichment.db import EnrichmentDB
-from workers.enrichment.models import _tool_call
+from workers.enrichment.models import model_call
 from workers.enrichment.sources import _verify_url_reachable
 from workers.enrichment.summarise import _salvage_json_array
 from workers.search.engine import searxng_search
@@ -86,7 +86,7 @@ def _proactive_search(
             "Return a JSON array. If NONE are worth monitoring, return []. "
             "Be very selective — most search results are NOT good monitoring targets."
         )
-        raw, tokens = _tool_call(prompt, max_tokens=400)
+        raw, tokens = model_call("enrichment_source_discovery", prompt)
         total_tokens += tokens
         if not raw:
             continue

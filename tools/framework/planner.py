@@ -18,10 +18,9 @@ import time
 
 import httpx
 
-from config import no_think_params
+from config import get_function_config, no_think_params
 from tools.framework.contract import ToolPlan
-from workers.enrichment.models import _assert_not_reasoner
-from workers.search.models import acquire_model
+from workers.search.models import acquire_role
 
 _log = logging.getLogger("tools.planner")
 
@@ -55,6 +54,8 @@ async def generate_plan(
     Returns None if the planner fails, times out, or decides no tools are needed.
     Fail-open — never raises. Caller proceeds without tools on None.
     """
+    cfg = get_function_config("tool_planner")
+
     user_prompt_parts: list[str] = []
     if conversation_summary:
         user_prompt_parts.append(f"Conversation context: {conversation_summary}")
@@ -64,11 +65,10 @@ async def generate_plan(
 
     t0 = time.time()
     try:
-        with acquire_model("tool", priority=True) as (tool_url, tool_model_id):
+        with acquire_role(cfg["role"], priority=True) as (tool_url, tool_model_id):
             if not tool_url:
                 _log.warning("no tool model available — skipping plan")
                 return None
-            _assert_not_reasoner(tool_url)
             _log.info("planner call  model=%s url=%s", tool_model_id, tool_url)
             async with httpx.AsyncClient(timeout=3600.0) as client:
                 resp = await client.post(
@@ -79,8 +79,8 @@ async def generate_plan(
                             {"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": "\n".join(user_prompt_parts)},
                         ],
-                        "temperature": 0.1,
-                        "max_tokens": 200,
+                        "temperature": cfg.get("temperature", 0.1),
+                        "max_tokens": cfg.get("max_tokens", 200),
                         **no_think_params(),
                     },
                 )

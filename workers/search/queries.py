@@ -5,8 +5,6 @@ import logging
 import re
 import time
 
-import httpx
-
 from workers.search.intent import (
     CHAT_INTENT_CHITCHAT,
     CHAT_INTENT_COMPARISON,
@@ -21,8 +19,7 @@ from workers.search.intent import (
     CODE_INTENT_LOOKUP,
     TASK_INTENT_SEARCH_EXPLICIT,
 )
-from config import no_think_params
-from workers.search.models import _tool_model
+from workers.enrichment.models import model_call
 from workers.search.temporal import build_prompt_date_header, now_in_chat_tz
 
 _log = logging.getLogger("web_search.queries")
@@ -178,10 +175,6 @@ def rerank_candidates(
     if not candidates:
         return []
 
-    tool_url, tool_model = _tool_model()
-    if not tool_url:
-        return [(c, 3) for c in candidates]
-
     head = candidates[:max_candidates]
     intent_label = intent_dict.get("intent") or "chitchat"
     entities = intent_dict.get("entities") or []
@@ -211,22 +204,12 @@ def rerank_candidates(
 
     started = time.time()
     try:
-        _log.info("rerank start  model=%s candidates=%d", tool_model, len(head))
-        resp = httpx.post(
-            f"{tool_url}/v1/chat/completions",
-            json={
-                "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 80,
-                **no_think_params(),
-            },
-            timeout=3600,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        _log.info("rerank start  candidates=%d", len(head))
+        raw, _tokens = model_call("tool_planner", prompt, max_tokens=80, temperature=0.0)
+        if not raw:
+            return [(c, 3) for c in candidates]
     except Exception as e:
-        _log.warning("rerank failed  model=%s: %s — passing candidates through", tool_model, e)
+        _log.warning("rerank failed: %s — passing candidates through", e)
         return [(c, 3) for c in candidates]
 
     elapsed = round(time.time() - started, 2)
@@ -425,10 +408,6 @@ def reformulate_query(
     original_query: str,
     intent_dict: dict,
 ) -> str | None:
-    tool_url, tool_model = _tool_model()
-    if not tool_url:
-        return None
-
     entities = intent_dict.get("entities") or []
     intent = intent_dict.get("intent") or "unknown"
     entities_str = ", ".join(entities[:5]) if entities else "(none extracted)"
@@ -444,22 +423,12 @@ def reformulate_query(
         "around the whole thing, no preamble.\n\nSimpler query:"
     )
     try:
-        _log.info("query reformulate start  model=%s", tool_model)
-        resp = httpx.post(
-            f"{tool_url}/v1/chat/completions",
-            json={
-                "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 60,
-                **no_think_params(),
-            },
-            timeout=3600,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        _log.info("query reformulate start")
+        raw, _tokens = model_call("tool_planner", prompt, max_tokens=60, temperature=0.0)
+        if not raw:
+            return None
     except Exception as e:
-        _log.warning("query reformulation failed  model=%s: %s", tool_model, e)
+        _log.warning("query reformulation failed: %s", e)
         return None
 
     cleaned = raw.strip()

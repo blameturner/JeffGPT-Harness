@@ -6,11 +6,10 @@ import re
 import threading
 import time
 
-import httpx
-
-from config import CATEGORY_COLLECTIONS
+from config import CATEGORY_COLLECTIONS, get_function_config, is_feature_enabled
 from memory import remember
-from workers.search.engine import FAST_TIMEOUT, _dedupe, searxng_search
+from workers.enrichment.models import model_call
+from workers.search.engine import _dedupe, searxng_search
 from workers.search.extraction import extract_from_pages
 from workers.search.intent import (
     SEARCH_POLICY_CONTEXTUAL,
@@ -19,7 +18,6 @@ from workers.search.intent import (
     SEARCH_POLICY_NONE,
     classify_message_intent,
 )
-from workers.search.models import _tool_model
 from workers.search.queries import (
     build_failure_context,
     generate_search_queries,
@@ -224,11 +222,12 @@ def _run_search_inner(
     )
 
     summaries_for_suggest = [(e["title"], e["url"], e["summary"]) for e in results]
-    threading.Thread(
-        target=_suggest_sources_from_search,
-        args=(summaries_for_suggest, query, org_id),
-        daemon=True,
-    ).start()
+    if is_feature_enabled("search_source_suggestion"):
+        threading.Thread(
+            target=_suggest_sources_from_search,
+            args=(summaries_for_suggest, query, org_id),
+            daemon=True,
+        ).start()
 
     return context_block, sources, confidence
 
@@ -283,9 +282,7 @@ def _suggest_sources_from_search(
     if not summaries:
         return
 
-    tool_url, tool_model = _tool_model()
-    if not tool_url:
-        return
+    cfg = get_function_config("search_source_suggestion")
 
     sources_text = "\n".join(
         f"{i+1}. {title} ({url})\n   {summary[:300]}"
@@ -319,20 +316,11 @@ def _suggest_sources_from_search(
     )
 
     try:
-        resp = httpx.post(
-            f"{tool_url}/v1/chat/completions",
-            json={
-                "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 400,
-            },
-            timeout=FAST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw, _tokens = model_call("search_source_suggestion", prompt)
     except Exception:
         _log.debug("search suggestion evaluation failed", exc_info=True)
+        return
+    if not raw:
         return
 
     try:

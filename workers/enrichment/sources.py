@@ -6,9 +6,9 @@ import re
 
 import httpx
 
-from config import CATEGORY_COLLECTIONS, MAX_SUMMARY_INPUT_CHARS
+from config import CATEGORY_COLLECTIONS, get_function_config
 from workers.enrichment.db import EnrichmentDB
-from workers.enrichment.models import _tool_call
+from workers.enrichment.models import model_call
 from workers.enrichment.summarise import _salvage_json_array
 
 _log = logging.getLogger("enrichment_agent.sources")
@@ -69,9 +69,9 @@ def _discover_sources(
         "  7 = probably meets criteria, below 7 = uncertain or missing a criterion\n\n"
         "If NO sources meet ALL criteria, return []. Be selective — 0 suggestions "
         "is better than a weak suggestion.\n\n"
-        f"CONTENT:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
+        f"CONTENT:\n{text[:get_function_config('enrichment_source_discovery').get('max_input_chars', 3000)]}"
     )
-    raw, tokens = _tool_call(prompt, max_tokens=600)
+    raw, tokens = model_call("enrichment_source_discovery", prompt)
     if not raw:
         _log.debug("discover_sources returned empty from %s", source_url[:80])
         return tokens

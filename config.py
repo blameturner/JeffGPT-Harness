@@ -1,14 +1,94 @@
+import json
 import os
 import re
 import time
 import subprocess
 import requests
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 _log = logging.getLogger("config")
 
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Platform config (config.json)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MODELS: dict[str, dict] = {
+    "chat":                      {"role": "t1_primary"},
+    "code":                      {"role": "t1_primary"},
+    "tool_planner":              {"role": "t3_tool",   "temperature": 0.1, "max_tokens": 200,  "max_input_chars": 1000},
+    "intent_classifier":         {"role": "t3_tool",   "temperature": 0.1, "max_tokens": 300,  "max_input_chars": 2000},
+    "search_extraction":         {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 500,  "max_input_chars": 12000},
+    "search_source_suggestion":  {"role": "t3_tool",   "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
+    "enrichment_summarise":      {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000},
+    "enrichment_relationships":  {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 1200, "max_input_chars": 8000},
+    "enrichment_quality":        {"role": "t3_tool",   "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500},
+    "enrichment_source_discovery": {"role": "t3_tool", "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
+    "batch_summarise":           {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 24000},
+}
+
+_DEFAULT_FEATURES: dict[str, bool] = {
+    "web_search": True,
+    "enrichment": True,
+    "tools_framework": True,
+    "batch_summarise": True,
+    "search_extraction": True,
+    "search_source_suggestion": True,
+    "intent_classifier": True,
+}
+
+
+def load_platform_config() -> dict:
+    """Load config.json from project root, merge with defaults."""
+    config_path = Path(__file__).parent / "config.json"
+    user_cfg: dict = {}
+    if config_path.is_file():
+        try:
+            with open(config_path) as f:
+                user_cfg = json.load(f)
+            _log.info("platform config loaded from %s", config_path)
+        except Exception as e:
+            _log.error("failed to load config.json, using defaults: %s", e)
+
+    # Deep-merge models: user overrides per-function, defaults fill gaps.
+    models = {}
+    user_models = user_cfg.get("models", {})
+    for fn_name, defaults in _DEFAULT_MODELS.items():
+        merged = {**defaults}
+        if fn_name in user_models:
+            merged.update({k: v for k, v in user_models[fn_name].items() if v is not None})
+        models[fn_name] = merged
+
+    # Features: user overrides per-toggle, defaults fill gaps.
+    features = {**_DEFAULT_FEATURES}
+    features.update(user_cfg.get("features", {}))
+
+    return {"models": models, "features": features}
+
+
+PLATFORM: dict = load_platform_config()
+
+
+def get_function_config(function_name: str) -> dict:
+    """Return model config for a named function.
+
+    Returns dict with keys: role, temperature, max_tokens, max_input_chars.
+    Falls back to defaults if function_name is unknown.
+    """
+    cfg = PLATFORM.get("models", {}).get(function_name)
+    if cfg:
+        return cfg
+    _log.warning("unknown function %r in platform config, using t3_tool default", function_name)
+    return {"role": "t3_tool", "temperature": 0.2, "max_tokens": 200, "max_input_chars": 2000}
+
+
+def is_feature_enabled(name: str) -> bool:
+    """Check if a feature toggle is enabled. Defaults to True if unknown."""
+    return PLATFORM.get("features", {}).get(name, True)
 
 MODEL_DISCOVERY_TIMEOUT_S = int(os.getenv("MODEL_DISCOVERY_TIMEOUT_S", "60"))
 MODEL_DISCOVERY_INTERVAL_S = 2
@@ -192,7 +272,7 @@ NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
-TOOLS_FRAMEWORK_ENABLED = os.getenv("TOOLS_FRAMEWORK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+TOOLS_FRAMEWORK_ENABLED = is_feature_enabled("tools_framework")
 
 BASE_SYSTEM_PROMPT = (
     "You are JeffGPT, a direct and capable AI assistant. "

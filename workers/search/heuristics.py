@@ -4,10 +4,7 @@ import json
 import logging
 import re
 
-import httpx
-
-from config import no_think_params
-from workers.search.models import _tool_model
+from workers.enrichment.models import model_call
 
 _log = logging.getLogger("web_search.heuristics")
 
@@ -81,10 +78,6 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
         _log.info("search skip (heuristic): short conversational message")
         return False, "", ""
 
-    tool_url, tool_model = _tool_model()
-    if not tool_url:
-        return False, "", ""
-
     prompt = (
         "Decide whether answering this user message would benefit from a web search. "
         "Lean towards YES — it's better to search and find nothing than to miss "
@@ -109,20 +102,10 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
         f"Message: {msg[:500]}"
     )
     try:
-        _log.info("heuristic classify start  model=%s", tool_model)
-        resp = httpx.post(
-            f"{tool_url}/v1/chat/completions",
-            json={
-                "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 80,
-                **no_think_params(),
-            },
-            timeout=3600,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        _log.info("heuristic classify start")
+        raw, _tokens = model_call("tool_planner", prompt, max_tokens=80, temperature=0.0)
+        if not raw:
+            return False, "", ""
         match = re.search(r"\{.*?\}", raw, re.S)
         if not match:
             return False, "", ""

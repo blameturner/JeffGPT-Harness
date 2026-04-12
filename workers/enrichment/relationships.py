@@ -4,14 +4,10 @@ import json
 import logging
 import re
 
+from config import get_function_config
 from graph import write_relationship
-from workers.enrichment.models import _fast_call
+from workers.enrichment.models import model_call
 from workers.enrichment.summarise import _salvage_json_array
-
-# hard cap on extracted text — at ~4000 chars (~1000 tokens) the 2B fast model
-# can finish prompt processing + extraction in well under FAST_TIMEOUT; larger
-# prompts regularly push it past the wall
-_RELATIONSHIP_TEXT_CAP = 4000
 
 _log = logging.getLogger("enrichment_agent.relationships")
 
@@ -120,11 +116,13 @@ Emit the JSON array now. First character `[`, last character `]`. No prose."""
 
 
 def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
-    _log.debug("extracting relationships  org=%d text_len=%d", org_id, len(text))
+    cfg = get_function_config("enrichment_relationships")
+    max_input = cfg.get("max_input_chars", 8000)
+    _log.debug("extracting relationships  org=%d text_len=%d max_input=%d", org_id, len(text), max_input)
     prompt = _RELATIONSHIP_EXTRACTION_PROMPT.format(
-        content=text[:_RELATIONSHIP_TEXT_CAP],
+        content=text[:max_input],
     )
-    raw, tokens = _fast_call(prompt, max_tokens=1200)
+    raw, tokens = model_call("enrichment_relationships", prompt)
     if not raw:
         _log.warning("relationship extraction returned empty  tokens=%d", tokens)
         return 0, tokens

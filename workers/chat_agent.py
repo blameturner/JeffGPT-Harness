@@ -8,7 +8,7 @@ from typing import Callable, Iterator
 
 import requests
 
-from config import MODELS, TOOLS_FRAMEWORK_ENABLED, get_model_url, refresh_models
+from config import MODELS, TOOLS_FRAMEWORK_ENABLED, get_model_url, is_feature_enabled, refresh_models
 from nocodb_client import NocodbClient
 from memory import remember
 from tools.framework.contract import ToolAction, ToolContext, ToolName, ToolPlan
@@ -156,6 +156,7 @@ class ChatAgent:
 
         _t_search = time.perf_counter()
         tool_context: ToolContext = ToolContext()
+        web_search_enabled = is_feature_enabled("web_search")
 
         if TOOLS_FRAMEWORK_ENABLED:
             # New path: heuristic gate → planner → parallel tool dispatch.
@@ -170,7 +171,9 @@ class ChatAgent:
                     last_assistant = (turn.get("content") or "")[:800]
                     break
             hints = gate_check(user_message, conversation_context=last_assistant)
-            _log.info("tools gate  conv=%s hints=%s", conversation_id, sorted(hints) or "[]")
+            if not web_search_enabled:
+                hints.discard("web_search")
+            _log.info("tools gate  conv=%s hints=%s web_search=%s", conversation_id, sorted(hints) or "[]", web_search_enabled)
 
             if hints:
                 tool_labels = {

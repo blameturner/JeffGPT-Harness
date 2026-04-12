@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
+from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL, is_feature_enabled
 from workers.batch_summarise import run_batch_summarise
 from workers.enrichment.cycle import run_enrichment_cycle, run_log_cleanup
 from workers.enrichment.db import EnrichmentDB
@@ -161,14 +161,17 @@ def start_scheduler() -> BackgroundScheduler:
         coalesce=True,
         replace_existing=True,
     )
-    sched.add_job(
-        run_batch_summarise,
-        CronTrigger(hour=4, minute=0, timezone="Australia/Sydney"),
-        id="batch_summarise",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
+    if is_feature_enabled("batch_summarise"):
+        sched.add_job(
+            run_batch_summarise,
+            CronTrigger(hour=4, minute=0, timezone="Australia/Sydney"),
+            id="batch_summarise",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+    else:
+        _log.info("batch_summarise disabled via config, skipping job registration")
     sched.start()
     registered = _register_agent_schedules(sched)
     enrichment_registered = _register_enrichment_agents(sched)

@@ -3,21 +3,23 @@ from __future__ import annotations
 import json
 import logging
 
-from config import MAX_SUMMARY_INPUT_CHARS
-from workers.enrichment.models import _tool_call
+from config import get_function_config
+from workers.enrichment.models import model_call
 
 _log = logging.getLogger("enrichment_agent.summarise")
 
 
 def _summarise(text: str) -> tuple[str, int]:
-    _log.debug("summarise  text_len=%d", len(text))
+    cfg = get_function_config("enrichment_summarise")
+    max_input = cfg.get("max_input_chars", 12000)
+    _log.debug("summarise  text_len=%d max_input=%d", len(text), max_input)
     prompt = (
         "Summarise the following page for a knowledge base. Be factual, "
         "≤ 250 words, preserve key names, numbers, dates, and verbatim "
         "quotes where notable.\n\n"
-        f"PAGE:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
+        f"PAGE:\n{text[:max_input]}"
     )
-    summary, tokens = _tool_call(prompt, max_tokens=300)
+    summary, tokens = model_call("enrichment_summarise", prompt)
     if summary:
         _log.info("summarise ok  summary_len=%d tokens=%d", len(summary), tokens)
     else:

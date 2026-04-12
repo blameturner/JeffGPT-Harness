@@ -9,6 +9,7 @@ from config import (
     ENRICHMENT_LOG_RETENTION_DAYS,
     ENRICHMENT_TOKEN_BUDGET,
     PROACTIVE_BUDGET_THRESHOLD,
+    is_feature_enabled,
 )
 from graph import get_sparse_concepts
 from workers.crawler import apply_polite_delay
@@ -22,6 +23,10 @@ _last_runs: dict[str | None, dict] = {}
 
 
 def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
+    if not is_feature_enabled("enrichment"):
+        _log.info("enrichment disabled via config, skipping cycle")
+        return
+
     cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     label = f"agent={enrichment_agent_id}" if enrichment_agent_id else "all"
     _log.info("cycle %s starting (%s)", cycle_id, label)

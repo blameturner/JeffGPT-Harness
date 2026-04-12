@@ -6,7 +6,7 @@ import re
 import threading
 import time
 
-from workers.search.engine import SUMMARY_INPUT_CHAR_CAP, SUMMARY_MAX_TOKENS
+from config import get_function_config, is_feature_enabled
 from workers.search.intent import (
     CHAT_INTENT_COMPARISON,
     CHAT_INTENT_CONTEXTUAL,
@@ -103,7 +103,6 @@ def _extract_one_page(
 
     # deferred: workers.enrichment pulls FalkorDB/NocoDB/crawler at import time
     try:
-        from workers.enrichment.models import _fast_call
         from workers.enrichment.quality import (
             _classify_content_type,
             _heuristic_quality_gate,
@@ -127,8 +126,9 @@ def _extract_one_page(
         _log.debug("extraction drop  content_type=%s", content_type)
         return None
 
+    cfg = get_function_config("search_extraction")
     goal = _extraction_goal_for(intent_dict)
-    excerpt = page_text[:SUMMARY_INPUT_CHAR_CAP]
+    excerpt = page_text[:cfg.get("max_input_chars", 12000)]
     prompt = (
         f"{build_prompt_date_header()}\n\n"
         f"You are extracting information from a web page for a user who asked:\n"
@@ -146,9 +146,10 @@ def _extract_one_page(
         f"PAGE:\n{excerpt}"
     )
 
-    raw, tokens = _fast_call(prompt, max_tokens=SUMMARY_MAX_TOKENS, temperature=0.2)
+    from workers.enrichment.models import model_call
+    raw, tokens = model_call("search_extraction", prompt)
     if not raw:
-        _log.debug("extraction: empty response from fast model")
+        _log.debug("extraction: empty response from model")
         return None
 
     cleaned = raw.strip()
@@ -209,8 +210,26 @@ def extract_from_pages(
     if not pages:
         return []
 
+    if not is_feature_enabled("search_extraction"):
+        _log.info("search_extraction disabled — returning raw snippets for %d pages", len(pages))
+        results: list[dict | None] = []
+        for page in pages:
+            result = page.get("result", {}) if isinstance(page.get("result"), dict) else {}
+            text = (page.get("text") or "")[:500]
+            if text.strip():
+                results.append({
+                    "summary": text,
+                    "relevance": "medium",
+                    "source_type": "unknown",
+                    "content_type": "UNCLEAR",
+                    "tokens": 0,
+                })
+            else:
+                results.append(None)
+        return results
+
     try:
-        from workers.enrichment.models import _fast_call
+        from workers.enrichment.models import model_call
         from workers.enrichment.quality import (
             _classify_content_type,
             _heuristic_quality_gate,
@@ -218,6 +237,8 @@ def extract_from_pages(
     except Exception as e:
         _log.warning("extraction helpers import failed: %s", e)
         return [None] * len(pages)
+
+    cfg = get_function_config("search_extraction")
 
     results: list[dict | None] = [None] * len(pages)
     candidates: list[tuple[int, str, str]] = []
@@ -266,10 +287,10 @@ def extract_from_pages(
         f"{pages_block}"
     )
 
-    raw, tokens = _fast_call(
+    raw, tokens = model_call(
+        "search_extraction",
         prompt,
-        max_tokens=SUMMARY_MAX_TOKENS * len(candidates),
-        temperature=0.2,
+        max_tokens=cfg.get("max_tokens", 500) * len(candidates),
     )
     elapsed = round(time.time() - started, 2)
 

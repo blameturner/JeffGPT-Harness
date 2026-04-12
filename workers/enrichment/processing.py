@@ -10,7 +10,7 @@ from config import CATEGORY_COLLECTIONS
 from memory import remember
 from workers.crawler import check_robots, compute_next_crawl_at, expand_frontier, fan_out
 from workers.enrichment.db import EnrichmentDB
-from workers.enrichment.models import _tool_call
+from workers.enrichment.models import model_call
 from workers.enrichment.quality import _content_hash, _validate_content
 from workers.enrichment.relationships import _extract_relationships
 from workers.enrichment.sources import _discover_sources
@@ -92,7 +92,7 @@ def _process_source(
                 org_id=org_id,
                 category=category,
                 budget_remaining=budget_remaining,
-                tool_call=_tool_call,
+                tool_call=lambda prompt, max_tokens, temp: model_call("enrichment_source_discovery", prompt, max_tokens=max_tokens, temperature=temp),
                 sparse_concepts=sparse_concepts,
             )
             if children_created:
