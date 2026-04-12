@@ -16,5 +16,5 @@ build/
 */.idea
 *.idea
 .idea/*
-/.idea
-/.claude
+/.idea/
+/.claude/
