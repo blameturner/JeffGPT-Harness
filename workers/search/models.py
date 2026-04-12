@@ -67,6 +67,10 @@ _ENRICHMENT_SAFE_ROLES: tuple[str, ...] = tuple(sorted(set(_FAST_POOL + _TOOL_PO
 _role_semaphores: dict[str, threading.Semaphore] = {}
 _role_sem_lock = threading.Lock()
 
+# Priority: user-facing requests set this flag. Background tasks (enrichment)
+# check it and yield if a user request is waiting.
+_user_requests_waiting = threading.Event()
+
 
 def _sem_for(role: str) -> threading.Semaphore:
     with _role_sem_lock:
@@ -95,18 +99,27 @@ def _present_candidates(pool: tuple[str, ...]) -> list[tuple[str, dict, threadin
 # ---------- Atomic pick + acquire ----------
 
 @contextmanager
-def acquire_model(pool_name: str) -> Iterator[tuple[str | None, str | None]]:
+def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str | None, str | None]]:
     """
     Atomically pick the least-loaded healthy model in the named pool and
     acquire its slot. Yields (url, model_id). Callers MUST post to the
     yielded url; never mix with a separately-resolved URL.
 
+    priority=True marks this as a user-facing request. Background tasks
+    should pass priority=False (default) and will back off briefly when
+    a user request is waiting.
+
     If no model in the pool is in the catalog, yields (None, None) and
     does NOT acquire a slot — callers should short-circuit.
     """
+    if priority:
+        _user_requests_waiting.set()
+
     pool = _POOLS.get(pool_name, ())
     if not pool:
         _log.error("acquire_model unknown pool=%s", pool_name)
+        if priority:
+            _user_requests_waiting.clear()
         yield None, None
         return
 
@@ -117,6 +130,8 @@ def acquire_model(pool_name: str) -> Iterator[tuple[str | None, str | None]]:
             pool_name,
             sorted({v.get("role") for v in MODELS.values() if isinstance(v, dict)}),
         )
+        if priority:
+            _user_requests_waiting.clear()
         yield None, None
         return
 
@@ -138,22 +153,22 @@ def acquire_model(pool_name: str) -> Iterator[tuple[str | None, str | None]]:
             break
 
     if acquired_sem is None:
-        # All ranked slots busy — block on the best-ranked role. This is
-        # still the fairest choice even if its free count changed between
-        # rank and block.
         _, (role, entry, sem) = ranked[0]
-        _log.debug("pool=%s all slots busy — blocking on %s", pool_name, role)
+        _log.info("pool=%s all slots busy — blocking on %s (priority=%s)", pool_name, role, priority)
         sem.acquire(blocking=True)
         acquired_role = role
         acquired_sem = sem
         acquired_entry = entry
 
+    if priority:
+        _user_requests_waiting.clear()
+
     url = acquired_entry.get("url")
     model_id = acquired_entry.get("model_id") or acquired_role
     free_now = _free_slots(acquired_sem)
-    _log.debug(
-        "pool=%s acquired role=%s free_after=%d url=%s",
-        pool_name, acquired_role, free_now, url,
+    _log.info(
+        "pool=%s acquired role=%s free_after=%d (priority=%s)",
+        pool_name, acquired_role, free_now, priority,
     )
     try:
         yield url, model_id

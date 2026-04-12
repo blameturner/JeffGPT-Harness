@@ -11,11 +11,13 @@ import requests
 from config import MODELS, TOOLS_FRAMEWORK_ENABLED, get_model_url, refresh_models
 from nocodb_client import NocodbClient
 from memory import remember
-from tools.framework.contract import ToolContext
+from tools.framework.contract import ToolAction, ToolContext, ToolName, ToolPlan
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
+from workers.search.intent import classify_message_intent
 from workers.search.models import _tool_model
+from workers.search.queries import generate_search_queries
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise
 from workers.chat.graph import extract_and_write_graph
@@ -172,46 +174,83 @@ class ChatAgent:
             _log.info("tools gate  conv=%s hints=%s", conversation_id, sorted(hints) or "[]")
 
             if hints:
+                tool_labels = {
+                    "web_search": "web search",
+                    "rag_lookup": "conversation history lookup",
+                    "code_exec": "code execution",
+                }
+                hint_names = [tool_labels.get(h, h) for h in sorted(hints)]
+                instant_summary = f"Running {', '.join(hint_names)} for: {user_message[:80]}"
                 emit({
                     "type": "tool_status",
-                    "phase": "thinking",
-                    "summary": "Preparing tools...",
+                    "phase": "planning",
+                    "summary": instant_summary,
                     "tools": sorted(hints),
                 })
 
-                async def _plan_and_run() -> ToolContext:
-                    convo_summary = ""
-                    if history:
-                        last = history[-1].get("content") or ""
-                        convo_summary = last[:200]
-                    plan = await generate_plan(
-                        user_message=user_message,
-                        hints=hints,
-                        conversation_summary=convo_summary,
-                    )
-                    if plan is None:
-                        return ToolContext()
-                    # Inject org-scoped context into every action's params so
-                    # executors can reach tenant-scoped resources without a global.
-                    for a in plan.actions:
-                        a.params["_org_id"] = self.org_id
-                        a.params["_collection"] = collection_name
-                    emit({
-                        "type": "tool_status",
-                        "phase": "planning",
-                        "summary": plan.summary,
-                        "tools": [a.tool.value for a in plan.actions],
-                    })
-                    return await execute_plan(plan, emit)
+                _t_tools = time.perf_counter()
 
-                try:
-                    _t_tools = time.perf_counter()
-                    _log.info("tools framework starting  conv=%s hints=%s", conversation_id, sorted(hints))
-                    tool_context = asyncio.run(_plan_and_run())
-                    _log.info("tools framework done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
-                except Exception:
-                    _log.error("tools framework failed  conv=%s", conversation_id, exc_info=True)
-                    tool_context = ToolContext()
+                if hints == {"web_search"}:
+                    # Fast path: skip planner entirely for web_search-only.
+                    # Use intent classification + template queries (no model call for most messages).
+                    _log.info("web_search fast-path  conv=%s", conversation_id)
+                    intent_dict = classify_message_intent(user_message, history[-6:] if history else None)
+                    queries = generate_search_queries(intent_dict, message=user_message)
+                    _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
+
+                    if queries:
+                        search_mode = getattr(self, '_search_mode', 'normal')
+                        plan = ToolPlan(
+                            actions=[ToolAction(
+                                tool=ToolName.WEB_SEARCH,
+                                params={
+                                    "queries": queries,
+                                    "_org_id": self.org_id,
+                                    "_collection": collection_name,
+                                    "_mode": search_mode,
+                                },
+                                reason="web search",
+                            )],
+                            summary=instant_summary,
+                        )
+                        try:
+                            tool_context = asyncio.run(execute_plan(plan, emit))
+                            _log.info("web_search fast-path done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
+                        except Exception:
+                            _log.error("web_search fast-path failed  conv=%s", conversation_id, exc_info=True)
+                            tool_context = ToolContext()
+                else:
+                    # Full planner path for multi-tool or non-search hints.
+                    async def _plan_and_run() -> ToolContext:
+                        convo_summary = ""
+                        if history:
+                            last = history[-1].get("content") or ""
+                            convo_summary = last[:200]
+                        plan = await generate_plan(
+                            user_message=user_message,
+                            hints=hints,
+                            conversation_summary=convo_summary,
+                        )
+                        if plan is None:
+                            return ToolContext()
+                        for a in plan.actions:
+                            a.params["_org_id"] = self.org_id
+                            a.params["_collection"] = collection_name
+                        emit({
+                            "type": "tool_status",
+                            "phase": "planning",
+                            "summary": plan.summary,
+                            "tools": [a.tool.value for a in plan.actions],
+                        })
+                        return await execute_plan(plan, emit)
+
+                    try:
+                        _log.info("tools framework starting  conv=%s hints=%s", conversation_id, sorted(hints))
+                        tool_context = asyncio.run(_plan_and_run())
+                        _log.info("tools framework done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
+                    except Exception:
+                        _log.error("tools framework failed  conv=%s", conversation_id, exc_info=True)
+                        tool_context = ToolContext()
 
             # Map web_search results back onto search_result so the downstream
             # payload build and persistence code paths stay unchanged.

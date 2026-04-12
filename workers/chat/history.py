@@ -4,14 +4,17 @@ import logging
 
 import requests
 
+from config import no_think_params
 from workers.search.models import _tool_model
 
 _log = logging.getLogger("chat.history")
 
 
-MAX_SUMMARY_INPUT_CHARS = 48_000
-SUMMARISE_TRIGGER_CHARS = int(128_000 * 0.8)
-FALLBACK_RECENT_MESSAGES = 12
+# ~4 chars per token. 4000 tokens of history = ~16K chars = ~136s prompt eval on CPU.
+# Trigger summarisation before history gets expensive.
+MAX_SUMMARY_INPUT_CHARS = 16_000
+SUMMARISE_TRIGGER_CHARS = 16_000
+FALLBACK_RECENT_MESSAGES = 8
 
 
 def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
@@ -61,8 +64,9 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
                     ],
                     "temperature": 0.2,
                     "max_tokens": 800,
+                    **no_think_params(),
                 },
-                timeout=120,
+                timeout=3600,
             )
             resp.raise_for_status()
             summary_text = resp.json()["choices"][0]["message"]["content"]

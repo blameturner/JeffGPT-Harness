@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     search_enabled: bool = False
     search_consent_declined: bool = False
     response_style: str | None = None
+    search_mode: str = "normal"
 
 
 def _distinct_nonempty(rows: list[dict], field: str) -> list[str]:
@@ -56,6 +57,7 @@ def chat(request: ChatRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    agent._search_mode = request.search_mode
     job = STORE.create()
     run_in_background(job, lambda j: agent.run_job(
         j,
@@ -71,6 +73,29 @@ def chat(request: ChatRequest):
         response_style=request.response_style,
     ))
     return {"job_id": job.id}
+
+
+class ResearchRequest(BaseModel):
+    org_id: int
+    model: str
+    question: str
+    conversation_id: int | None = None
+
+
+@router.post("/research")
+def research(request: ResearchRequest):
+    from workers.research_agent import run_research, estimate_research_time
+    _log.info("POST /research  model=%s org=%d question=%s", request.model, request.org_id, request.question[:80])
+    estimate = estimate_research_time()
+    job = STORE.create()
+    run_in_background(job, lambda j: run_research(
+        question=request.question,
+        org_id=request.org_id,
+        model=request.model,
+        job=j,
+        conversation_id=request.conversation_id,
+    ))
+    return {"job_id": job.id, "estimate": estimate}
 
 
 @router.get("/collections")

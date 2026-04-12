@@ -213,7 +213,7 @@ PROACTIVE_BUDGET_THRESHOLD = 5000
 REASONER_ROLE = "reasoner"
 
 # Bounds concurrent in-flight model calls to match llama.cpp's --parallel N.
-MODEL_PARALLEL_SLOTS = int(os.getenv("MODEL_PARALLEL_SLOTS", "4"))
+MODEL_PARALLEL_SLOTS = int(os.getenv("MODEL_PARALLEL_SLOTS", "2"))
 CATEGORY_COLLECTIONS = {
     "documentation": "scraped_documentation",
     "news": "scraped_news",

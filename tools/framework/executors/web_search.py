@@ -47,7 +47,7 @@ MAX_URLS_TO_PROCESS = 6
 MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
-SUMMARY_TIMEOUT = 600.0
+SUMMARY_TIMEOUT = 3600.0
 
 
 _SUMMARISE_SYSTEM = (
@@ -224,35 +224,36 @@ async def execute(params: dict, emit) -> ToolResult:
             elapsed_s=round(time.time() - t0, 2),
         )
 
+    mode = params.get("_mode", "normal")
+
     # 2. Parallel scrape via the shared scrape_page pipeline
     scraped = await asyncio.gather(*[_scrape_one(r) for r in results])
 
-    # 3. Summarise only non-trivial extracts (skip snippet-only fallbacks
-    #    because there's nothing beyond the snippet to condense).
-    to_summarise = [s for s in scraped if s["text"] and len(s["text"]) >= 300]
+    if mode == "deep":
+        # Deep search: summarise each page through the tool model for higher quality.
+        to_summarise = [s for s in scraped if s["text"] and len(s["text"]) >= 300]
+        summaries: list[str] = []
+        if to_summarise:
+            _sem = asyncio.Semaphore(2)
 
-    summaries: list[str] = []
-    if to_summarise:
-        # Limit concurrency to 2 so most work routes through the fast t3_tool
-        # model instead of spreading across slower large models.
-        _sem = asyncio.Semaphore(2)
+            async def _bounded_summarise(client, url, text, query):
+                async with _sem:
+                    return await _summarise_one(client, url, text, query)
 
-        async def _bounded_summarise(client, url, text, query):
-            async with _sem:
-                return await _summarise_one(client, url, text, query)
-
-        async with httpx.AsyncClient() as client:
-            summaries = await asyncio.gather(*[
-                _bounded_summarise(client, s["url"], s["text"], " | ".join(queries))
-                for s in to_summarise
-            ])
-
-    # Short-content items get their raw text (or snippet) as "summary".
-    short_items = [s for s in scraped if s not in to_summarise and s["text"]]
-    short_summaries = [s["text"][:MAX_SUMMARY_CHARS] for s in short_items]
-
-    combined_items = to_summarise + short_items
-    combined_summaries = list(summaries) + short_summaries
+            async with httpx.AsyncClient() as client:
+                summaries = await asyncio.gather(*[
+                    _bounded_summarise(client, s["url"], s["text"], " | ".join(queries))
+                    for s in to_summarise
+                ])
+        short_items = [s for s in scraped if s not in to_summarise and s["text"]]
+        short_summaries = [s["text"][:MAX_SUMMARY_CHARS] for s in short_items]
+        combined_items = to_summarise + short_items
+        combined_summaries = list(summaries) + short_summaries
+        _log.info("deep search  summarised=%d short=%d", len(summaries), len(short_summaries))
+    else:
+        # Normal search: pass raw scraped text directly to the main model.
+        combined_items = [s for s in scraped if s["text"]]
+        combined_summaries = [s["text"][:MAX_SUMMARY_CHARS] for s in combined_items]
 
     # 4. Build combined context + per-source metadata for UI + ChromaDB.
     context_parts: list[str] = []

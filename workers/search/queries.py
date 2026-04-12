@@ -221,7 +221,7 @@ def rerank_candidates(
                 "max_tokens": 80,
                 **no_think_params(),
             },
-            timeout=600,
+            timeout=3600,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -304,7 +304,7 @@ def reformulate_query(
                 "max_tokens": 60,
                 **no_think_params(),
             },
-            timeout=600,
+            timeout=3600,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()

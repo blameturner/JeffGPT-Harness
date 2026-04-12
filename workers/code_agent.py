@@ -279,10 +279,17 @@ class CodeAgent(ChatAgent):
                       conversation_id, self.mode, sorted(hints) or "[]")
 
             if hints:
+                tool_labels = {
+                    "web_search": "web search",
+                    "rag_lookup": "conversation history lookup",
+                    "code_exec": "code execution",
+                }
+                hint_names = [tool_labels.get(h, h) for h in sorted(hints)]
+                instant_summary = f"Running {', '.join(hint_names)} for: {user_message[:80]}"
                 emit({
                     "type": "tool_status",
-                    "phase": "thinking",
-                    "summary": "Preparing tools...",
+                    "phase": "planning",
+                    "summary": instant_summary,
                     "tools": sorted(hints),
                 })
 
