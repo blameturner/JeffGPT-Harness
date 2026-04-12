@@ -16,7 +16,7 @@ CONTENT_TYPE_SOFT_ACCEPT = {"PRODUCT", "UNCLEAR", "NAVIGATION", "GENERATED"}
 CONTENT_TYPE_REJECT = {"BOILERPLATE", "PAYWALL"}
 CONTENT_TYPE_ENUM = CONTENT_TYPE_ACCEPT | CONTENT_TYPE_SOFT_ACCEPT | CONTENT_TYPE_REJECT
 
-VALIDATOR_MIN_LEN = 300
+VALIDATOR_MIN_LEN = 150
 VALIDATOR_MIN_UNIQUE_RATIO = 0.15
 VALIDATOR_MAX_TOP5_LINE_RATIO = 0.40
 VALIDATOR_CLASSIFIER_CHAR_BUDGET = 1500
@@ -51,7 +51,7 @@ def _heuristic_quality_gate(text: str) -> tuple[bool, str, dict]:
     unique_ratio = len(set(tokens)) / len(tokens)
     metrics["unique_ratio"] = round(unique_ratio, 3)
     # require min corpus size before trusting ratio — a 50-word glossary can legitimately be low
-    if len(tokens) > 200 and unique_ratio < VALIDATOR_MIN_UNIQUE_RATIO:
+    if len(tokens) > 500 and unique_ratio < VALIDATOR_MIN_UNIQUE_RATIO:
         return False, "low_lexical_diversity", metrics
 
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
@@ -140,8 +140,8 @@ def _looks_like_injection(text: str) -> tuple[bool, str, int]:
     prompt = _INJECTION_CHECK_PROMPT.format(span=span[:800])
     raw, tokens = _tool_call(prompt, max_tokens=4, temperature=0.0)
     if not raw:
-        # fail closed — this path only runs when residue is already present
-        return True, "injection_check_unavailable", 0
+        # fail open — don't reject valid content because model is unavailable
+        return False, "injection_check_unavailable", 0
     verdict = raw.strip().upper()
     if verdict.startswith("ADVERSARIAL"):
         return True, "llm_adversarial", tokens

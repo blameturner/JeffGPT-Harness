@@ -15,6 +15,11 @@ async def lifespan(app: FastAPI):
     sched = start_scheduler()
     app.state.scheduler = sched
     _log.info("scheduler running")
+    from workers.queue import JobQueue
+    job_queue = JobQueue()
+    app.state.queue = job_queue
+    job_queue.start()
+    _log.info("job queue running")
     _log.info("ready")
     try:
         yield

@@ -323,3 +323,37 @@ def reject_suggestions_by_parent(body: BulkSuggestionAction):
         return {"ok": True, "rejected": len(suggestions)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/enrichment/scrape-report")
+def scrape_report(org_id: int):
+    from workers.enrichment.db import EnrichmentDB
+    try:
+        db = EnrichmentDB()
+        targets = db.list_all_targets(org_id)
+        total = len(targets)
+        by_status: dict[str, int] = {}
+        by_error: dict[str, int] = {}
+        failed_urls: list[dict] = []
+        for t in targets:
+            s = t.get("status") or "unknown"
+            by_status[s] = by_status.get(s, 0) + 1
+            if s in ("error", "rejected"):
+                err = t.get("last_scrape_error") or "unknown"
+                by_error[err] = by_error.get(err, 0) + 1
+                fails = int(t.get("consecutive_failures") or 0)
+                if fails >= 3:
+                    failed_urls.append({
+                        "url": t.get("url", "")[:100],
+                        "consecutive_failures": fails,
+                        "error": err,
+                    })
+        return {
+            "total": total,
+            "by_status": by_status,
+            "by_error": by_error,
+            "top_failures": sorted(by_error.items(), key=lambda x: -x[1])[:20],
+            "persistent_failures": sorted(failed_urls, key=lambda x: -x["consecutive_failures"])[:20],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

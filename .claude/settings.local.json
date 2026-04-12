@@ -3,7 +3,12 @@
     "allow": [
       "Bash(npx tsr:*)",
       "Bash(npx tsc:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(wc -l workers/web_search.py workers/search/*.py)",
+      "WebSearch",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

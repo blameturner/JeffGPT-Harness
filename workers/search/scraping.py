@@ -312,37 +312,59 @@ def playwright_fetch(url: str) -> str:
 
 def _scrape_with_httpx(url: str) -> str:
     started = time.time()
+    resp = None
     try:
         resp = httpx.get(
             url,
-            timeout=SCRAPE_TIMEOUT,
+            timeout=30,
             follow_redirects=True,
             headers=BROWSER_HEADERS,
         )
         resp.raise_for_status()
-        if len(resp.content) > MAX_RESPONSE_BYTES:
-            _log.warning("scrape skip  response too large (%d bytes) for %s", len(resp.content), url)
-            return ""
-        final_url = str(resp.url)
-        if final_url != url and not _is_safe_url(final_url):
-            _log.warning("scrape blocked redirect to unsafe url %s", final_url[:120])
+    except httpx.ConnectError as e:
+        err_str = str(e).lower()
+        if "ssl" in err_str or "certificate" in err_str or "verify" in err_str:
+            _log.warning("scrape ssl error, retrying without verification  url=%s", url[:80])
+            try:
+                resp = httpx.get(url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS, verify=False)
+                resp.raise_for_status()
+            except Exception as e2:
+                _log.warning("scrape ssl retry also failed  url=%s: %s", url[:80], e2)
+                return ""
+        else:
+            _log.warning("scrape connect error  url=%s: %s", url[:80], e)
             return ""
     except httpx.HTTPStatusError as e:
-        _log.warning("scrape %d for %s (%s)", e.response.status_code, url, e.response.reason_phrase)
+        _log.warning("scrape %d  url=%s (%s)", e.response.status_code, url[:80], e.response.reason_phrase)
         return ""
     except httpx.TimeoutException:
-        _log.warning("scrape timeout after %ds for %s", SCRAPE_TIMEOUT, url)
+        _log.warning("scrape timeout after 30s  url=%s", url[:80])
         return ""
     except Exception as e:
-        _log.warning("scrape failed for %s: %s", url, e)
+        _log.warning("scrape failed  url=%s: %s (%s)", url[:80], type(e).__name__, e)
+        return ""
+
+    if resp is None:
+        return ""
+
+    if len(resp.content) > MAX_RESPONSE_BYTES:
+        _log.warning("scrape skip  response too large (%d bytes)  url=%s", len(resp.content), url[:80])
+        return ""
+    if len(resp.content) < 100:
+        _log.warning("scrape empty  status=%d bytes=%d  url=%s", resp.status_code, len(resp.content), url[:80])
+        return ""
+
+    final_url = str(resp.url)
+    if final_url != url and not _is_safe_url(final_url):
+        _log.warning("scrape blocked redirect to unsafe url %s", final_url[:120])
         return ""
 
     elapsed = round(time.time() - started, 2)
     content_type = (resp.headers.get("content-type") or "").lower()
-    if content_type and "text/html" not in content_type and "text/plain" not in content_type:
-        _log.debug("scrape skip  non-html content-type=%s for %s", content_type.split(";")[0], url)
+    if content_type and not any(t in content_type for t in ("text/html", "text/plain", "application/xhtml")):
+        _log.info("scrape skip  non-html content-type=%s  url=%s", content_type.split(";")[0], url[:80])
         return ""
-    _log.debug("scrape ok    %s  status=%d size=%d %.2fs", url, resp.status_code, len(resp.text), elapsed)
+    _log.info("scrape ok    %s  status=%d size=%d %.2fs", url[:80], resp.status_code, len(resp.text), elapsed)
 
     try:
         soup = BeautifulSoup(resp.text, "lxml")

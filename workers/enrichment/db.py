@@ -228,6 +228,16 @@ class EnrichmentDB:
         urls.update(r.get("url") for r in pending if r.get("url"))
         return urls
 
+    def list_all_targets(self, org_id: int) -> list[dict]:
+        data = self._get(
+            NOCODB_TABLE_SCRAPE_TARGETS,
+            params={
+                "where": f"(org_id,eq,{org_id})",
+                "limit": 1000,
+            },
+        )
+        return data.get("list", [])
+
     def list_due_sources(self, org_id: int, enrichment_agent_id: int | None = None) -> list[dict]:
         where = f"(org_id,eq,{org_id})~and(active,eq,1)"
         if enrichment_agent_id is not None:

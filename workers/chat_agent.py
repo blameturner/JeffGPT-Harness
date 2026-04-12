@@ -379,8 +379,36 @@ class ChatAgent:
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
-        # Emit done IMMEDIATELY so the frontend shows completion. All persistence
-        # and background work happens after — the user already has the streamed chunks.
+        # Persist to NocoDB BEFORE emitting done — this is the critical write
+        # that must not be lost. If this fails, the user still has streamed chunks.
+        if output:
+            if not _user_msg_written.wait(timeout=10.0):
+                _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
+            _t = time.perf_counter()
+            persist_ok = persist_assistant_message(
+                db=self.db,
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                output=output,
+                final_model=final_model,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                style_key=style_key,
+                search_sources=search_sources,
+                search_status=search_status,
+                search_confidence=search_confidence,
+                search_context=search_context,
+                intent_dict=intent_dict,
+            )
+            _log.info("persist done  conv=%s ok=%s %.2fs", conversation_id, persist_ok, time.perf_counter() - _t)
+            if not persist_ok:
+                emit({"type": "error", "message": "assistant message persist failed"})
+
+        try:
+            self.db.update_conversation(conversation_id, {"status": "complete"})
+        except Exception:
+            _log.warning("status update to complete failed  conv=%s", conversation_id)
+
         emit({
             "type": "done",
             "conversation_id": conversation_id,
@@ -397,39 +425,11 @@ class ChatAgent:
             "search_source_count": len(search_sources),
         })
 
-        # All DB writes and memory operations run in a background thread.
-        # The user already has their complete response via streamed chunks + done event.
+        # Only memory/graph work in background — these are non-critical.
         import threading
 
         def _post_turn_work():
             _t_bg = time.perf_counter()
-
-            # Persist assistant message to NocoDB
-            if output:
-                if not _user_msg_written.wait(timeout=10.0):
-                    _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
-                _t = time.perf_counter()
-                persist_ok = persist_assistant_message(
-                    db=self.db,
-                    conversation_id=conversation_id,
-                    org_id=self.org_id,
-                    output=output,
-                    final_model=final_model,
-                    tokens_input=tokens_input,
-                    tokens_output=tokens_output,
-                    style_key=style_key,
-                    search_sources=search_sources,
-                    search_status=search_status,
-                    search_confidence=search_confidence,
-                    search_context=search_context,
-                    intent_dict=intent_dict,
-                )
-                _log.info("bg: persist done  conv=%s ok=%s %.2fs", conversation_id, persist_ok, time.perf_counter() - _t)
-
-            try:
-                self.db.update_conversation(conversation_id, {"status": "complete"})
-            except Exception:
-                _log.warning("bg: status update failed  conv=%s", conversation_id)
 
             # Memory and graph
             if convo_rag_enabled and output:
@@ -552,18 +552,25 @@ class ChatAgent:
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
+
+                # Some models put thinking in reasoning_content, actual answer in content.
+                # Others put everything in content with <think> tags.
+                reasoning = delta.get("reasoning_content")
                 text = delta.get("content")
+
+                if reasoning and not text:
+                    # Model is still thinking — count but don't emit
+                    think_tokens += 1
+                    continue
+
                 if not text:
                     continue
 
-                # Filter out <think>...</think> blocks from the streamed output.
-                # The main chat model has thinking enabled (useful for quality),
-                # but we don't stream thinking tokens to the user.
-                if not first_content_emitted:
-                    if "<think>" in text:
-                        in_think_block = True
-                        think_tokens += 1
-                        continue
+                # Filter <think>...</think> tags in content (Qwen3 style)
+                if not first_content_emitted and "<think>" in text:
+                    in_think_block = True
+                    think_tokens += 1
+                    continue
                 if in_think_block:
                     think_tokens += 1
                     if "</think>" in text:

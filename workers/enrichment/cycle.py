@@ -97,6 +97,11 @@ def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
                 break
 
             source_url = source.get("url") or ""
+            consecutive_fails = int(source.get("consecutive_failures") or 0)
+            if consecutive_fails >= 5:
+                _log.info("skipping permanently failed source %s (consecutive_failures=%d)", source_url[:60], consecutive_fails)
+                continue
+
             try:
                 domain = urlparse(source_url).netloc.lower()
             except Exception:

@@ -49,26 +49,33 @@ def _process_source(
         db.log_event(cycle_id, "source_rejected", org_id, target_id, url, "robots.txt disallow")
         return 0
 
+    _log.info("source %s stage=scrape  url=%s", target_id, url[:60])
     fetch_meta: dict[str, Any] = {}
     text = scrape_page(url, source=source, meta_out=fetch_meta)
     fetch_path = fetch_meta.get("path", "unknown")
     if not text:
+        consecutive = int(source.get("consecutive_failures") or 0) + 1
         _log.warning(
-            "source %s scrape failed: no text extracted from %s (path=%s)",
-            target_id, url, fetch_path,
+            "source %s scrape failed  url=%s path=%s consecutive=%d",
+            target_id, url[:60], fetch_path, consecutive,
         )
         db.log_event(
             cycle_id, "source_error", org_id, target_id, url,
-            message=f"scrape failed (path={fetch_path})",
+            message=f"scrape failed (path={fetch_path} consecutive={consecutive})",
             flags=[f"fetch_path:{fetch_path}"],
         )
-        # retry on normal cadence — don't penalise source with exponential backoff for transient scrape failures
         retry_at = (now_utc + timedelta(hours=base_hours)).isoformat()
-        db.update_scrape_target(target_id, status="error", next_crawl_at=retry_at)
+        db.update_scrape_target(
+            target_id,
+            status="error",
+            next_crawl_at=retry_at,
+            consecutive_failures=consecutive,
+            last_scrape_error=f"{fetch_path}: empty",
+        )
         return 0
 
-    _log.debug(
-        "source %s scraped %d chars from %s (path=%s)",
+    _log.info(
+        "source %s stage=scrape done  chars=%d path=%s",
         target_id, len(text), url, fetch_path,
     )
     new_hash = _content_hash(text)
@@ -114,6 +121,7 @@ def _process_source(
 
     total_tokens = 0
 
+    _log.info("source %s stage=validate  url=%s chars=%d", target_id, url[:60], len(text))
     vr = _validate_content(text)
     total_tokens += vr["tokens"]
     text = vr.get("clean_text", text)
@@ -237,6 +245,8 @@ def _process_source(
         chunk_count=chunks,
         status="ok",
         consecutive_unchanged=0,
+        consecutive_failures=0,
+        last_scrape_error="",
         next_crawl_at=next_at.isoformat(),
     )
     elapsed = round(time.time() - started, 2)
