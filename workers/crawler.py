@@ -64,7 +64,23 @@ def apply_polite_delay(domain: str) -> float:
 
 # Fails open (returns True) on any robots.txt error — a flaky server must
 # not halt crawling.
+#
+# NOTE: RobotFileParser.read() would use urllib's default "Python-urllib/X.Y"
+# User-Agent when fetching robots.txt itself. Many sites (Wikipedia, dev.to,
+# realpython.com, lobste.rs, devdocs.io) return 403 to that UA, and
+# urllib.robotparser interprets a 4xx-other-than-404 as "disallow everything".
+# We therefore fetch robots.txt with httpx using a browser UA, then hand the
+# body to RobotFileParser.parse(). 4xx/5xx on robots.txt → fail open (allow).
 def check_robots(url: str) -> bool:
+    try:
+        from workers.search.urls import BROWSER_UA
+    except Exception:
+        BROWSER_UA = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+
     parsed = urlparse(url)
     host = f"{parsed.scheme}://{parsed.netloc}"
     now = time.time()
@@ -77,12 +93,36 @@ def check_robots(url: str) -> bool:
                 return rp.can_fetch("mst-harness", url)
             except Exception:
                 return True
+
     rp = urllib.robotparser.RobotFileParser()
     rp.set_url(f"{host}/robots.txt")
     try:
-        rp.read()
-    except Exception:
-        return True
+        resp = httpx.get(
+            f"{host}/robots.txt",
+            headers={"User-Agent": BROWSER_UA, "Accept": "text/plain,*/*;q=0.8"},
+            timeout=10.0,
+            follow_redirects=True,
+        )
+    except Exception as e:
+        _log.debug("robots fetch failed  host=%s err=%s  — failing open", host, e)
+        rp.allow_all = True
+    else:
+        if resp.status_code == 200 and resp.text:
+            try:
+                rp.parse(resp.text.splitlines())
+            except Exception as e:
+                _log.debug("robots parse failed  host=%s err=%s  — failing open", host, e)
+                rp.allow_all = True
+        elif 400 <= resp.status_code < 500 and resp.status_code != 401:
+            # Most 4xx (including 403, 404, 410) → no rules → allow.
+            # robotparser's default read() gets this wrong for 403.
+            rp.allow_all = True
+        elif resp.status_code >= 500 or resp.status_code == 401:
+            # Server error / auth required → play safe and disallow.
+            rp.disallow_all = True
+        else:
+            rp.allow_all = True
+
     with _robots_lock:
         ROBOTS_CACHE[host] = (rp, now)
         if len(ROBOTS_CACHE) > 500:

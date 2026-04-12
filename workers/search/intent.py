@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from workers.search.models import _tool_model, tool_slot
+from workers.search.models import acquire_model
 from workers.search.temporal import build_prompt_date_header
 
 _log = logging.getLogger("web_search.intent")
@@ -309,11 +309,6 @@ def classify_message_intent(
         result["classifier_raw"] = "heuristic_skip"
         return result
 
-    tool_url, tool_model = _tool_model()
-    if not tool_url:
-        _log.warning("intent classifier: no tool model available, using fallback")
-        return _fallback_intent()
-
     prompt = _INTENT_CLASSIFIER_PROMPT.format(
         date_header=build_prompt_date_header(),
         history=_format_history_for_classifier(history),
@@ -322,7 +317,10 @@ def classify_message_intent(
 
     started = time.time()
     try:
-        with tool_slot():
+        with acquire_model("tool") as (tool_url, tool_model):
+            if not tool_url:
+                _log.warning("intent classifier: no tool model available, using fallback")
+                return _fallback_intent()
             resp = httpx.post(
                 f"{tool_url}/v1/chat/completions",
                 json={

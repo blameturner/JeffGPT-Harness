@@ -6,7 +6,7 @@ import time
 import httpx
 
 from config import MODELS, REASONER_ROLE
-from workers.search.models import _fast_model, _tool_model, fast_slot, tool_slot
+from workers.search.models import acquire_model
 
 _log = logging.getLogger("enrichment_agent.models")
 
@@ -14,7 +14,9 @@ FAST_TIMEOUT = 180
 
 
 def _assert_not_reasoner(url: str | None) -> None:
-    # belt-and-braces: the resolver already restricts enrichment to tool/fast roles
+    # Belt-and-braces: the resolver already restricts enrichment to the fast
+    # and tool pools. This guards against catalog misconfiguration that ever
+    # registers a reasoner model under one of those roles.
     if not url:
         return
     reasoner_entry = MODELS.get(REASONER_ROLE)
@@ -24,7 +26,7 @@ def _assert_not_reasoner(url: str | None) -> None:
     if reasoner_url and url == reasoner_url:
         raise RuntimeError(
             f"refusing to dispatch enrichment call to reasoner "
-            f"(url={url}). Enrichment must use tool/fast roles only."
+            f"(url={url}). Enrichment must use fast/tool pools only."
         )
 
 
@@ -85,12 +87,10 @@ def _model_call(
 
 
 def _tool_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
-    url, model_id = _tool_model()
-    with tool_slot():
+    with acquire_model("tool") as (url, model_id):
         return _model_call("tool_call", url, model_id, prompt, max_tokens, temperature)
 
 
 def _fast_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
-    url, model_id = _fast_model()
-    with fast_slot():
+    with acquire_model("fast") as (url, model_id):
         return _model_call("fast_call", url, model_id, prompt, max_tokens, temperature)

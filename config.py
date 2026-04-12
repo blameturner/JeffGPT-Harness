@@ -118,10 +118,15 @@ def discover_models() -> dict:
     host = _get_host()
     port_start = int(os.getenv("MODEL_PORT_START", "8080"))
     port_end = int(os.getenv("MODEL_PORT_END", "8090"))
-    exclude_ports = {
-        int(os.getenv("EMBEDDER_PORT", "8083")),
-        int(os.getenv("RERANKER_PORT", "8084")),
-    }
+    # Exclude ports used by non-model SVC_ services so they aren't registered as models
+    exclude_ports: set[int] = set()
+    for _svc_var in ("SVC_EMBEDDER_URL", "SVC_RERANKER_URL", "SVC_WHISPER_URL", "SVC_SEARXNG_URL"):
+        _svc_url = os.getenv(_svc_var, "")
+        if _svc_url:
+            try:
+                exclude_ports.add(int(_svc_url.rstrip("/").rsplit(":", 1)[-1]))
+            except ValueError:
+                pass
     for port in range(port_start, port_end + 1):
         if port in exclude_ports:
             continue
@@ -161,17 +166,20 @@ def get_model_url(key: str) -> str | None:
     return None
 
 
-EMBEDDER_URL = os.getenv("EMBEDDER_URL") or f"http://{_get_host()}:{os.getenv('EMBEDDER_PORT', '8083')}"
-RERANKER_URL = os.getenv("RERANKER_URL") or f"http://{_get_host()}:{os.getenv('RERANKER_PORT', '8084')}"
+EMBEDDER_URL = os.getenv("SVC_EMBEDDER_URL")
+RERANKER_URL = os.getenv("SVC_RERANKER_URL")
+WHISPER_URL = os.getenv("SVC_WHISPER_URL")
 
-CHROMA_URL = os.getenv("CHROMA_URL")
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://mst-ag-searxng:8080")
-FALKORDB_HOST = os.getenv("FALKORDB_HOST")
-FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
+CHROMA_URL = os.getenv("DB_CHROMADB_URL")
+SEARXNG_URL = os.getenv("SVC_SEARXNG_URL", "http://mst-ag-searxng:8080")
+BROWSER_URL = os.getenv("SVC_BROWSER_URL", "http://mst-ag-browser:8086")
+SANDBOX_URL = os.getenv("SVC_SANDBOX_URL", "http://mst-ag-sandbox:8087")
+FALKORDB_HOST = os.getenv("DB_FALKORDB_HOST")
+FALKORDB_PORT = int(os.getenv("DB_FALKORDB_PORT", "6379"))
 
-NOCODB_URL = os.getenv("NOCODB_URL")
-NOCODB_TOKEN = os.getenv("NOCODB_TOKEN")
-NOCODB_BASE_ID = os.getenv("NOCODB_BASE_ID")
+NOCODB_URL = os.getenv("DB_NOCODB_URL")
+NOCODB_TOKEN = os.getenv("DB_NOCODB_TOKEN")
+NOCODB_BASE_ID = os.getenv("DB_NOCODB_BASE_ID")
 
 NOCODB_TABLE_ORGANISATION = "organisation"
 NOCODB_TABLE_AGENT_RUNS = "agent_runs"
@@ -183,6 +191,8 @@ NOCODB_TABLE_MESSAGES = "messages"
 NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+TOOLS_FRAMEWORK_ENABLED = os.getenv("TOOLS_FRAMEWORK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 
 BASE_SYSTEM_PROMPT = (
     "You are JeffGPT, a direct and capable AI assistant. "

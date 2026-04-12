@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -7,15 +8,19 @@ from typing import Callable, Iterator
 
 import requests
 
-from config import MODELS, get_model_url, refresh_models
+from config import MODELS, TOOLS_FRAMEWORK_ENABLED, get_model_url, refresh_models
 from nocodb_client import NocodbClient
 from memory import remember
+from tools.framework.contract import ToolContext
+from tools.framework.dispatcher import execute_plan
+from tools.framework.gate import gate_check
+from tools.framework.planner import generate_plan
 from workers.search.models import _tool_model
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise
 from workers.chat.graph import extract_and_write_graph
 from workers.chat.payload import build_chat_payload
-from workers.chat.search_phase import run_search_phase
+from workers.chat.search_phase import SearchPhaseResult, run_search_phase
 from workers.chat.rag_phase import submit_rag_future, collect_rag, cancel_rag
 from workers.chat.persistence import (
     schedule_status_processing_write,
@@ -146,17 +151,75 @@ class ChatAgent:
         )
 
         _t_search = time.perf_counter()
-        search_result = run_search_phase(
-            user_message=user_message,
-            history=history,
-            convo=convo,
-            conversation_id=conversation_id,
-            org_id=self.org_id,
-            search_enabled=self.search_enabled,
-            search_consent_declined=search_consent_declined,
-            emit=emit,
-            span=_span,
-        )
+        tool_context: ToolContext = ToolContext()
+
+        if TOOLS_FRAMEWORK_ENABLED:
+            # New path: heuristic gate → planner → parallel tool dispatch.
+            # search_result stays empty-default; legacy consent flow is skipped.
+            search_result = SearchPhaseResult()
+
+            # Use the last assistant turn (if any) as context so follow-up
+            # questions like "and what about Melbourne?" reopen web_search.
+            last_assistant = ""
+            for turn in reversed(history):
+                if turn.get("role") == "assistant":
+                    last_assistant = (turn.get("content") or "")[:800]
+                    break
+            hints = gate_check(user_message, conversation_context=last_assistant)
+            _log.info("tools gate  conv=%s hints=%s", conversation_id, sorted(hints) or "[]")
+
+            if hints:
+                async def _plan_and_run() -> ToolContext:
+                    convo_summary = ""
+                    if history:
+                        last = history[-1].get("content") or ""
+                        convo_summary = last[:200]
+                    plan = await generate_plan(
+                        user_message=user_message,
+                        hints=hints,
+                        conversation_summary=convo_summary,
+                    )
+                    if plan is None:
+                        return ToolContext()
+                    # Inject org-scoped context into every action's params so
+                    # executors can reach tenant-scoped resources without a global.
+                    for a in plan.actions:
+                        a.params["_org_id"] = self.org_id
+                        a.params["_collection"] = collection_name
+                    emit({
+                        "type": "tool_status",
+                        "phase": "planning",
+                        "summary": plan.summary,
+                        "tools": [a.tool.value for a in plan.actions],
+                    })
+                    return await execute_plan(plan, emit)
+
+                try:
+                    tool_context = asyncio.run(_plan_and_run())
+                except Exception:
+                    _log.error("tools framework failed", exc_info=True)
+                    tool_context = ToolContext()
+
+            # Map web_search results back onto search_result so the downstream
+            # payload build and persistence code paths stay unchanged.
+            for r in tool_context.results:
+                if r.tool.value == "web_search" and r.ok:
+                    search_result.search_context = r.data
+                    search_result.search_status = "used"
+                    search_result.search_confidence = "high"
+                    break
+        else:
+            search_result = run_search_phase(
+                user_message=user_message,
+                history=history,
+                convo=convo,
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                search_enabled=self.search_enabled,
+                search_consent_declined=search_consent_declined,
+                emit=emit,
+                span=_span,
+            )
         _span("search_total_ms", _t_search)
 
         if search_result.consent_required:
@@ -189,6 +252,17 @@ class ChatAgent:
         search_status = search_result.search_status
         search_note = search_result.search_note
         intent_dict = search_result.intent_dict
+
+        # Prepend tool-framework results (rag_lookup, code_exec, etc.) onto
+        # search_context so they ride the same system-prompt injection path.
+        # web_search results were already mapped onto search_result.search_context.
+        if tool_context.results:
+            non_web = [r for r in tool_context.results if r.tool.value != "web_search"]
+            if non_web:
+                block = ToolContext(
+                    plan_summary=tool_context.plan_summary, results=non_web,
+                ).to_system_block()
+                search_context = (block + "\n\n" + (search_context or "")).strip()
 
         _t = time.perf_counter()
         style_key, style_prompt = chat_style_prompt(response_style)
