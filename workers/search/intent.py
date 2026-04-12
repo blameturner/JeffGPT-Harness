@@ -7,6 +7,7 @@ import time
 
 import httpx
 
+from config import thinking_skip_messages
 from workers.search.models import acquire_model
 from workers.search.temporal import build_prompt_date_header
 
@@ -326,10 +327,9 @@ def classify_message_intent(
                 f"{tool_url}/v1/chat/completions",
                 json={
                     "model": tool_model,
-                    "messages": [
+                    "messages": thinking_skip_messages(tool_model, [
                         {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": "<think>\n</think>\n"},
-                    ],
+                    ]),
                     "temperature": 0.0,
                     "max_tokens": 200,
                 },

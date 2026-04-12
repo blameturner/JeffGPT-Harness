@@ -11,7 +11,7 @@ from typing import Iterator, Literal
 
 import requests
 
-from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED
+from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, thinking_skip_messages
 from workers.search.temporal import build_temporal_context
 from memory import remember
 from rag import retrieve
@@ -105,10 +105,9 @@ def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> lis
             f"{fast_url}/v1/chat/completions",
             json={
                 "model": fast_model,
-                "messages": [
+                "messages": thinking_skip_messages(fast_model, [
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "<think>\n</think>\n"},
-                ],
+                ]),
                 "temperature": 0.0,
                 "max_tokens": 400,
             },
@@ -408,14 +407,21 @@ class CodeAgent(ChatAgent):
             except Exception:
                 _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
+        # Plan checklist must emit BEFORE done so the frontend receives it.
+        checklist_steps = None
+        if self.mode == "plan" and output:
+            tool_url, tool_model = self._tool_model_url()
+            if tool_url:
+                checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
+                if checklist_steps:
+                    emit({"type": "plan_checklist", "steps": checklist_steps})
+
         if conversation_id is not None:
             try:
                 self.db.update_code_conversation(conversation_id, {"status": "complete"})
             except Exception:
                 _log.warning("status update to complete failed  conv=%s", conversation_id)
 
-        # Emit done immediately so the frontend shows completion without
-        # waiting for slow background tasks (embedding, graph, checklist).
         emit({
             "type": "done",
             "mode": self.mode,
@@ -427,9 +433,8 @@ class CodeAgent(ChatAgent):
             "output": output,
         })
 
-        # Background: memory, graph extraction, and checklist parsing.
-        # These involve CPU-bound embedding and model calls — run after
-        # the user already has their response.
+        # Background: memory writes and graph extraction involve CPU-bound
+        # embedding calls. Run after the user already has their response.
         import threading
 
         def _post_turn_work():
@@ -460,17 +465,11 @@ class CodeAgent(ChatAgent):
                 except Exception:
                     _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
 
-            if self.mode == "plan" and output:
-                tool_url, tool_model = self._tool_model_url()
-                if tool_url:
-                    checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
-                    if checklist_steps:
-                        emit({"type": "plan_checklist", "steps": checklist_steps})
-                        if conversation_id is not None:
-                            try:
-                                self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
-                            except Exception:
-                                _log.error("checklist persist failed  conv=%s", conversation_id, exc_info=True)
+            if checklist_steps and conversation_id is not None:
+                try:
+                    self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
+                except Exception:
+                    _log.error("checklist persist failed  conv=%s", conversation_id, exc_info=True)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 

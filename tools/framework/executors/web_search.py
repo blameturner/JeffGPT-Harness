@@ -33,6 +33,7 @@ import time
 
 import httpx
 
+from config import thinking_skip_messages
 from tools.framework.contract import ToolName, ToolResult
 from tools.framework.dispatcher import register_executor
 from workers.enrichment.models import _assert_not_reasoner
@@ -153,11 +154,10 @@ async def _summarise_one(
             _assert_not_reasoner(tool_url)
             _log.info("summarise start  url=%s model=%s", url[:80], tool_model_id)
             payload = {
-                "messages": [
+                "messages": thinking_skip_messages(tool_model_id, [
                     {"role": "system", "content": _SUMMARISE_SYSTEM},
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "<think>\n</think>\n"},
-                ],
+                ]),
                 "max_tokens": 600,
                 "temperature": 0.1,
             }
@@ -173,7 +173,7 @@ async def _summarise_one(
         _log.info("summarise ok  url=%s chars=%d", url[:80], len(summary))
         return summary[:MAX_SUMMARY_CHARS] if summary else text[:MAX_SUMMARY_CHARS]
     except Exception as e:
-        _log.warning("summarise failed  url=%s: %s (%s)", url[:80], type(e).__name__, e)
+        _log.warning("summarise failed  url=%s: %s %r", url[:80], type(e).__name__, e)
         return text[:MAX_SUMMARY_CHARS]
 
 

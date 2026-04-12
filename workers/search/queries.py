@@ -21,6 +21,7 @@ from workers.search.intent import (
     CODE_INTENT_LOOKUP,
     TASK_INTENT_SEARCH_EXPLICIT,
 )
+from config import thinking_skip_messages
 from workers.search.models import _tool_model
 from workers.search.temporal import build_prompt_date_header, now_in_chat_tz
 
@@ -215,10 +216,9 @@ def rerank_candidates(
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": [
+                "messages": thinking_skip_messages(tool_model, [
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "<think>\n</think>\n"},
-                ],
+                ]),
                 "temperature": 0.0,
                 "max_tokens": 80,
             },
@@ -300,10 +300,9 @@ def reformulate_query(
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": [
+                "messages": thinking_skip_messages(tool_model, [
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "<think>\n</think>\n"},
-                ],
+                ]),
                 "temperature": 0.0,
                 "max_tokens": 60,
             },

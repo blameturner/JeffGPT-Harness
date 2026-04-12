@@ -5,7 +5,7 @@ import time
 
 import httpx
 
-from config import MODELS, REASONER_ROLE
+from config import MODELS, REASONER_ROLE, thinking_skip_messages
 from workers.search.models import acquire_model
 
 _log = logging.getLogger("enrichment_agent.models")
@@ -55,10 +55,9 @@ def _model_call(
             f"{url}/v1/chat/completions",
             json={
                 "model": model_id,
-                "messages": [
+                "messages": thinking_skip_messages(model_id, [
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "<think>\n</think>\n"},
-                ],
+                ]),
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },

@@ -18,6 +18,7 @@ import time
 
 import httpx
 
+from config import thinking_skip_messages
 from tools.framework.contract import ToolPlan
 from workers.enrichment.models import _assert_not_reasoner
 from workers.search.models import acquire_model
@@ -110,11 +111,10 @@ async def generate_plan(
                     f"{tool_url}/v1/chat/completions",
                     json={
                         "model": tool_model_id,
-                        "messages": [
+                        "messages": thinking_skip_messages(tool_model_id, [
                             {"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": "\n".join(user_prompt_parts)},
-                            {"role": "assistant", "content": "<think>\n</think>\n"},
-                        ],
+                        ]),
                         "temperature": 0.1,
                         "max_tokens": 500,
                     },
