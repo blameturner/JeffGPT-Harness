@@ -105,7 +105,10 @@ def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> lis
             f"{fast_url}/v1/chat/completions",
             json={
                 "model": fast_model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
+                ],
                 "temperature": 0.0,
                 "max_tokens": 400,
             },
@@ -278,6 +281,13 @@ class CodeAgent(ChatAgent):
                       conversation_id, self.mode, sorted(hints) or "[]")
 
             if hints:
+                emit({
+                    "type": "tool_status",
+                    "phase": "thinking",
+                    "summary": "Preparing tools...",
+                    "tools": sorted(hints),
+                })
+
                 async def _plan_and_run() -> ToolContext:
                     convo_summary = ""
                     if history:
@@ -379,6 +389,8 @@ class CodeAgent(ChatAgent):
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s mode=%s model=%s in=%d out=%d %.1fs", conversation_id, self.mode, final_model, tokens_input, tokens_output, duration)
 
+        # Persist assistant message immediately — this is the critical write
+        # that survives page navigation. Everything after this is background work.
         if output and conversation_id is not None:
             try:
                 self.db.add_code_message(
@@ -396,47 +408,14 @@ class CodeAgent(ChatAgent):
             except Exception:
                 _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
-            try:
-                remember(
-                    text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
-                    metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
-                    org_id=self.org_id,
-                    collection_name=f"code_{conversation_id}",
-                )
-            except Exception:
-                _log.error("memory write failed", exc_info=True)
-
-        if convo_knowledge and output:
-            try:
-                remember(
-                    text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
-                    metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
-                    org_id=self.org_id,
-                    collection_name="code_knowledge",
-                )
-            except Exception:
-                _log.error("code_knowledge write failed", exc_info=True)
-            self._extract_and_write_graph(user_message, output, conversation_id)
-
-        checklist_steps = None
-        if self.mode == "plan" and output:
-            tool_url, tool_model = self._tool_model_url()
-            if tool_url:
-                checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
-                if checklist_steps:
-                    emit({"type": "plan_checklist", "steps": checklist_steps})
-                    if conversation_id is not None:
-                        try:
-                            self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
-                        except Exception:
-                            _log.error("checklist persist failed", exc_info=True)
-
         if conversation_id is not None:
             try:
                 self.db.update_code_conversation(conversation_id, {"status": "complete"})
             except Exception:
                 _log.warning("status update to complete failed  conv=%s", conversation_id)
 
+        # Emit done immediately so the frontend shows completion without
+        # waiting for slow background tasks (embedding, graph, checklist).
         emit({
             "type": "done",
             "mode": self.mode,
@@ -447,6 +426,53 @@ class CodeAgent(ChatAgent):
             "duration_seconds": duration,
             "output": output,
         })
+
+        # Background: memory, graph extraction, and checklist parsing.
+        # These involve CPU-bound embedding and model calls — run after
+        # the user already has their response.
+        import threading
+
+        def _post_turn_work():
+            if output and conversation_id is not None:
+                try:
+                    remember(
+                        text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
+                        metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
+                        org_id=self.org_id,
+                        collection_name=f"code_{conversation_id}",
+                    )
+                except Exception:
+                    _log.error("memory write failed  conv=%s", conversation_id, exc_info=True)
+
+            if convo_knowledge and output:
+                try:
+                    remember(
+                        text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
+                        metadata={"conversation_id": conversation_id, "model": str(final_model), "mode": self.mode, "turn_time": time.time()},
+                        org_id=self.org_id,
+                        collection_name="code_knowledge",
+                    )
+                except Exception:
+                    _log.error("code_knowledge write failed  conv=%s", conversation_id, exc_info=True)
+                try:
+                    from workers.chat.graph import extract_and_write_graph
+                    extract_and_write_graph(user_message, output, conversation_id, self.org_id)
+                except Exception:
+                    _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
+
+            if self.mode == "plan" and output:
+                tool_url, tool_model = self._tool_model_url()
+                if tool_url:
+                    checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
+                    if checklist_steps:
+                        emit({"type": "plan_checklist", "steps": checklist_steps})
+                        if conversation_id is not None:
+                            try:
+                                self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
+                            except Exception:
+                                _log.error("checklist persist failed  conv=%s", conversation_id, exc_info=True)
+
+        threading.Thread(target=_post_turn_work, daemon=True).start()
 
     def run_streaming(
         self,

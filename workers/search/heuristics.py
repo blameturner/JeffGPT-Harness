@@ -108,11 +108,15 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
         f"Message: {msg[:500]}"
     )
     try:
+        _log.info("heuristic classify start  model=%s", tool_model)
         resp = httpx.post(
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
+                ],
                 "temperature": 0.0,
                 "max_tokens": 80,
             },
