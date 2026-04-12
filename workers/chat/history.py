@@ -2,11 +2,6 @@ from __future__ import annotations
 
 import logging
 
-import requests
-
-from config import no_think_params
-from workers.search.models import _tool_model
-
 _log = logging.getLogger("chat.history")
 
 
@@ -41,58 +36,9 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
         used += len(line)
     transcript = "".join(buf)
 
-    # Don't block chat on model availability — try with a short timeout,
-    # fall back to simple truncation if the model is busy.
-    fast_url, fast_model = _tool_model()
-    summary_text: str | None = None
-
-    if fast_url:
-        try:
-            resp = requests.post(
-                f"{fast_url}/v1/chat/completions",
-                json={
-                    "model": fast_model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You compress chat history. Given a transcript, "
-                                "produce a concise factual summary (<= 400 words) "
-                                "preserving names, decisions, open questions, and "
-                                "any instructions the user gave. No preamble."
-                            ),
-                        },
-                        {"role": "user", "content": transcript},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 800,
-                    **no_think_params(),
-                },
-                timeout=(5, 120),
-            )
-            resp.raise_for_status()
-            summary_text = resp.json()["choices"][0]["message"]["content"]
-        except requests.ConnectionError:
-            _log.warning("summarisation skipped — model unreachable, using truncation")
-        except requests.Timeout:
-            _log.warning("summarisation skipped — model busy, using truncation")
-        except Exception as e:
-            _log.warning("summarisation failed, falling back: %s", e)
-            summary_text = None
-
-    if summary_text:
-        new_history = [
-            {
-                "role": "system",
-                "content": f"Earlier conversation summary:\n{summary_text}",
-            }
-        ] + recent
-        return new_history, {
-            "type": "summarised",
-            "removed": len(old),
-            "summary_chars": len(summary_text),
-        }
-
+    # Never call a model during the interactive chat path — just truncate.
+    # Model-based summarisation is too slow on CPU and blocks the chat flow.
+    _log.info("summarisation: truncating to last %d messages (dropped %d)", FALLBACK_RECENT_MESSAGES, max(0, len(history) - FALLBACK_RECENT_MESSAGES))
     trimmed = history[-FALLBACK_RECENT_MESSAGES:]
     return trimmed, {
         "type": "summarised",

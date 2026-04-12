@@ -191,10 +191,19 @@ class ChatAgent:
                 _t_tools = time.perf_counter()
 
                 if hints == {"web_search"}:
-                    # Fast path: skip planner entirely for web_search-only.
-                    # Use intent classification + template queries (no model call for most messages).
+                    # Fast path: skip planner AND intent classifier entirely.
+                    # Build queries directly from the user message — zero model calls.
                     _log.info("web_search fast-path  conv=%s", conversation_id)
-                    intent_dict = classify_message_intent(user_message, history[-6:] if history else None)
+                    # Simple heuristic intent for query generation — no model call
+                    words = user_message.lower().split()
+                    entities = [w for w in user_message.split() if len(w) > 3 and w[0].isupper()]
+                    intent_dict = {
+                        "intent": "factual_lookup",
+                        "entities": entities or [user_message[:60]],
+                        "time_sensitive": any(w in words for w in ("latest", "recent", "current", "today", "now", "2025", "2026")),
+                        "confidence": "medium",
+                        "search_policy": "focused",
+                    }
                     queries = generate_search_queries(intent_dict, message=user_message)
                     _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
 
