@@ -483,7 +483,7 @@ class ChatAgent:
             f"{self.url}/v1/chat/completions",
             json=payload,
             stream=True,
-            timeout=(10, 600),
+            timeout=(30, 3600),
         ) as response:
             response.raise_for_status()
             response.encoding = "utf-8"

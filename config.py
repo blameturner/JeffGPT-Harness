@@ -236,8 +236,7 @@ def scoped_graph(org_id: int) -> str:
 def no_think_params() -> dict:
     """Extra params to disable thinking on tool/classifier model calls.
 
-    llama.cpp rejects assistant prefills when thinking is enabled, so we
-    disable thinking at the API level instead. Returns a dict to merge
-    into the request JSON payload.
+    llama.cpp passes chat_template_kwargs through the Jinja chat template.
+    Setting enable_thinking=false tells the template to skip thinking blocks.
     """
-    return {"enable_thinking": False}
+    return {"chat_template_kwargs": {"enable_thinking": False}}
