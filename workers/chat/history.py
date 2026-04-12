@@ -41,6 +41,8 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
         used += len(line)
     transcript = "".join(buf)
 
+    # Don't block chat on model availability — try with a short timeout,
+    # fall back to simple truncation if the model is busy.
     fast_url, fast_model = _tool_model()
     summary_text: str | None = None
 
@@ -66,10 +68,14 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
                     "max_tokens": 800,
                     **no_think_params(),
                 },
-                timeout=3600,
+                timeout=(5, 120),
             )
             resp.raise_for_status()
             summary_text = resp.json()["choices"][0]["message"]["content"]
+        except requests.ConnectionError:
+            _log.warning("summarisation skipped — model unreachable, using truncation")
+        except requests.Timeout:
+            _log.warning("summarisation skipped — model busy, using truncation")
         except Exception as e:
             _log.warning("summarisation failed, falling back: %s", e)
             summary_text = None
