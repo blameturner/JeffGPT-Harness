@@ -163,7 +163,7 @@ def start_scheduler() -> BackgroundScheduler:
     )
     sched.add_job(
         run_batch_summarise,
-        CronTrigger(hour=18, minute=0),  # 4am AEST = 18:00 UTC
+        CronTrigger(hour=4, minute=0, timezone="Australia/Sydney"),
         id="batch_summarise",
         max_instances=1,
         coalesce=True,
