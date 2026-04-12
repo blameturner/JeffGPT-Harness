@@ -14,6 +14,8 @@ The underlying set up this is deployed on:
 - 512gb SSD
 - Ubuntu 22.04
 
+Currently running a series of Gemma 4 models as T1s, T2 is Qwen3.5 Coder and the Tool is a Qwen tool.
+
 The entire build is deployed in Docker Containers. The Frontend is a React/Typescript App, with a Hono/NodeJS Gateway to handle requests and types.
 
 The repo for the Frontend is here https://github.com/blameturner/mst-harness-ui
@@ -26,20 +28,23 @@ The Docker Compose config for this container is:
         extra_hosts:
           - "host.docker.internal:host-gateway"
         environment:
-          - MODEL_REASONER_URL=http://host.docker.internal:8080
-          - MODEL_FAST_URL=http://host.docker.internal:8081
-          - MODEL_CODER_URL=http://host.docker.internal:8082
-          - MODEL_TOOL_URL=http://host.docker.internal:8085
-          - EMBEDDER_URL=http://host.docker.internal:8083
-          - RERANKER_URL=http://host.docker.internal:8084
-          - CHROMA_URL=http://host.docker.internal:XXXX
-          - FALKORDB_HOST=falkordb
-          - FALKORDB_PORT=XXXX
-          - NOCODB_URL=http://host.docker.internal:XXXX
-          - NOCODB_TOKEN=XXXX
-          - NOCODB_BASE_ID=XXXX
+          - MODEL_T1_PRIMARY_URL=http://host.docker.internal:8080
+          - MODEL_T1_SECONDARY_URL=http://host.docker.internal:8081
+          - MODEL_T2_CODER_URL=http://host.docker.internal:8082
+          - MODEL_T3_TOOL_URL=http://host.docker.internal:8085
+          - MODEL_EXP_RWKV_URL=http://host.docker.internal:8086
+          - MODEL_EXP_RWKV_R_URL=http://host.docker.internal:8087
+          - SVC_WHISPER_URL=http://host.docker.internal:8090
+          - SVC_EMBEDDER_URL=http://host.docker.internal:8083
+          - SVC_RERANKER_URL=http://host.docker.internal:8084
+          - DB_CHROMA_URL=http://host.docker.internal:XXXX
+          - DB_FALKORDB_HOST=falkordb
+          - DB_FALKORDB_PORT=XXXX
+          - DB_NOCODB_URL=http://host.docker.internal:XXXX
+          - DB_NOCODB_TOKEN=XXXX
+          - DB_NOCODB_BASE_ID=XXXX
           - ENVIRONMENT=production
-          - SEARXNG_URL=http://host.docker.internal:XXXX
+          - SVC_SEARXNG_URL=http://host.docker.internal:XXXX
           - ENRICHMENT_TOKEN_BUDGET=50000
           - ENRICHMENT_LOG_RETENTION_DAYS=30
         ports:
