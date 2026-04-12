@@ -15,8 +15,6 @@ from tools.framework.contract import ToolAction, ToolContext, ToolName, ToolPlan
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
-from workers.search.intent import classify_message_intent
-from workers.search.models import _tool_model
 from workers.search.queries import generate_search_queries
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise
@@ -80,6 +78,7 @@ class ChatAgent:
 
     @staticmethod
     def _tool_model_url() -> tuple[str | None, str | None]:
+        from workers.search.models import _tool_model
         return _tool_model()
 
     def run_job(

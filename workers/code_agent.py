@@ -413,15 +413,6 @@ class CodeAgent(ChatAgent):
             except Exception:
                 _log.error("assistant message persist failed  conv=%s", conversation_id, exc_info=True)
 
-        # Plan checklist must emit BEFORE done so the frontend receives it.
-        checklist_steps = None
-        if self.mode == "plan" and output:
-            tool_url, tool_model = self._tool_model_url()
-            if tool_url:
-                checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
-                if checklist_steps:
-                    emit({"type": "plan_checklist", "steps": checklist_steps})
-
         if conversation_id is not None:
             try:
                 self.db.update_code_conversation(conversation_id, {"status": "complete"})
@@ -471,11 +462,16 @@ class CodeAgent(ChatAgent):
                 except Exception:
                     _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
 
-            if checklist_steps and conversation_id is not None:
-                try:
-                    self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
-                except Exception:
-                    _log.error("checklist persist failed  conv=%s", conversation_id, exc_info=True)
+            if self.mode == "plan" and output and conversation_id is not None:
+                tool_url, tool_model = self._tool_model_url()
+                if tool_url:
+                    try:
+                        checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
+                        if checklist_steps:
+                            self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
+                            _log.info("bg: checklist persisted  conv=%s steps=%d", conversation_id, len(checklist_steps))
+                    except Exception:
+                        _log.error("bg: checklist failed  conv=%s", conversation_id, exc_info=True)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 

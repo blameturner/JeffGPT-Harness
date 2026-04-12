@@ -46,6 +46,14 @@ def run_enrichment_cycle(enrichment_agent_id: int | None = None) -> None:
         db.log_event(cycle_id, "deferred", message="active agent_runs")
         return
 
+    # Defer if any chat jobs are currently active — don't compete for CPU.
+    from workers.jobs import STORE
+    active_jobs = sum(1 for j in STORE._jobs.values() if not j.done)
+    if active_jobs > 0:
+        _log.info("cycle %s deferred — %d active chat jobs", cycle_id, active_jobs)
+        db.log_event(cycle_id, "deferred", message=f"{active_jobs} active chat jobs")
+        return
+
     db.log_event(cycle_id, "cycle_start", message=label)
     tokens_used = 0
 
