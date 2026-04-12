@@ -321,11 +321,15 @@ def classify_message_intent(
             if not tool_url:
                 _log.warning("intent classifier: no tool model available, using fallback")
                 return _fallback_intent()
+            _log.info("intent classify start  model=%s", tool_model)
             resp = httpx.post(
                 f"{tool_url}/v1/chat/completions",
                 json={
                     "model": tool_model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": "<think>\n</think>\n"},
+                    ],
                     "temperature": 0.0,
                     "max_tokens": 200,
                 },
@@ -334,7 +338,7 @@ def classify_message_intent(
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        _log.warning("intent classifier call failed: %s", e)
+        _log.warning("intent classifier failed: %s", e)
         return _fallback_intent()
 
     elapsed = round(time.time() - started, 2)

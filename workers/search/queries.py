@@ -210,11 +210,15 @@ def rerank_candidates(
 
     started = time.time()
     try:
+        _log.info("rerank start  model=%s candidates=%d", tool_model, len(head))
         resp = httpx.post(
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
+                ],
                 "temperature": 0.0,
                 "max_tokens": 80,
             },
@@ -223,7 +227,7 @@ def rerank_candidates(
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        _log.warning("rerank call failed: %s — passing candidates through", e)
+        _log.warning("rerank failed  model=%s: %s — passing candidates through", tool_model, e)
         return [(c, 3) for c in candidates]
 
     elapsed = round(time.time() - started, 2)
@@ -291,11 +295,15 @@ def reformulate_query(
         "around the whole thing, no preamble.\n\nSimpler query:"
     )
     try:
+        _log.info("query reformulate start  model=%s", tool_model)
         resp = httpx.post(
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
+                ],
                 "temperature": 0.0,
                 "max_tokens": 60,
             },
@@ -304,7 +312,7 @@ def reformulate_query(
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        _log.warning("query reformulation failed: %s", e)
+        _log.warning("query reformulation failed  model=%s: %s", tool_model, e)
         return None
 
     cleaned = raw.strip()

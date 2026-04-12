@@ -46,7 +46,7 @@ MAX_URLS_TO_PROCESS = 6
 MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
-SUMMARY_TIMEOUT = 30.0
+SUMMARY_TIMEOUT = 120.0
 
 
 _SUMMARISE_SYSTEM = (
@@ -151,10 +151,12 @@ async def _summarise_one(
                 _log.warning("no tool model available for summarise url=%s", url)
                 return text[:MAX_SUMMARY_CHARS]
             _assert_not_reasoner(tool_url)
+            _log.info("summarise start  url=%s model=%s", url[:80], tool_model_id)
             payload = {
                 "messages": [
                     {"role": "system", "content": _SUMMARISE_SYSTEM},
                     {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
                 ],
                 "max_tokens": 600,
                 "temperature": 0.1,
@@ -168,9 +170,10 @@ async def _summarise_one(
             )
             resp.raise_for_status()
         summary = resp.json()["choices"][0]["message"]["content"].strip()
+        _log.info("summarise ok  url=%s chars=%d", url[:80], len(summary))
         return summary[:MAX_SUMMARY_CHARS] if summary else text[:MAX_SUMMARY_CHARS]
     except Exception as e:
-        _log.warning("summarise failed url=%s: %s", url, e)
+        _log.warning("summarise failed  url=%s: %s (%s)", url[:80], type(e).__name__, e)
         return text[:MAX_SUMMARY_CHARS]
 
 

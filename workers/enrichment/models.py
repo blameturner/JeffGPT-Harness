@@ -46,8 +46,8 @@ def _model_call(
         return "", 0
     _assert_not_reasoner(url)
     started = time.time()
-    _log.debug(
-        "%s    url=%s model=%s prompt_len=%d max_tokens=%d",
+    _log.info(
+        "%s start  url=%s model=%s prompt_len=%d max_tokens=%d",
         role_label, url, model_id, len(prompt), max_tokens,
     )
     try:
@@ -55,7 +55,10 @@ def _model_call(
             f"{url}/v1/chat/completions",
             json={
                 "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "<think>\n</think>\n"},
+                ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },
@@ -67,7 +70,7 @@ def _model_call(
         usage = data.get("usage") or {}
         tokens = int(usage.get("total_tokens") or (len(prompt) // 4 + max_tokens))
         elapsed = round(time.time() - started, 2)
-        _log.debug("%s ok  tokens=%d %.2fs", role_label, tokens, elapsed)
+        _log.info("%s ok  tokens=%d %.2fs", role_label, tokens, elapsed)
         return text, tokens
     except httpx.HTTPStatusError as e:
         _log.error(

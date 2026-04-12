@@ -104,6 +104,7 @@ async def generate_plan(
                 _log.warning("no tool model available — skipping plan")
                 return None
             _assert_not_reasoner(tool_url)
+            _log.info("planner call  model=%s url=%s", tool_model_id, tool_url)
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     f"{tool_url}/v1/chat/completions",
@@ -112,6 +113,7 @@ async def generate_plan(
                         "messages": [
                             {"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": "\n".join(user_prompt_parts)},
+                            {"role": "assistant", "content": "<think>\n</think>\n"},
                         ],
                         "temperature": 0.1,
                         "max_tokens": 500,
@@ -119,6 +121,7 @@ async def generate_plan(
                 )
                 resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
+        _log.info("planner response  model=%s chars=%d elapsed=%.2fs", tool_model_id, len(raw), time.time() - t0)
     except Exception:
         _log.warning("planner call failed", exc_info=True)
         return None

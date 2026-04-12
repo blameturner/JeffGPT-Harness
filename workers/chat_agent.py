@@ -169,6 +169,13 @@ class ChatAgent:
             _log.info("tools gate  conv=%s hints=%s", conversation_id, sorted(hints) or "[]")
 
             if hints:
+                emit({
+                    "type": "tool_status",
+                    "phase": "thinking",
+                    "summary": "Preparing tools...",
+                    "tools": sorted(hints),
+                })
+
                 async def _plan_and_run() -> ToolContext:
                     convo_summary = ""
                     if history:
@@ -195,9 +202,12 @@ class ChatAgent:
                     return await execute_plan(plan, emit)
 
                 try:
+                    _t_tools = time.perf_counter()
+                    _log.info("tools framework starting  conv=%s hints=%s", conversation_id, sorted(hints))
                     tool_context = asyncio.run(_plan_and_run())
+                    _log.info("tools framework done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
                 except Exception:
-                    _log.error("tools framework failed", exc_info=True)
+                    _log.error("tools framework failed  conv=%s", conversation_id, exc_info=True)
                     tool_context = ToolContext()
 
             # Map web_search results back onto search_result so the downstream

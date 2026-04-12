@@ -12,7 +12,10 @@ answer). So this gate is intentionally broad.
 
 from __future__ import annotations
 
+import logging
 import re
+
+_log = logging.getLogger("tools.gate")
 
 from workers.search.heuristics import _definitely_no_search, _explicit_search_intent
 
@@ -152,6 +155,8 @@ def gate_check(
                 hints.add("rag_lookup")
             if _CODE_RUN_REQUEST.search(msg):
                 hints.add("code_exec")
+        if hints:
+            _log.info("gate  msg=%s hints=%s (no_search path)", msg[:80], sorted(hints))
         return hints
 
     hints: set[str] = set()
@@ -177,4 +182,6 @@ def gate_check(
         if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
             hints.add("web_search")
 
+    if hints:
+        _log.info("gate  msg=%s hints=%s", msg[:80], sorted(hints))
     return hints
