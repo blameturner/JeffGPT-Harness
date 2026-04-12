@@ -520,6 +520,7 @@ class ChatAgent:
         in_think_block = False
         think_tokens = 0
         first_content_emitted = False
+        reasoning_chunks: list[str] = []
 
         with requests.post(
             f"{self.url}/v1/chat/completions",
@@ -559,8 +560,9 @@ class ChatAgent:
                 text = delta.get("content")
 
                 if reasoning and not text:
-                    # Model is still thinking — count but don't emit
+                    # Model is still thinking — collect but don't emit yet
                     think_tokens += 1
+                    reasoning_chunks.append(reasoning)
                     continue
 
                 if not text:
@@ -582,6 +584,17 @@ class ChatAgent:
                 first_content_emitted = True
                 chunks.append(text)
                 emit({"type": "chunk", "text": text})
+
+        # Fallback: if model put everything in reasoning_content and content was
+        # always empty, use the reasoning as the output. Better than losing the response.
+        if not chunks and reasoning_chunks:
+            _log.warning("model returned no content, using reasoning_content as fallback  tokens=%d", len(reasoning_chunks))
+            full_reasoning = "".join(reasoning_chunks)
+            chunks.append(full_reasoning)
+            emit({"type": "chunk", "text": full_reasoning})
+
+        if think_tokens > 0:
+            _log.info("model thinking summary  think_tokens=%d content_tokens=%d", think_tokens, len(chunks))
 
         return chunks, final_usage, final_model
 

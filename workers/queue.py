@@ -59,6 +59,7 @@ class QueueJob:
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("nocodb_id", None)
+        d.pop("created_at", None)
         if isinstance(d.get("payload"), dict):
             d["payload"] = json.dumps(d["payload"])
         return d

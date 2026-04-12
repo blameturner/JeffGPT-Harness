@@ -134,7 +134,7 @@ _PW_QUEUE_SENTINEL = object()
 _pw_queue: queue.Queue | None = None
 _pw_worker: threading.Thread | None = None
 _pw_worker_lock = threading.Lock()
-PLAYWRIGHT_FETCH_TIMEOUT = 60
+PLAYWRIGHT_FETCH_TIMEOUT = 120
 MAX_RESPONSE_BYTES = 5_000_000
 
 
@@ -220,16 +220,16 @@ def _playwright_worker_main() -> None:
                     else route.abort()
                 ))
 
-                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=5_000)
+                    page.wait_for_load_state("networkidle", timeout=30_000)
                 except Exception:
                     pass
                 # SPA lazy-render: wait for body to accumulate real text.
                 try:
                     page.wait_for_function(
-                        "() => document.body && document.body.innerText.length > 500",
-                        timeout=5_000,
+                        "() => document.body && document.body.innerText.length > 200",
+                        timeout=30_000,
                     )
                 except Exception:
                     pass
@@ -316,7 +316,7 @@ def _scrape_with_httpx(url: str) -> str:
     try:
         resp = httpx.get(
             url,
-            timeout=30,
+            timeout=60,
             follow_redirects=True,
             headers=BROWSER_HEADERS,
         )
@@ -326,7 +326,7 @@ def _scrape_with_httpx(url: str) -> str:
         if "ssl" in err_str or "certificate" in err_str or "verify" in err_str:
             _log.warning("scrape ssl error, retrying without verification  url=%s", url[:80])
             try:
-                resp = httpx.get(url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS, verify=False)
+                resp = httpx.get(url, timeout=60, follow_redirects=True, headers=BROWSER_HEADERS, verify=False)
                 resp.raise_for_status()
             except Exception as e2:
                 _log.warning("scrape ssl retry also failed  url=%s: %s", url[:80], e2)

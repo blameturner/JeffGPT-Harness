@@ -64,7 +64,11 @@ def _model_call(
         )
         r.raise_for_status()
         data = r.json()
-        text = data["choices"][0]["message"]["content"].strip()
+        msg = data["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        if not text and msg.get("reasoning_content"):
+            text = msg["reasoning_content"].strip()
+            _log.warning("%s content empty, using reasoning_content as fallback", role_label)
         usage = data.get("usage") or {}
         tokens = int(usage.get("total_tokens") or (len(prompt) // 4 + max_tokens))
         elapsed = round(time.time() - started, 2)
