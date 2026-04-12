@@ -293,46 +293,80 @@ class CodeAgent(ChatAgent):
                     "tools": sorted(hints),
                 })
 
-                async def _plan_and_run() -> ToolContext:
-                    convo_summary = ""
-                    if history:
-                        last = history[-1].get("content") or ""
-                        convo_summary = last[:200]
-                    plan = await generate_plan(
-                        user_message=user_message,
-                        hints=hints,
-                        conversation_summary=convo_summary,
-                    )
-                    if plan is None:
-                        return ToolContext()
-                    # Inject scope into each action's params. Code sessions have
-                    # their own memory collection plus the attached codebase (if
-                    # any); rag_lookup uses whichever it receives in params.
-                    code_collection = f"code_{conversation_id}" if conversation_id else "code_knowledge"
-                    for a in plan.actions:
-                        a.params["_org_id"] = self.org_id
-                        a.params["_collection"] = code_collection
-                        # Widen rag_lookup to the cross-session code collections
-                        # plus the attached codebase_collection if present.
-                        if a.tool.value == "rag_lookup" and "collections" not in a.params:
-                            cols = [code_collection, "code_knowledge"]
-                            if codebase_collection:
-                                cols.append(codebase_collection)
-                            a.params["collections"] = cols
-                    emit({
-                        "type": "tool_status",
-                        "phase": "planning",
-                        "summary": plan.summary,
-                        "tools": [a.tool.value for a in plan.actions],
-                    })
-                    return await execute_plan(plan, emit)
+                code_collection = f"code_{conversation_id}" if conversation_id else "code_knowledge"
 
-                try:
-                    tool_context = asyncio.run(_plan_and_run())
-                except Exception:
-                    _log.error("tools framework failed  conv=%s",
-                               conversation_id, exc_info=True)
-                    tool_context = ToolContext()
+                if hints == {"web_search"}:
+                    # Fast path: skip planner, zero model calls.
+                    _log.info("web_search fast-path  conv=%s", conversation_id)
+                    from workers.search.queries import generate_search_queries
+                    words = user_message.lower().split()
+                    entities = [w for w in user_message.split() if len(w) > 3 and w[0].isupper()]
+                    intent_dict = {
+                        "intent": "factual_lookup",
+                        "entities": entities or [user_message[:60]],
+                        "time_sensitive": any(w in words for w in ("latest", "recent", "current", "today", "now", "2025", "2026")),
+                        "confidence": "medium",
+                        "search_policy": "focused",
+                    }
+                    queries = generate_search_queries(intent_dict, message=user_message)
+                    _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
+
+                    if queries:
+                        from tools.framework.contract import ToolAction, ToolName, ToolPlan
+                        plan = ToolPlan(
+                            actions=[ToolAction(
+                                tool=ToolName.WEB_SEARCH,
+                                params={
+                                    "queries": queries,
+                                    "_org_id": self.org_id,
+                                    "_collection": code_collection,
+                                    "_mode": "normal",
+                                },
+                                reason="web search",
+                            )],
+                            summary=instant_summary,
+                        )
+                        try:
+                            tool_context = asyncio.run(execute_plan(plan, emit))
+                        except Exception:
+                            _log.error("web_search fast-path failed  conv=%s", conversation_id, exc_info=True)
+                            tool_context = ToolContext()
+                else:
+                    # Full planner path for non-search hints.
+                    async def _plan_and_run() -> ToolContext:
+                        convo_summary = ""
+                        if history:
+                            last = history[-1].get("content") or ""
+                            convo_summary = last[:200]
+                        plan = await generate_plan(
+                            user_message=user_message,
+                            hints=hints,
+                            conversation_summary=convo_summary,
+                        )
+                        if plan is None:
+                            return ToolContext()
+                        for a in plan.actions:
+                            a.params["_org_id"] = self.org_id
+                            a.params["_collection"] = code_collection
+                            if a.tool.value == "rag_lookup" and "collections" not in a.params:
+                                cols = [code_collection, "code_knowledge"]
+                                if codebase_collection:
+                                    cols.append(codebase_collection)
+                                a.params["collections"] = cols
+                        emit({
+                            "type": "tool_status",
+                            "phase": "planning",
+                            "summary": plan.summary,
+                            "tools": [a.tool.value for a in plan.actions],
+                        })
+                        return await execute_plan(plan, emit)
+
+                    try:
+                        tool_context = asyncio.run(_plan_and_run())
+                    except Exception:
+                        _log.error("tools framework failed  conv=%s",
+                                   conversation_id, exc_info=True)
+                        tool_context = ToolContext()
 
         storage_files = _files_to_storage(self.files)
         if conversation_id is not None:

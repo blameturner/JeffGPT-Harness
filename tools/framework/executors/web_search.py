@@ -279,7 +279,7 @@ async def execute(params: dict, emit) -> ToolResult:
         "urls": len(results),
         "scraped_ok": len([s for s in scraped if s["text"] and s["path"] not in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
         "snippet_only": len([s for s in scraped if s["path"] in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
-        "summarised": len(summaries),
+        "summarised": len(summaries) if mode == "deep" else 0,
         "chars": len(combined),
     }
     path_counts: dict[str, int] = {}
