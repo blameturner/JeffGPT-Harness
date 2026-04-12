@@ -4,7 +4,7 @@ import json
 import logging
 
 from config import MAX_SUMMARY_INPUT_CHARS
-from workers.enrichment.models import _fast_call
+from workers.enrichment.models import _tool_call
 
 _log = logging.getLogger("enrichment_agent.summarise")
 
@@ -17,7 +17,7 @@ def _summarise(text: str) -> tuple[str, int]:
         "quotes where notable.\n\n"
         f"PAGE:\n{text[:MAX_SUMMARY_INPUT_CHARS]}"
     )
-    summary, tokens = _fast_call(prompt, max_tokens=300)
+    summary, tokens = _tool_call(prompt, max_tokens=300)
     if summary:
         _log.info("summarise ok  summary_len=%d tokens=%d", len(summary), tokens)
     else:

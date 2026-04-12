@@ -10,7 +10,7 @@ from workers.search.models import acquire_model
 
 _log = logging.getLogger("enrichment_agent.models")
 
-FAST_TIMEOUT = 180
+FAST_TIMEOUT = 600
 
 
 def _assert_not_reasoner(url: str | None) -> None:

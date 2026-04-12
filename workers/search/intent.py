@@ -332,7 +332,7 @@ def classify_message_intent(
                     "max_tokens": 200,
                     **no_think_params(),
                 },
-                timeout=120,
+                timeout=600,
             )
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()

@@ -119,7 +119,7 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
                 "max_tokens": 80,
                 **no_think_params(),
             },
-            timeout=120,
+            timeout=600,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()

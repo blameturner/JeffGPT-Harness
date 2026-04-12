@@ -97,6 +97,9 @@ class ChatAgent:
         from workers.jobs import STORE
 
         def emit(event: dict):
+            etype = event.get("type", "")
+            if etype != "chunk":
+                _log.info("emit  type=%s %s", etype, event.get("phase") or event.get("summary", "")[:60] or "")
             STORE.append(job, event)
 
         _turn_start = time.perf_counter()

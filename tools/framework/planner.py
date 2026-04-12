@@ -106,7 +106,7 @@ async def generate_plan(
                 return None
             _assert_not_reasoner(tool_url)
             _log.info("planner call  model=%s url=%s", tool_model_id, tool_url)
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=600.0) as client:
                 resp = await client.post(
                     f"{tool_url}/v1/chat/completions",
                     json={

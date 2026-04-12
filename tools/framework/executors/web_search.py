@@ -47,7 +47,7 @@ MAX_URLS_TO_PROCESS = 6
 MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
-SUMMARY_TIMEOUT = 120.0
+SUMMARY_TIMEOUT = 600.0
 
 
 _SUMMARISE_SYSTEM = (
@@ -233,9 +233,17 @@ async def execute(params: dict, emit) -> ToolResult:
 
     summaries: list[str] = []
     if to_summarise:
+        # Limit concurrency to 2 so most work routes through the fast t3_tool
+        # model instead of spreading across slower large models.
+        _sem = asyncio.Semaphore(2)
+
+        async def _bounded_summarise(client, url, text, query):
+            async with _sem:
+                return await _summarise_one(client, url, text, query)
+
         async with httpx.AsyncClient() as client:
             summaries = await asyncio.gather(*[
-                _summarise_one(client, s["url"], s["text"], " | ".join(queries))
+                _bounded_summarise(client, s["url"], s["text"], " | ".join(queries))
                 for s in to_summarise
             ])
 

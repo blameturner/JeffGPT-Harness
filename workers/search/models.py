@@ -45,8 +45,12 @@ _log = logging.getLogger("web_search.models")
 
 # Role names match the MODEL_<NAME>_URL env var convention, lowercased and
 # with the leading MODEL_ stripped (see config._collect_role_env_vars).
-_FAST_POOL: tuple[str, ...] = ("t1_primary", "t1_secondary", "t2_coder")
-_TOOL_POOL: tuple[str, ...] = ("t3_tool", "t1_primary", "t1_secondary", "t2_coder")
+# Fast pool: used for enrichment summarisation and relationship extraction.
+# Only non-thinking models — Gemma 4 thinking can't be disabled per-request.
+_FAST_POOL: tuple[str, ...] = ("t3_tool", "t2_coder")
+# Tool pool: used for planner, classifiers, web search summariser.
+# t3_tool preferred (fast 4B), t2_coder fallback (no thinking).
+_TOOL_POOL: tuple[str, ...] = ("t3_tool", "t2_coder")
 
 _POOLS: dict[str, tuple[str, ...]] = {
     "fast": _FAST_POOL,
