@@ -116,7 +116,7 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
                 "temperature": 0.0,
                 "max_tokens": 80,
             },
-            timeout=20,
+            timeout=120,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()

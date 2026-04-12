@@ -218,7 +218,7 @@ def rerank_candidates(
                 "temperature": 0.0,
                 "max_tokens": 80,
             },
-            timeout=30,
+            timeout=120,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -299,7 +299,7 @@ def reformulate_query(
                 "temperature": 0.0,
                 "max_tokens": 60,
             },
-            timeout=20,
+            timeout=120,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()

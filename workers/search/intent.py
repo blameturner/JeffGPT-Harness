@@ -329,7 +329,7 @@ def classify_message_intent(
                     "temperature": 0.0,
                     "max_tokens": 200,
                 },
-                timeout=10,
+                timeout=120,
             )
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
