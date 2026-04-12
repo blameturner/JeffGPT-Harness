@@ -172,8 +172,8 @@ WHISPER_URL = os.getenv("SVC_WHISPER_URL")
 
 CHROMA_URL = os.getenv("DB_CHROMADB_URL")
 SEARXNG_URL = os.getenv("SVC_SEARXNG_URL", "http://mst-ag-searxng:8080")
-BROWSER_URL = os.getenv("SVC_BROWSER_URL", "http://mst-ag-browser:8086")
-SANDBOX_URL = os.getenv("SVC_SANDBOX_URL", "http://mst-ag-sandbox:8087")
+BROWSER_URL = os.getenv("SVC_BROWSER_URL", "http://localhost:3800/browser")
+SANDBOX_URL = os.getenv("SVC_SANDBOX_URL", "http://localhost:3800/sandbox")
 FALKORDB_HOST = os.getenv("DB_FALKORDB_HOST")
 FALKORDB_PORT = int(os.getenv("DB_FALKORDB_PORT", "6379"))
 
