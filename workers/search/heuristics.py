@@ -6,7 +6,7 @@ import re
 
 import httpx
 
-from config import thinking_skip_messages
+from config import no_think_params
 from workers.search.models import _tool_model
 
 _log = logging.getLogger("web_search.heuristics")
@@ -114,11 +114,10 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
             f"{tool_url}/v1/chat/completions",
             json={
                 "model": tool_model,
-                "messages": thinking_skip_messages(tool_model, [
-                    {"role": "user", "content": prompt},
-                ]),
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": 80,
+                **no_think_params(),
             },
             timeout=120,
         )

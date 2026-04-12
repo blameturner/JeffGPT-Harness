@@ -26,7 +26,9 @@ class NocodbClient:
                 response.raise_for_status()
                 tables = response.json()["list"]
                 table_map = {table["title"]: table["id"] for table in tables}
-                _log.debug("tables loaded  count=%d", len(table_map))
+                if not hasattr(NocodbClient, "_tables_logged"):
+                    _log.info("tables loaded  count=%d", len(table_map))
+                    NocodbClient._tables_logged = True
                 return table_map
             except Exception:
                 _log.warning("not ready, retrying (%d/15)", attempt + 1)

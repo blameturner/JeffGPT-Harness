@@ -233,18 +233,11 @@ def scoped_graph(org_id: int) -> str:
     return f"org_{org_id}_mst_ag"
 
 
-# Models whose llama.cpp chat template enables thinking (thinking = 1) and
-# use <think></think> tags. Only these get the thinking-skip prefill.
-_THINK_TAG_MODELS = re.compile(r"qwen3", re.IGNORECASE)
+def no_think_params() -> dict:
+    """Extra params to disable thinking on tool/classifier model calls.
 
-
-def thinking_skip_messages(model_id: str | None, messages: list[dict]) -> list[dict]:
-    """Append a thinking-skip prefill for models that use <think> tags.
-
-    For Qwen3 family models (which use <think></think>), appends an assistant
-    message that closes the thinking block so the model skips straight to output.
-    For all other models (Gemma 4, Qwen 2.5, etc.), returns messages unchanged.
+    llama.cpp rejects assistant prefills when thinking is enabled, so we
+    disable thinking at the API level instead. Returns a dict to merge
+    into the request JSON payload.
     """
-    if model_id and _THINK_TAG_MODELS.search(model_id):
-        return messages + [{"role": "assistant", "content": "<think>\n</think>\n"}]
-    return messages
+    return {"enable_thinking": False}

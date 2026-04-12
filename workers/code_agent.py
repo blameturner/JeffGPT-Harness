@@ -11,7 +11,7 @@ from typing import Iterator, Literal
 
 import requests
 
-from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, thinking_skip_messages
+from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, no_think_params
 from workers.search.temporal import build_temporal_context
 from memory import remember
 from rag import retrieve
@@ -105,11 +105,10 @@ def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> lis
             f"{fast_url}/v1/chat/completions",
             json={
                 "model": fast_model,
-                "messages": thinking_skip_messages(fast_model, [
-                    {"role": "user", "content": prompt},
-                ]),
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": 400,
+                **no_think_params(),
             },
             timeout=60,
         )

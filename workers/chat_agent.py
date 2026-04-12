@@ -337,40 +337,8 @@ class ChatAgent:
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
-        # Persist assistant message immediately — critical for page-change resilience.
-        persist_ok = False
-        if output:
-            if not _user_msg_written.wait(timeout=10.0):
-                _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
-            persist_ok = persist_assistant_message(
-                db=self.db,
-                conversation_id=conversation_id,
-                org_id=self.org_id,
-                output=output,
-                final_model=final_model,
-                tokens_input=tokens_input,
-                tokens_output=tokens_output,
-                style_key=style_key,
-                search_sources=search_sources,
-                search_status=search_status,
-                search_confidence=search_confidence,
-                search_context=search_context,
-                intent_dict=intent_dict,
-            )
-            _log.info("persist done  conv=%s ok=%s", conversation_id, persist_ok)
-            if not persist_ok:
-                emit({
-                    "type": "error",
-                    "message": "assistant message persist failed — check harness logs for NocoDB error body",
-                })
-
-        try:
-            self.db.update_conversation(conversation_id, {"status": "complete"})
-        except Exception:
-            _log.warning("status update to complete failed  conv=%s", conversation_id)
-
-        # Emit done immediately so the frontend shows completion without
-        # waiting for slow background tasks (embedding, graph extraction).
+        # Emit done IMMEDIATELY so the frontend shows completion. All persistence
+        # and background work happens after — the user already has the streamed chunks.
         emit({
             "type": "done",
             "conversation_id": conversation_id,
@@ -387,12 +355,43 @@ class ChatAgent:
             "search_source_count": len(search_sources),
         })
 
-        # Background: memory writes and graph extraction involve CPU-bound
-        # embedding calls. Run after the user already has their response.
+        # All DB writes and memory operations run in a background thread.
+        # The user already has their complete response via streamed chunks + done event.
         import threading
 
         def _post_turn_work():
+            _t_bg = time.perf_counter()
+
+            # Persist assistant message to NocoDB
+            if output:
+                if not _user_msg_written.wait(timeout=10.0):
+                    _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
+                _t = time.perf_counter()
+                persist_ok = persist_assistant_message(
+                    db=self.db,
+                    conversation_id=conversation_id,
+                    org_id=self.org_id,
+                    output=output,
+                    final_model=final_model,
+                    tokens_input=tokens_input,
+                    tokens_output=tokens_output,
+                    style_key=style_key,
+                    search_sources=search_sources,
+                    search_status=search_status,
+                    search_confidence=search_confidence,
+                    search_context=search_context,
+                    intent_dict=intent_dict,
+                )
+                _log.info("bg: persist done  conv=%s ok=%s %.2fs", conversation_id, persist_ok, time.perf_counter() - _t)
+
+            try:
+                self.db.update_conversation(conversation_id, {"status": "complete"})
+            except Exception:
+                _log.warning("bg: status update failed  conv=%s", conversation_id)
+
+            # Memory and graph
             if convo_rag_enabled and output:
+                _t = time.perf_counter()
                 try:
                     remember(
                         text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -400,10 +399,12 @@ class ChatAgent:
                         org_id=self.org_id,
                         collection_name=collection_name,
                     )
+                    _log.info("bg: rag remember done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("memory rag write failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("bg: rag remember failed  conv=%s", conversation_id, exc_info=True)
 
             if convo_knowledge and output:
+                _t = time.perf_counter()
                 try:
                     remember(
                         text=f"USER: {user_message}\n\nASSISTANT: {output}",
@@ -411,12 +412,17 @@ class ChatAgent:
                         org_id=self.org_id,
                         collection_name="chat_knowledge",
                     )
+                    _log.info("bg: knowledge remember done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("chat_knowledge write failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("bg: knowledge remember failed  conv=%s", conversation_id, exc_info=True)
+                _t = time.perf_counter()
                 try:
                     extract_and_write_graph(user_message, output, conversation_id, self.org_id)
+                    _log.info("bg: graph extraction done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("bg: graph extraction failed  conv=%s", conversation_id, exc_info=True)
+
+            _log.info("bg: post-turn complete  conv=%s total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 
@@ -469,6 +475,9 @@ class ChatAgent:
         chunks: list[str] = []
         final_usage: dict = {}
         final_model: str = self.model
+        in_think_block = False
+        think_tokens = 0
+        first_content_emitted = False
 
         with requests.post(
             f"{self.url}/v1/chat/completions",
@@ -498,12 +507,32 @@ class ChatAgent:
                     final_usage = usage
 
                 choices = event.get("choices") or []
-                if choices:
-                    delta = choices[0].get("delta") or {}
-                    text = delta.get("content")
-                    if text:
-                        chunks.append(text)
-                        emit({"type": "chunk", "text": text})
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                text = delta.get("content")
+                if not text:
+                    continue
+
+                # Filter out <think>...</think> blocks from the streamed output.
+                # The main chat model has thinking enabled (useful for quality),
+                # but we don't stream thinking tokens to the user.
+                if not first_content_emitted:
+                    if "<think>" in text:
+                        in_think_block = True
+                        think_tokens += 1
+                        continue
+                if in_think_block:
+                    think_tokens += 1
+                    if "</think>" in text:
+                        in_think_block = False
+                        if think_tokens > 1:
+                            _log.info("model thinking done  tokens=%d", think_tokens)
+                    continue
+
+                first_content_emitted = True
+                chunks.append(text)
+                emit({"type": "chunk", "text": text})
 
         return chunks, final_usage, final_model
 
