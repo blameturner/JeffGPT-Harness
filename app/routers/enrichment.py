@@ -85,14 +85,20 @@ def create_enrichment_agent(body: EnrichmentAgentCreate):
 
 
 @router.patch("/enrichment/agents/{agent_id}")
-def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate):
+def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate, request: Request):
     from workers.enrichment.db import EnrichmentDB
+    from scheduler import reload_agent_schedules
     try:
         db = EnrichmentDB()
         updates = {k: v for k, v in body.model_dump().items() if v is not None}
         if not updates:
             return db.get_enrichment_agent(agent_id)
-        return db.update_enrichment_agent(agent_id, updates)
+        result = db.update_enrichment_agent(agent_id, updates)
+        # Reload scheduler if cron or timezone changed so new schedule takes effect immediately.
+        if "cron_expression" in updates or "timezone" in updates or "active" in updates:
+            reload_agent_schedules()
+            _log.info("scheduler reloaded after enrichment agent %d update", agent_id)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
