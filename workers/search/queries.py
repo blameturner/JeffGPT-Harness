@@ -271,6 +271,156 @@ def rerank_candidates(
     return ranked
 
 
+_STOPWORDS: frozenset[str] = frozenset(
+    "a about above after again against all am an and any are aren't as at be "
+    "because been before being below between both but by can can't cannot could "
+    "couldn't did didn't do does doesn't doing don't down during each few for "
+    "from further get got had hadn't has hasn't have haven't having he he'd "
+    "he'll he's her here here's hers herself him himself his how how's i i'd "
+    "i'll i'm i've if in into is isn't it it's its itself let's me more most "
+    "mustn't my myself no nor not of off on once only or other ought our ours "
+    "ourselves out over own please same shan't she she'd she'll she's should "
+    "shouldn't so some such than that that's the their theirs them themselves "
+    "then there there's these they they'd they'll they're they've this those "
+    "through to too under until up upon very was wasn't we we'd we'll we're "
+    "we've were weren't what what's when when's where where's which while who "
+    "who's whom why why's will with won't would wouldn't you you'd you'll "
+    "you're you've your yours yourself yourselves "
+    # Question/instruction words to strip from queries
+    "tell explain describe discuss define help show give list name "
+    "know want need like think say said going go make made "
+    # Action verbs that add noise in search queries
+    "compare handle use using work works find look search check "
+    "create run start stop try".split()
+)
+
+
+def _extract_keywords(message: str) -> list[str]:
+    """Extract meaningful keywords by removing stopwords. Pure Python, sub-ms."""
+    words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
+    return [w for w in words if w.lower() not in _STOPWORDS and len(w) > 1]
+
+
+def _extract_phrases(message: str) -> list[str]:
+    """Extract contiguous runs of non-stopword tokens as phrases.
+
+    "tell me about the Linux kernel architecture" → ["Linux kernel architecture"]
+    """
+    words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
+    phrases: list[str] = []
+    current: list[str] = []
+    for w in words:
+        if w.lower() in _STOPWORDS:
+            if len(current) >= 2:
+                phrases.append(" ".join(current))
+            current = []
+        else:
+            current.append(w)
+    if len(current) >= 2:
+        phrases.append(" ".join(current))
+    return phrases
+
+
+def generate_broad_queries(message: str, *, max_queries: int = 10) -> list[str]:
+    """Generate up to `max_queries` diverse search queries from a user message.
+
+    Zero model calls — pure heuristic keyword/phrase extraction with multiple
+    query strategies to cast a wide net. SearxNG is fast, so we compensate
+    for imprecise queries with volume and diversity.
+    """
+    cleaned = re.sub(r"\s+", " ", message.strip())
+    if not cleaned:
+        return []
+
+    keywords = _extract_keywords(cleaned)
+    phrases = _extract_phrases(cleaned)
+    year = _current_year()
+
+    # Detect time-sensitivity
+    lower = cleaned.lower()
+    time_sensitive = any(
+        w in lower
+        for w in ("latest", "recent", "current", "today", "now", "2025", "2026", "this year")
+    )
+
+    queries: list[str] = []
+
+    # --- Strategy 1: Cleaned natural-language query ---
+    # Strip leading question/instruction preamble, then trim dangling
+    # articles/prepositions that the regex leaves behind.
+    nl = re.sub(
+        r"^(can you |could you |please |tell me (about )?|explain (to me )?"
+        r"|what is |what are |what's |who is |who are |how does |how do "
+        r"|how to |why does |why do |why is |describe |compare "
+        r"|i want to know (about )?|show me "
+        r"|i('m| am) (looking for|curious about|wondering about) )",
+        "", cleaned, flags=re.IGNORECASE,
+    ).strip()
+    # Trim leftover leading articles / prepositions
+    nl = re.sub(r"^(the |a |an |about |for |in |on |of |to )+", "", nl, flags=re.IGNORECASE).strip()
+    if nl:
+        queries.append(nl)
+
+    # --- Strategy 2: Keyword-only query ---
+    if keywords:
+        queries.append(" ".join(keywords[:6]))
+
+    # --- Strategy 3: Longest phrase (likely the core topic) ---
+    if phrases:
+        longest = max(phrases, key=len)
+        queries.append(f'"{longest}"')
+
+    # --- Strategy 4: Each multi-word phrase quoted ---
+    for p in phrases:
+        if len(p.split()) >= 2:
+            queries.append(f'"{p}"')
+
+    # --- Strategy 5: Keywords + "explained" / "overview" ---
+    if keywords:
+        core = " ".join(keywords[:4])
+        queries.append(f"{core} explained")
+        queries.append(f"{core} overview")
+
+    # --- Strategy 6: Time-sensitive variant ---
+    if time_sensitive and keywords:
+        queries.append(f"{' '.join(keywords[:4])} {year}")
+
+    # --- Strategy 7: "what is" reformulation ---
+    if keywords:
+        queries.append(f"what is {' '.join(keywords[:4])}")
+
+    # --- Strategy 8: Site-specific (Wikipedia) ---
+    if keywords:
+        core_topic = " ".join(keywords[:4])
+        queries.append(f"{core_topic} site:en.wikipedia.org")
+
+    # --- Strategy 9: Comparison ("vs") if message looks comparative ---
+    if re.search(r"\b(vs\.?|versus|compared? to|or)\b", cleaned, re.IGNORECASE) and len(keywords) >= 2:
+        queries.append(f"{keywords[0]} vs {keywords[1]}")
+
+    # --- Strategy 10: Individual keyword pairs for broad coverage ---
+    if len(keywords) >= 2:
+        for kw in keywords[1:4]:
+            queries.append(f"{keywords[0]} {kw}")
+
+    # Deduplicate (case-insensitive) and cap
+    seen: set[str] = set()
+    unique: list[str] = []
+    for q in queries:
+        q = q.strip()
+        key = q.lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(q)
+
+    result = unique[:max_queries]
+    _log.info(
+        "broad_queries generated  strategies=9 unique=%d capped=%d queries=%s",
+        len(unique), len(result), result,
+    )
+    return result
+
+
 def reformulate_query(
     original_query: str,
     intent_dict: dict,

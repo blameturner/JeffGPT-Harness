@@ -1,0 +1,12 @@
+{
+  "family": "rwkv",
+  "match_patterns": ["rwkv"],
+  "thinking": {
+    "style": "think_tags",
+    "open_tag": "<think>",
+    "close_tag": "</think>",
+    "disable_params": {
+      "chat_template_kwargs": {"enable_thinking": false}
+    }
+  }
+}

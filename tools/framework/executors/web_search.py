@@ -43,7 +43,7 @@ from workers.search.models import acquire_model
 _log = logging.getLogger("tools.web_search")
 
 # --- Tunables ---
-MAX_URLS_TO_PROCESS = 6
+MAX_URLS_TO_PROCESS = 10
 MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
@@ -192,7 +192,7 @@ async def execute(params: dict, emit) -> ToolResult:
     raw_queries = params.get("queries") or []
     if isinstance(raw_queries, str):
         raw_queries = [raw_queries]
-    queries = [str(q).strip() for q in raw_queries if str(q).strip()][:3]
+    queries = [str(q).strip() for q in raw_queries if str(q).strip()][:10]
     if not queries:
         return ToolResult(
             tool=ToolName.WEB_SEARCH, action_index=0, ok=False,

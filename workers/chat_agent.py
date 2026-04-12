@@ -15,7 +15,7 @@ from tools.framework.contract import ToolAction, ToolContext, ToolName, ToolPlan
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
-from workers.search.queries import generate_search_queries
+from workers.search.queries import generate_broad_queries, generate_search_queries
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise
 from workers.chat.graph import extract_and_write_graph
@@ -191,19 +191,10 @@ class ChatAgent:
 
                 if hints == {"web_search"}:
                     # Fast path: skip planner AND intent classifier entirely.
-                    # Build queries directly from the user message — zero model calls.
+                    # Generate many diverse queries heuristically (zero model
+                    # calls) and let SearxNG volume compensate for precision.
                     _log.info("web_search fast-path  conv=%s", conversation_id)
-                    # Simple heuristic intent for query generation — no model call
-                    words = user_message.lower().split()
-                    entities = [w for w in user_message.split() if len(w) > 3 and w[0].isupper()]
-                    intent_dict = {
-                        "intent": "factual_lookup",
-                        "entities": entities or [user_message[:60]],
-                        "time_sensitive": any(w in words for w in ("latest", "recent", "current", "today", "now", "2025", "2026")),
-                        "confidence": "medium",
-                        "search_policy": "focused",
-                    }
-                    queries = generate_search_queries(intent_dict, message=user_message)
+                    queries = generate_broad_queries(user_message, max_queries=10)
                     _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
 
                     if queries:
@@ -568,35 +559,57 @@ class ChatAgent:
                 text = delta.get("content")
 
                 if reasoning and not text:
-                    # Model is still thinking — collect but don't emit yet
+                    # Model is still thinking — stream to UI as thinking event
                     think_tokens += 1
                     reasoning_chunks.append(reasoning)
+                    emit({"type": "thinking", "text": reasoning})
                     continue
 
                 if not text:
                     continue
 
-                # Filter <think>...</think> tags in content (Qwen3 style)
+                # Filter <think>...</think> tags in content (Qwen/RWKV style)
                 if not first_content_emitted and "<think>" in text:
                     in_think_block = True
                     think_tokens += 1
+                    # Strip the <think> tag, emit remaining text as thinking
+                    after_tag = text.split("<think>", 1)[1] if "<think>" in text else ""
+                    if after_tag:
+                        reasoning_chunks.append(after_tag)
+                        emit({"type": "thinking", "text": after_tag})
                     continue
                 if in_think_block:
                     think_tokens += 1
                     if "</think>" in text:
                         in_think_block = False
+                        # Emit any text before the closing tag as thinking
+                        before_tag = text.split("</think>", 1)[0]
+                        if before_tag:
+                            reasoning_chunks.append(before_tag)
+                            emit({"type": "thinking", "text": before_tag})
+                        # Emit any text after the closing tag as content
+                        after_tag = text.split("</think>", 1)[1].strip()
+                        if after_tag:
+                            first_content_emitted = True
+                            chunks.append(after_tag)
+                            emit({"type": "chunk", "text": after_tag})
                         if think_tokens > 1:
                             _log.info("model thinking done  tokens=%d", think_tokens)
+                    else:
+                        reasoning_chunks.append(text)
+                        emit({"type": "thinking", "text": text})
                     continue
 
                 first_content_emitted = True
                 chunks.append(text)
                 emit({"type": "chunk", "text": text})
 
-        # Fallback: if model put everything in reasoning_content and content was
-        # always empty, use the reasoning as the output. Better than losing the response.
+        # Fallback: if model put everything in thinking (reasoning_content field
+        # OR <think> tags) and never produced actual content, use the reasoning
+        # as the output.  Better than losing the response entirely.
         if not chunks and reasoning_chunks:
-            _log.warning("model returned no content, using reasoning_content as fallback  tokens=%d", len(reasoning_chunks))
+            _log.warning("model returned no content, using thinking as fallback  think_tokens=%d reasoning_chars=%d",
+                         think_tokens, sum(len(r) for r in reasoning_chunks))
             full_reasoning = "".join(reasoning_chunks)
             chunks.append(full_reasoning)
             emit({"type": "chunk", "text": full_reasoning})

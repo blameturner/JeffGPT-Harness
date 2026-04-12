@@ -1,0 +1,10 @@
+{
+  "family": "gemma",
+  "match_patterns": ["gemma"],
+  "thinking": {
+    "style": "reasoning_content",
+    "disable_params": {
+      "chat_template_kwargs": {"enable_thinking": false}
+    }
+  }
+}

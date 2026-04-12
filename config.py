@@ -233,10 +233,19 @@ def scoped_graph(org_id: int) -> str:
     return f"org_{org_id}_mst_ag"
 
 
-def no_think_params() -> dict:
+def no_think_params(model_id: str | None = None) -> dict:
     """Extra params to disable thinking on tool/classifier model calls.
 
     llama.cpp passes chat_template_kwargs through the Jinja chat template.
     Setting enable_thinking=false tells the template to skip thinking blocks.
+
+    If a model_id is provided, uses the model's profile-specific disable
+    params (which may differ per model family).  Falls back to the universal
+    default when no profile matches or no model_id is given.
     """
+    if model_id:
+        from model_profiles import no_think_params_for
+        params = no_think_params_for(model_id)
+        if params:
+            return params
     return {"chat_template_kwargs": {"enable_thinking": False}}

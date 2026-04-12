@@ -1,0 +1,10 @@
+{
+  "family": "default",
+  "match_patterns": [],
+  "thinking": {
+    "style": "none",
+    "disable_params": {
+      "chat_template_kwargs": {"enable_thinking": false}
+    }
+  }
+}
