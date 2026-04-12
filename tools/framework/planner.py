@@ -27,10 +27,10 @@ _log = logging.getLogger("tools.planner")
 
 
 SYSTEM_PROMPT = """Output ONLY valid JSON. No markdown, no prose.
-Tools: web_search(queries:[str]), rag_lookup(query:str), code_exec(language:str,code:str)
+Tools: web_search(queries:[str]), rag_lookup(query:str), code_exec(language:str,code:str), code_repo(op:str,repo:str,...)
 web_search: 2-3 DIVERSE queries targeting different aspects.
 rag_lookup: only when user references prior conversations.
-code_exec: only when user wants to RUN code, not write/show code.
+code_repo: ops: orient(repo manifest), read(files:[str]), write(file,content,message,branch), search(query), tree.
 Max 4 actions. "summary": one sentence shown to user.
 
 
@@ -39,6 +39,12 @@ User: What's the latest RBA rate decision?
 
 User: What did we discuss about auth?
 {"actions":[{"tool":"rag_lookup","params":{"query":"auth migration discussion"},"reason":"prior context"}],"summary":"Searching our previous discussions..."}
+
+User: How does auth work in prodigi?
+{"actions":[{"tool":"code_repo","params":{"op":"orient","repo":"prodigi"},"reason":"understand codebase"},{"tool":"code_repo","params":{"op":"search","repo":"prodigi","query":"authentication middleware"},"reason":"find auth files"}],"summary":"Examining the Prodigi codebase..."}
+
+User: Show me the main entry file
+{"actions":[{"tool":"code_repo","params":{"op":"read","repo":"prodigi","files":["src/index.ts"]},"reason":"fetch file content"}],"summary":"Fetching the file..."}
 
 User: thanks
 {"actions":[],"summary":""}"""

@@ -174,6 +174,9 @@ CHROMA_URL = os.getenv("DB_CHROMADB_URL")
 SEARXNG_URL = os.getenv("SVC_SEARXNG_URL", "http://mst-ag-searxng:8080")
 BROWSER_URL = os.getenv("SVC_BROWSER_URL", "http://localhost:3800/browser")
 SANDBOX_URL = os.getenv("SVC_SANDBOX_URL", "http://localhost:3800/sandbox")
+SVC_GITEA_URL = os.getenv("SVC_GITEA_URL")
+GITEA_TOKEN = os.getenv("GITEA_TOKEN")
+GITEA_OWNER = os.getenv("GITEA_OWNER", "")
 FALKORDB_HOST = os.getenv("DB_FALKORDB_HOST")
 FALKORDB_PORT = int(os.getenv("DB_FALKORDB_PORT", "6379"))
 
@@ -189,6 +192,10 @@ NOCODB_TABLE_ENRICHMENT_LOG = "enrichment_log"
 NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS = "suggested_scrape_targets"
 NOCODB_TABLE_MESSAGES = "messages"
 NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
+NOCODB_TABLE_CODE_AGENTS = "code_agents"
+NOCODB_TABLE_CODE_AGENT_TASKS = "code_agent_tasks"
+NOCODB_TABLE_CODE_AGENT_THOUGHTS = "code_agent_thoughts"
+NOCODB_TABLE_CODE_AGENT_PROPOSALS = "code_agent_proposals"
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 

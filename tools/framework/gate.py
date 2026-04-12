@@ -90,6 +90,14 @@ _CODE_ERROR_SIGNALS = re.compile(
     re.I,
 )
 
+_CODE_REPO = re.compile(
+    r"\b(repo(sitory)?|codebase|source code|git|branch|pull request|PR|commit|merge)\b"
+    r"|\b(show me the|read the|look at the|find the)\b.*\b(code|file|module|component|function)\b"
+    r"|\b(in the (code|repo|project))\b"
+    r"|\b(project structure|directory tree|file tree)\b",
+    re.I,
+)
+
 _CODE_RUN_REQUEST = re.compile(
     # direct run requests ("run this", "execute this") already covered by _CODE_EXEC,
     # but also: "what's the output of", "what does this function return", "test this snippet"
@@ -142,6 +150,8 @@ def gate_check(
             hints.add("rag_lookup")
         if _CODE_EXEC.search(msg) or "```" in msg:
             hints.add("code_exec")
+        if _CODE_REPO.search(msg):
+            hints.add("code_repo")
         # Context-aware: follow-up on a prior search-using turn reopens web_search.
         if conversation_context and _FOLLOW_UP.search(msg):
             if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
@@ -166,6 +176,8 @@ def gate_check(
         hints.add("rag_lookup")
     if _CODE_EXEC.search(msg) or "```" in msg:
         hints.add("code_exec")
+    if _CODE_REPO.search(msg):
+        hints.add("code_repo")
 
     # Code-mode augments — broader coverage for API lookups and error traces.
     if is_code:
