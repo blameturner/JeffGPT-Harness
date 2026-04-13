@@ -10,7 +10,7 @@ import logging
 import time
 import threading
 import uuid
-from typing import Callable
+from typing import Callable, Iterator
 
 from config import TOOLS_FRAMEWORK_ENABLED, is_feature_enabled
 from memory import remember
