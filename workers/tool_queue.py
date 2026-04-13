@@ -1061,10 +1061,11 @@ def _handle_graph_extract(payload: dict) -> dict:
 
 
 def _handle_deep_search(payload: dict) -> dict:
-    """Deep search: scrape all URLs → T1 summarise each → synthesise → deliver.
+    """Deep search: gather ~10 usable sources → T1 summarise each → synthesise → deliver.
 
-    Single pass (no iteration), but with a final synthesis step that produces
-    one coherent response from all sources.
+    Starts with the plan URLs, scrapes them, and if not enough have usable
+    content, runs additional SearXNG searches to fill the gap.  Keeps going
+    until it has TARGET_SOURCES usable pages or exhausts all queries.
     """
     import asyncio as _aio
     from memory import remember
@@ -1077,34 +1078,42 @@ def _handle_deep_search(payload: dict) -> dict:
     conversation_id = payload.get("conversation_id")
 
     queries = plan.get("queries", [])
-    urls = plan.get("urls", [])
+    plan_urls = plan.get("urls", [])
     question = " ".join(queries[:3]) if queries else ""
 
-    if not urls or not org_id:
+    if not plan_urls or not org_id:
         _log.info("queue deep_search: skipped — no urls or org  org=%d", org_id)
         return {"status": "skipped", "error": "no urls or org"}
 
     _log.info("queue deep_search: starting  org=%d  urls=%d  queries=%d",
-              org_id, len(urls), len(queries))
+              org_id, len(plan_urls), len(queries))
 
     loop = _aio.new_event_loop()
     all_summaries: list[dict] = []
+    with_text: list[dict] = []
 
     try:
-        # 1. Scrape all URLs in parallel
+        # 1. Scrape all plan URLs in parallel
         try:
             scraped = loop.run_until_complete(
-                _aio.gather(*[_scrape_one(r) for r in urls])
+                _aio.gather(*[_scrape_one(r) for r in plan_urls])
             )
         except Exception:
             _log.error("queue deep_search: scrape failed", exc_info=True)
             scraped = []
 
-        with_text = [s for s in scraped if s.get("text") and len(s["text"]) >= 200]
-        _log.info("queue deep_search: scraped  total=%d with_text=%d", len(scraped), len(with_text))
+        for s in scraped:
+            text_len = len(s.get("text") or "")
+            if text_len >= 200:
+                with_text.append(s)
+            else:
+                _log.info("queue deep_search: scrape too short  url=%s  chars=%d  path=%s",
+                          s.get("url", "?")[:60], text_len, s.get("path", "?"))
+
+        _log.info("queue deep_search: scraped  total=%d usable=%d", len(scraped), len(with_text))
 
         if not with_text:
-            _log.warning("queue deep_search: all sources empty")
+            _log.warning("queue deep_search: no usable sources after all attempts")
             if conversation_id:
                 try:
                     from nocodb_client import NocodbClient
@@ -1115,7 +1124,7 @@ def _handle_deep_search(payload: dict) -> dict:
                         role="assistant",
                         content=(
                             "[Deep search failed]\n\n"
-                            "All sources returned empty content. "
+                            "Could not extract usable content from any source. "
                             "Try different search queries or topics."
                         ),
                         model="deep_search",
@@ -1126,7 +1135,7 @@ def _handle_deep_search(payload: dict) -> dict:
                     _log.error("queue deep_search: failure delivery failed", exc_info=True)
             return {"status": "no_sources"}
 
-        # 2. Summarise each source with T1 secondary
+        # 3. Summarise each usable source with T1 secondary
         for source in with_text:
             try:
                 result = loop.run_until_complete(
@@ -1293,7 +1302,7 @@ def _handle_research(payload: dict) -> dict:
     from memory import remember
     from workers.enrichment.models import model_call
     from workers.chat.graph import extract_and_write_graph
-    from tools.framework.executors.web_search import _search_all, _scrape_one, _summarise_one
+    from tools.framework.executors.web_search import _scrape_one, _summarise_one
     from tools.framework.executors.research import (
         _assess_progress, MAX_ITERATIONS, MAX_SOURCES_PER_ITERATION, MAX_TOTAL_SOURCES,
         _SYNTHESISE_PROMPT,
@@ -1328,18 +1337,27 @@ def _handle_research(payload: dict) -> dict:
             _log.info("queue research: iteration %d/%d  queries=%d  total_sources=%d",
                       iteration, MAX_ITERATIONS, len(queries), len(all_summaries))
 
-            # 1. Search
+            # 1. Search — gather more URLs than _search_all's cap of 5
             try:
                 from workers.search.urls import _is_blocklisted
-                raw_results = loop.run_until_complete(_search_all(queries))
-                results = [r for r in raw_results if not _is_blocklisted(r["url"])]
+                from tools.framework.executors.web_search import _search_one
+                all_raw = loop.run_until_complete(
+                    _aio.gather(*[_search_one(q) for q in queries])
+                )
+                seen_search: set[str] = {s["url"] for s in all_summaries}
+                results = []
+                for result_set in all_raw:
+                    for r in result_set:
+                        url = (r.get("url") or "").strip()
+                        if not url or url in seen_search or _is_blocklisted(url):
+                            continue
+                        seen_search.add(url)
+                        results.append(r)
             except Exception:
                 _log.error("queue research: search failed iteration=%d", iteration, exc_info=True)
                 break
 
-            # Deduplicate against already-processed URLs
-            seen_urls = {s["url"] for s in all_summaries}
-            new_results = [r for r in results if r["url"] not in seen_urls][:MAX_SOURCES_PER_ITERATION]
+            new_results = results[:MAX_SOURCES_PER_ITERATION]
 
             if not new_results:
                 _log.info("queue research: no new URLs found in iteration %d — stopping", iteration)
@@ -1356,7 +1374,14 @@ def _handle_research(payload: dict) -> dict:
                 _log.error("queue research: scrape failed iteration=%d", iteration, exc_info=True)
                 break
 
-            with_text = [s for s in scraped if s.get("text") and len(s["text"]) >= 200]
+            with_text = []
+            for s in scraped:
+                text_len = len(s.get("text") or "")
+                if text_len >= 200:
+                    with_text.append(s)
+                else:
+                    _log.info("queue research: scrape too short  url=%s  chars=%d  path=%s",
+                              s.get("url", "?")[:60], text_len, s.get("path", "?"))
 
             if not with_text:
                 _log.info("queue research: all sources empty in iteration %d", iteration)

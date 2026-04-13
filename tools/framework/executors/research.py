@@ -28,7 +28,6 @@ import time
 
 from tools.framework.contract import ToolName, ToolResult
 from tools.framework.dispatcher import register_executor
-from tools.framework.executors.web_search import _search_all
 from workers.enrichment.models import model_call
 
 _log = logging.getLogger("tools.research")

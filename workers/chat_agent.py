@@ -273,6 +273,7 @@ class ChatAgent:
                         _log.info("chat conv=%s  deep search execution dispatched", conversation_id)
                     except Exception:
                         _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
+                        tool_context = ToolContext()
                     for r in tool_context.results:
                         if r.tool.value == "deep_search" and r.ok:
                             search_result.search_context = r.data
@@ -311,6 +312,7 @@ class ChatAgent:
                         _log.info("chat conv=%s  research execution dispatched", conversation_id)
                     except Exception:
                         _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
+                        tool_context = ToolContext()
                     for r in tool_context.results:
                         if r.tool.value == "research" and r.ok:
                             search_result.search_context = r.data

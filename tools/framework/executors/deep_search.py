@@ -20,7 +20,7 @@ import time
 
 from tools.framework.contract import ToolName, ToolResult
 from tools.framework.dispatcher import register_executor
-from tools.framework.executors.web_search import _search_all
+from tools.framework.executors.web_search import _search_one
 from workers.enrichment.models import model_call
 
 _log = logging.getLogger("tools.deep_search")
@@ -127,12 +127,23 @@ async def execute(params: dict, emit) -> ToolResult:
     emit({"type": "searching", "queries": queries, "mode": "deep"})
     t0 = time.time()
 
-    # SearXNG in parallel to find candidate URLs
+    # SearXNG in parallel — gather more URLs than normal web search.
+    # _search_all caps at 5 (for inline search). Deep search needs ~20
+    # candidates so the handler can find 10 usable ones after scraping.
     from workers.search.urls import _is_blocklisted
-    raw_results = await _search_all(queries)
-    results = [r for r in raw_results if not _is_blocklisted(r["url"])]
-    _log.info("deep_search searxng  queries=%d raw=%d after_blocklist=%d",
-              len(queries), len(raw_results), len(results))
+    all_raw = await asyncio.gather(*[_search_one(q) for q in queries])
+    seen: set[str] = set()
+    results: list[dict] = []
+    for result_set in all_raw:
+        for r in result_set:
+            url = (r.get("url") or "").strip()
+            if not url or url in seen or _is_blocklisted(url):
+                continue
+            seen.add(url)
+            results.append(r)
+    results = results[:25]  # cap at 25 candidates
+    _log.info("deep_search searxng  queries=%d unique=%d after_blocklist=%d",
+              len(queries), len(seen), len(results))
 
     elapsed = round(time.time() - t0, 2)
 
