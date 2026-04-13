@@ -589,9 +589,11 @@ class ChatAgent:
 
         # Prepend tool-framework results (rag_lookup, code_exec, etc.) onto
         # search_context so they ride the same system-prompt injection path.
-        # web_search results were already mapped onto search_result.search_context.
+        # web_search, deep_search, and research results are already mapped
+        # onto search_result.search_context — don't duplicate them.
+        _ALREADY_MAPPED = {"web_search", "deep_search", "research"}
         if tool_context.results:
-            non_web = [r for r in tool_context.results if r.tool.value != "web_search"]
+            non_web = [r for r in tool_context.results if r.tool.value not in _ALREADY_MAPPED]
             if non_web:
                 block = ToolContext(
                     plan_summary=tool_context.plan_summary, results=non_web,
