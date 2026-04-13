@@ -175,9 +175,9 @@ class ChatAgent:
                     last_assistant = (turn.get("content") or "")[:800]
                     break
             hints = gate_check(user_message, conversation_context=last_assistant)
-            if not web_search_enabled:
+            if not web_search_enabled or not self.search_enabled:
                 hints.discard("web_search")
-            _log.info("tools gate  conv=%s hints=%s web_search=%s", conversation_id, sorted(hints) or "[]", web_search_enabled)
+            _log.info("tools gate  conv=%s hints=%s web_search=%s search_enabled=%s", conversation_id, sorted(hints) or "[]", web_search_enabled, self.search_enabled)
 
             if hints:
                 tool_labels = {

@@ -23,9 +23,9 @@ def write_relationship(
     graph = get_graph(org_id)
 
     query = (
-        f"MERGE (a:{from_type} {{name: $from_name}}) "
-        f"MERGE (b:{to_type} {{name: $to_name}}) "
-        f"MERGE (a)-[:{relationship}]->(b)"
+        f"MERGE (a:`{from_type}` {{name: $from_name}}) "
+        f"MERGE (b:`{to_type}` {{name: $to_name}}) "
+        f"MERGE (a)-[:`{relationship}`]->(b)"
     )
 
     _log.info("write  (%s:%s)-[%s]->(%s:%s)  graph=%s", from_name, from_type, relationship, to_name, to_type, graph_name)

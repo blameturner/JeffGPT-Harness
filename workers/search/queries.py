@@ -268,20 +268,25 @@ _STOPWORDS: frozenset[str] = frozenset(
     "through to too under until up upon very was wasn't we we'd we'll we're "
     "we've were weren't what what's when when's where where's which while who "
     "who's whom why why's will with won't would wouldn't you you'd you'll "
-    "you're you've your yours yourself yourselves "
-    # Question/instruction words to strip from queries
+    "you're you've your yours yourself yourselves".split()
+)
+
+# Words that are part of question/instruction framing, not the topic itself.
+# Separated from stopwords so topic-extraction can strip these without
+# losing genuinely meaningful words like "compare" in a comparison query.
+_FRAMING_WORDS: frozenset[str] = frozenset(
     "tell explain describe discuss define help show give list name "
     "know want need like think say said going go make made "
-    # Action verbs that add noise in search queries
-    "compare handle use using work works find look search check "
-    "create run start stop try".split()
+    "handle find look search check create run start stop try "
+    "please kindly wondering curious looking".split()
 )
 
 
 def _extract_keywords(message: str) -> list[str]:
-    """Extract meaningful keywords by removing stopwords. Pure Python, sub-ms."""
+    """Extract meaningful keywords by removing stopwords and framing. Pure Python, sub-ms."""
     words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
-    return [w for w in words if w.lower() not in _STOPWORDS and len(w) > 1]
+    noise = _STOPWORDS | _FRAMING_WORDS
+    return [w for w in words if w.lower() not in noise and len(w) > 1]
 
 
 def _extract_phrases(message: str) -> list[str]:
@@ -290,10 +295,11 @@ def _extract_phrases(message: str) -> list[str]:
     "tell me about the Linux kernel architecture" → ["Linux kernel architecture"]
     """
     words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
+    noise = _STOPWORDS | _FRAMING_WORDS
     phrases: list[str] = []
     current: list[str] = []
     for w in words:
-        if w.lower() in _STOPWORDS:
+        if w.lower() in noise:
             if len(current) >= 2:
                 phrases.append(" ".join(current))
             current = []
@@ -304,101 +310,278 @@ def _extract_phrases(message: str) -> list[str]:
     return phrases
 
 
-def generate_broad_queries(message: str, *, max_queries: int = 10) -> list[str]:
-    """Generate up to `max_queries` diverse search queries from a user message.
+# ---- Core topic extraction ----
 
-    Zero model calls — pure heuristic keyword/phrase extraction with multiple
-    query strategies to cast a wide net. SearxNG is fast, so we compensate
-    for imprecise queries with volume and diversity.
+# Regex patterns stripped from the START of the message to isolate the actual
+# topic.  Order matters — longer/more specific patterns first.  Each pattern
+# should consume the framing prefix so we're left with the user's real subject.
+_QUESTION_PREAMBLES: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # Instruction preambles
+        r"^(?:can|could|would) you (?:please |kindly )?(?:tell|show|explain|describe|find|look up|search|help(?: me)?(?: with)?|give me(?: info(?:rmation)? (?:on|about))?)\s*(?:me )?\s*",
+        r"^(?:please |kindly )?(?:tell|show|explain|describe|find|look up|search|help(?: me)?(?: with)?|give me(?: info(?:rmation)? (?:on|about))?)\s*(?:me )?\s*",
+        r"^i(?:'m| am) (?:looking for|curious about|wondering about|interested in|trying to (?:find|understand|learn(?: about)?))\s*",
+        r"^i (?:want|need|would like) to (?:know|learn|understand|find out)(?: (?:more )?about)?\s*",
+        r"^(?:do you know|have you heard)(?: anything)? about\s*",
+        r"^(?:what do you know about|what can you tell me about)\s*",
+        # Question words — only strip the framing, keep the topic
+        r"^what (?:is|are|was|were|does|do|did|would|could|should)(?: (?:a|an|the))?\s*",
+        r"^who (?:is|are|was|were)\s*",
+        r"^where (?:is|are|was|were|can|do|does)\s*",
+        r"^when (?:is|are|was|were|did|does|will)\s*",
+        r"^why (?:is|are|was|were|did|does|do|don't|doesn't|won't|can't)\s*",
+        r"^how (?:does|do|did|is|are|can|could|to|would|should)\s*",
+        r"^(?:is|are|was|were|does|do|did|has|have|will|can|could|should|would) (?:the |a |an )?\s*",
+    ]
+]
+
+# Leftover determiners / prepositions after stripping preambles.
+_LEADING_FLUFF = re.compile(
+    r"^(?:the |a |an |about |for |in |on |of |to |with |by |from |regarding |concerning |re: )+",
+    re.IGNORECASE,
+)
+
+# Trailing punctuation / filler that adds no search value.
+_TRAILING_FLUFF = re.compile(r"[?.!,;:]+$")
+
+
+def _strip_preamble(text: str) -> str:
+    """Remove question/instruction framing from the start of a message."""
+    result = text
+    for pat in _QUESTION_PREAMBLES:
+        result = pat.sub("", result, count=1)
+        if result != text:
+            break
+    result = _LEADING_FLUFF.sub("", result).strip()
+    result = _TRAILING_FLUFF.sub("", result).strip()
+    return result
+
+
+def _detect_entities(text: str) -> list[str]:
+    """Detect likely proper nouns / named entities from capitalisation patterns.
+
+    Returns multi-word entities first (more specific), then single-word ones.
+    Skips sentence-initial capitalisation by checking position context.
+    """
+    # Find capitalised word sequences (2+ words starting with uppercase)
+    multi = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text)
+    # Single capitalised words — but not sentence-initial ones
+    words = text.split()
+    singles: list[str] = []
+    for i, w in enumerate(words):
+        clean = re.sub(r"[^a-zA-Z]", "", w)
+        if not clean or len(clean) < 2:
+            continue
+        if clean[0].isupper() and clean[1:].islower():
+            # Skip if first word of message or after sentence-ending punctuation
+            if i == 0:
+                continue
+            prev = words[i - 1] if i > 0 else ""
+            if prev.endswith((".", "!", "?", ":")):
+                continue
+            if clean.lower() not in _STOPWORDS and clean.lower() not in _FRAMING_WORDS:
+                singles.append(clean)
+
+    # Also detect ALL-CAPS acronyms (2-6 chars)
+    acronyms = re.findall(r"\b([A-Z]{2,6})\b", text)
+    acronyms = [a for a in acronyms if a not in ("I", "A")]
+
+    # Quoted terms the user explicitly marked as entities
+    quoted = re.findall(r'"([^"]{2,60})"', text)
+    quoted += re.findall(r"'([^']{2,60})'", text)
+
+    # Combine: quoted first (user intent), then multi-word, then acronyms, then singles
+    all_entities: list[str] = []
+    seen: set[str] = set()
+    for e in quoted + multi + acronyms + singles:
+        key = e.lower()
+        if key not in seen:
+            seen.add(key)
+            all_entities.append(e)
+    return all_entities
+
+
+def _detect_question_type(lower: str) -> str | None:
+    """Classify the question type to tailor query shape."""
+    if re.match(r"^(how (to|do|does|can|could|should))\b", lower):
+        return "howto"
+    if re.match(r"^(what (is|are|was|were))\b", lower):
+        return "definition"
+    if re.match(r"^(who (is|are|was|were))\b", lower):
+        return "person"
+    if re.match(r"^(where|what .* located|location of)\b", lower):
+        return "location"
+    if re.match(r"^(when|what (date|time|year))\b", lower):
+        return "temporal"
+    if re.match(r"^(why|what .* reason|what causes?)\b", lower):
+        return "causal"
+    if re.search(r"\b(vs\.?|versus|compared? to|difference between|better)\b", lower):
+        return "comparison"
+    if re.search(r"\b(best|top|recommend|suggestion|review)\b", lower):
+        return "recommendation"
+    if re.search(r"\b(error|bug|issue|problem|fix|broken|crash|fail|won't|doesn't work)\b", lower):
+        return "troubleshooting"
+    return None
+
+
+def _is_time_sensitive(lower: str) -> bool:
+    """Check if the query is about current/recent information."""
+    return bool(re.search(
+        r"\b(latest|recent|current|today|now|this year|this month|this week|"
+        r"right now|currently|2025|2026|new|upcoming|just released|breaking)\b",
+        lower,
+    ))
+
+
+def generate_broad_queries(message: str, *, max_queries: int = 10) -> list[str]:
+    """Generate on-topic search queries from a user message.
+
+    Zero model calls — heuristic extraction with focused strategies.
+    Every query stays tightly anchored to the user's actual topic.
+
+    Design principles:
+      - Core topic is king: strip question framing aggressively, keep subject.
+      - Entities get quoted: multi-word proper nouns stay together in SearXNG.
+      - No drift strategies: never generate queries from isolated keyword
+        pairs or generic reformulations ("what is X", "X explained") that
+        can match unrelated domains.
+      - Fewer, better queries beat many scattered ones.
     """
     cleaned = re.sub(r"\s+", " ", message.strip())
     if not cleaned:
         return []
 
+    lower = cleaned.lower()
+    year = _current_year()
+    time_sensitive = _is_time_sensitive(lower)
+
+    # ---- Phase 1: Extract the core topic ----
+    core = _strip_preamble(cleaned)
+    if not core:
+        core = cleaned  # preamble stripping ate everything — use raw
+
+    # ---- Phase 2: Structural analysis ----
+    entities = _detect_entities(cleaned)
     keywords = _extract_keywords(cleaned)
     phrases = _extract_phrases(cleaned)
-    year = _current_year()
+    qtype = _detect_question_type(lower)
 
-    # Detect time-sensitivity
-    lower = cleaned.lower()
-    time_sensitive = any(
-        w in lower
-        for w in ("latest", "recent", "current", "today", "now", "2025", "2026", "this year")
-    )
-
+    # ---- Phase 3: Build queries, most specific first ----
     queries: list[str] = []
 
-    # --- Strategy 1: Cleaned natural-language query ---
-    # Strip leading question/instruction preamble, then trim dangling
-    # articles/prepositions that the regex leaves behind.
-    nl = re.sub(
-        r"^(can you |could you |please |tell me (about )?|explain (to me )?"
-        r"|what is |what are |what's |who is |who are |how does |how do "
-        r"|how to |why does |why do |why is |describe |compare "
-        r"|i want to know (about )?|show me "
-        r"|i('m| am) (looking for|curious about|wondering about) )",
-        "", cleaned, flags=re.IGNORECASE,
-    ).strip()
-    # Trim leftover leading articles / prepositions
-    nl = re.sub(r"^(the |a |an |about |for |in |on |of |to )+", "", nl, flags=re.IGNORECASE).strip()
-    if nl:
-        queries.append(nl)
+    # --- Q1: Core topic (cleaned of framing) ---
+    # This is usually the single best query.
+    queries.append(core)
 
-    # --- Strategy 2: Keyword-only query ---
-    if keywords:
-        queries.append(" ".join(keywords[:6]))
+    # --- Q2: Core topic with entities quoted ---
+    # Keeps multi-word names together so SearXNG treats them as phrases.
+    if entities:
+        quoted_core = core
+        for entity in entities:
+            if entity in quoted_core and f'"{entity}"' not in quoted_core:
+                quoted_core = quoted_core.replace(entity, f'"{entity}"', 1)
+        if quoted_core != core:
+            queries.append(quoted_core)
 
-    # --- Strategy 3: Longest phrase (likely the core topic) ---
+    # --- Q3: Entity-focused query ---
+    # When entities are detected, a query built around just the entities
+    # is often the most precise.
+    if entities:
+        entity_q = " ".join(
+            f'"{e}"' if " " in e else e
+            for e in entities[:3]
+        )
+        # Add topic keywords that aren't part of any entity
+        entity_lower_set = {e.lower() for e in entities}
+        extra_kw = [
+            k for k in keywords
+            if k.lower() not in entity_lower_set
+            and not any(k.lower() in e.lower() for e in entities)
+        ]
+        if extra_kw:
+            entity_q += " " + " ".join(extra_kw[:3])
+        queries.append(entity_q.strip())
+
+    # --- Q4: Longest content phrase quoted ---
+    # The longest non-stopword run is likely the most specific topic chunk.
     if phrases:
         longest = max(phrases, key=len)
-        queries.append(f'"{longest}"')
+        if len(longest.split()) >= 2:
+            queries.append(f'"{longest}"')
 
-    # --- Strategy 4: Each multi-word phrase quoted ---
+    # --- Q5: Question-type specific reformulation ---
+    topic_str = " ".join(keywords[:5]) if keywords else core
+    if qtype == "howto":
+        queries.append(f"how to {topic_str}")
+    elif qtype == "comparison" and len(entities) >= 2:
+        queries.append(f'"{entities[0]}" vs "{entities[1]}"')
+    elif qtype == "comparison" and len(keywords) >= 2:
+        queries.append(f"{keywords[0]} vs {keywords[1]}")
+    elif qtype == "recommendation":
+        queries.append(f"best {topic_str}")
+    elif qtype == "troubleshooting":
+        queries.append(f"{topic_str} solution fix")
+    elif qtype == "person" and entities:
+        queries.append(f'"{entities[0]}" biography')
+    elif qtype == "definition":
+        queries.append(f"{topic_str} definition meaning")
+
+    # --- Q6: Time-sensitive variant ---
+    if time_sensitive:
+        queries.append(f"{core} {year}")
+
+    # --- Q7: Keywords-only (concise, no filler) ---
+    # Useful when the natural-language query has noise SearXNG can't handle.
+    if keywords and len(keywords) >= 2:
+        kw_q = " ".join(keywords[:6])
+        queries.append(kw_q)
+
+    # --- Q8: Additional entity phrases quoted individually ---
+    # Each distinct phrase becomes its own query for coverage.
     for p in phrases:
         if len(p.split()) >= 2:
             queries.append(f'"{p}"')
 
-    # --- Strategy 5: Keywords + "explained" / "overview" ---
-    if keywords:
-        core = " ".join(keywords[:4])
-        queries.append(f"{core} explained")
-        queries.append(f"{core} overview")
+    # --- Q9: Core with domain/context qualifier ---
+    # If we detected a question about something that commonly has
+    # ambiguous names, add a domain hint derived from the message.
+    _DOMAIN_SIGNALS = {
+        "health": r"\b(symptom|treatment|disease|diagnosis|medical|health|doctor|patient|medication|dose|side effect)\b",
+        "programming": r"\b(code|programming|function|library|framework|api|debug|compile|syntax|runtime|package|npm|pip)\b",
+        "sports": r"\b(team|player|match|game|score|season|league|championship|tournament|coach|roster)\b",
+        "finance": r"\b(stock|market|invest|price|dividend|earnings|portfolio|trading|crypto|bitcoin|etf)\b",
+        "legal": r"\b(law|legal|court|judge|statute|regulation|compliance|attorney|lawsuit|rights)\b",
+        "science": r"\b(research|study|experiment|hypothesis|theory|journal|peer.review|evidence|data|findings)\b",
+        "cooking": r"\b(recipe|cook|ingredient|bake|fry|roast|dish|cuisine|meal|flavor)\b",
+    }
+    for domain, pattern in _DOMAIN_SIGNALS.items():
+        if re.search(pattern, lower):
+            # Only add if domain word not already in core
+            if domain not in core.lower():
+                queries.append(f"{core} {domain}")
+            break  # one domain hint is enough
 
-    # --- Strategy 6: Time-sensitive variant ---
-    if time_sensitive and keywords:
-        queries.append(f"{' '.join(keywords[:4])} {year}")
-
-    # --- Strategy 7: "what is" reformulation ---
-    if keywords:
-        queries.append(f"what is {' '.join(keywords[:4])}")
-
-    # --- Strategy 8: Site-specific (Wikipedia) ---
-    if keywords:
-        core_topic = " ".join(keywords[:4])
-        queries.append(f"{core_topic} site:en.wikipedia.org")
-
-    # --- Strategy 9: Comparison ("vs") if message looks comparative ---
-    if re.search(r"\b(vs\.?|versus|compared? to|or)\b", cleaned, re.IGNORECASE) and len(keywords) >= 2:
-        queries.append(f"{keywords[0]} vs {keywords[1]}")
-
-    # --- Strategy 10: Individual keyword pairs for broad coverage ---
-    if len(keywords) >= 2:
-        for kw in keywords[1:4]:
-            queries.append(f"{keywords[0]} {kw}")
-
-    # Deduplicate (case-insensitive) and cap
+    # ---- Phase 4: Deduplicate and rank ----
     seen: set[str] = set()
     unique: list[str] = []
     for q in queries:
         q = q.strip()
+        if not q:
+            continue
         key = q.lower()
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(q)
+        # Skip if it's a pure subset of an already-added query
+        if key in seen:
+            continue
+        # Skip very short queries (likely just a single common word)
+        if len(q) < 3:
+            continue
+        seen.add(key)
+        unique.append(q)
 
     result = unique[:max_queries]
     _log.info(
-        "broad_queries generated  strategies=9 unique=%d capped=%d queries=%s",
+        "broad_queries generated  unique=%d capped=%d queries=%s",
         len(unique), len(result), result,
     )
     return result
