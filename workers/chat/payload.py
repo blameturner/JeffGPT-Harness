@@ -16,13 +16,30 @@ def build_chat_payload(
     search_context: str,
     search_note: str,
     rag_context: str,
+    search_status: str = "",
 ) -> list[dict]:
     payload: list[dict] = []
     payload.append({"role": "system", "content": BASE_SYSTEM_PROMPT})
     payload.append({"role": "system", "content": build_temporal_context()})
     if system:
         payload.append({"role": "system", "content": system})
-    if search_context:
+    if search_context and search_status == "awaiting_approval":
+        payload.append({"role": "system", "content": (
+            "You have prepared a search/research plan for the user's question. "
+            "Present this plan clearly and ask the user to approve it or suggest changes. "
+            "Do NOT answer the question yet — you have not analysed any sources. "
+            "Just present the plan below and ask for confirmation.\n\n"
+            + search_context
+        )})
+    elif search_context and search_status == "queued":
+        payload.append({"role": "system", "content": (
+            "You have queued a deep search or research job for the user's question. "
+            "Tell the user their request is being processed and results will be "
+            "delivered to this conversation when ready. Do NOT attempt to answer "
+            "the question — the analysis has not completed yet.\n\n"
+            + search_context
+        )})
+    elif search_context:
         payload.append({"role": "system", "content": (
             "The following are LIVE web search results retrieved just now for "
             "this conversation. Use these sources to inform your answer. "

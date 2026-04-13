@@ -205,10 +205,116 @@ class ChatAgent:
                 if turn.get("role") == "assistant":
                     last_assistant = (turn.get("content") or "")[:800]
                     break
-            hints = gate_check(user_message, conversation_context=last_assistant)
-            if not web_search_enabled or not self.search_enabled:
-                hints.discard("web_search")
-            _log.info("chat conv=%s  gate check: tools=%s web_search_global=%s search_enabled=%s", conversation_id, sorted(hints) or "none", web_search_enabled, self.search_enabled)
+            search_mode = self._search_mode
+            has_queued_jobs = False
+            _t_tools = time.perf_counter()
+
+            # --- Approval handling runs BEFORE the gate check ---
+            # When the user approves a pending plan, the message text
+            # ("Approved", "Go ahead") won't trigger any gate hints.
+            # So we handle approvals independently.
+            _approval_modes = ("deep_approved", "research_approved")
+            pending_ds = convo.get("pending_deep_search") or ""
+            pending_rs = convo.get("pending_research") or ""
+
+            # Clear stale plans when user moves on to something else
+            if search_mode not in ("deep_approved", "deep", "research_approved", "research"):
+                stale_clear = {}
+                if pending_ds:
+                    stale_clear["pending_deep_search"] = ""
+                    pending_ds = ""
+                if pending_rs:
+                    stale_clear["pending_research"] = ""
+                    pending_rs = ""
+                if stale_clear:
+                    try:
+                        self.db.update_conversation(conversation_id, stale_clear)
+                        _log.info("chat conv=%s  cleared stale pending plans: %s", conversation_id, sorted(stale_clear.keys()))
+                    except Exception:
+                        pass
+
+            if search_mode == "deep_approved" and pending_ds:
+                try:
+                    ds_plan = json.loads(pending_ds)
+                except Exception:
+                    ds_plan = {}
+                if ds_plan:
+                    _log.info("chat conv=%s  deep search approved — executing %d queries, %d urls",
+                              conversation_id, len(ds_plan.get("queries", [])), len(ds_plan.get("urls", [])))
+                    actions = [ToolAction(
+                        tool=ToolName.DEEP_SEARCH,
+                        params={
+                            "_phase": "execute",
+                            "_plan": ds_plan,
+                            "_org_id": self.org_id,
+                            "_conversation_id": conversation_id,
+                        },
+                        reason="deep search (approved, executing)",
+                    )]
+                    plan = ToolPlan(actions=actions, summary="Executing approved deep search")
+                    try:
+                        tool_context = asyncio.run(execute_plan(plan, emit))
+                        _log.info("chat conv=%s  deep search execution dispatched", conversation_id)
+                    except Exception:
+                        _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
+                    for r in tool_context.results:
+                        if r.tool.value == "deep_search" and r.ok:
+                            has_queued_jobs = True
+                            search_result.search_context = r.data
+                            search_result.search_status = "queued"
+                            search_result.search_confidence = "pending"
+                            emit({"type": "jobs_queued", "tool": "deep_search",
+                                  "message": r.data, "status": "running"})
+                else:
+                    _log.warning("chat conv=%s  deep_approved but plan was empty", conversation_id)
+            elif search_mode == "deep_approved":
+                _log.warning("chat conv=%s  deep_approved but no pending plan — falling back to normal", conversation_id)
+
+            elif search_mode == "research_approved" and pending_rs:
+                try:
+                    rs_plan = json.loads(pending_rs)
+                except Exception:
+                    rs_plan = {}
+                if rs_plan:
+                    _log.info("chat conv=%s  research approved — executing %d queries",
+                              conversation_id, len(rs_plan.get("queries", [])))
+                    actions = [ToolAction(
+                        tool=ToolName.RESEARCH,
+                        params={
+                            "_phase": "execute",
+                            "_plan": rs_plan,
+                            "_org_id": self.org_id,
+                            "_conversation_id": conversation_id,
+                        },
+                        reason="research (approved, executing)",
+                    )]
+                    plan = ToolPlan(actions=actions, summary="Executing approved research")
+                    try:
+                        tool_context = asyncio.run(execute_plan(plan, emit))
+                        _log.info("chat conv=%s  research execution dispatched", conversation_id)
+                    except Exception:
+                        _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
+                    for r in tool_context.results:
+                        if r.tool.value == "research" and r.ok:
+                            has_queued_jobs = True
+                            search_result.search_context = r.data
+                            search_result.search_status = "queued"
+                            search_result.search_confidence = "pending"
+                            emit({"type": "jobs_queued", "tool": "research",
+                                  "message": r.data, "status": "running"})
+                else:
+                    _log.warning("chat conv=%s  research_approved but plan was empty", conversation_id)
+            elif search_mode == "research_approved":
+                _log.warning("chat conv=%s  research_approved but no pending plan — falling back to normal", conversation_id)
+
+            # --- Gate check for normal tool dispatch ---
+            # Skip if approval already handled the request.
+            hints = set()
+            if search_mode not in _approval_modes:
+                hints = gate_check(user_message, conversation_context=last_assistant)
+                if not web_search_enabled or not self.search_enabled:
+                    hints.discard("web_search")
+            _log.info("chat conv=%s  gate check: tools=%s web_search_global=%s search_enabled=%s mode=%s", conversation_id, sorted(hints) or "none", web_search_enabled, self.search_enabled, search_mode)
 
             if hints:
                 tool_labels = {
@@ -224,111 +330,6 @@ class ChatAgent:
                     "summary": instant_summary,
                     "tools": sorted(hints),
                 })
-
-                _t_tools = time.perf_counter()
-                has_queued_jobs = False
-
-                search_mode = self._search_mode
-
-                # Check for pending approval plans (deep search or research).
-                # If the user approved, execute. If they moved on, clear stale plans.
-                _approval_modes = ("deep_approved", "deep", "research_approved", "research")
-                pending_ds = convo.get("pending_deep_search") or ""
-                pending_rs = convo.get("pending_research") or ""
-
-                if search_mode not in _approval_modes:
-                    # User moved on — clear any stale pending plans
-                    stale_clear = {}
-                    if pending_ds:
-                        stale_clear["pending_deep_search"] = ""
-                        pending_ds = ""
-                    if pending_rs:
-                        stale_clear["pending_research"] = ""
-                        pending_rs = ""
-                    if stale_clear:
-                        try:
-                            self.db.update_conversation(conversation_id, stale_clear)
-                            _log.info("chat conv=%s  cleared stale pending plans: %s", conversation_id, sorted(stale_clear.keys()))
-                        except Exception:
-                            pass
-
-                # Handle deep search approval
-                if search_mode == "deep_approved":
-                    if not pending_ds:
-                        _log.warning("chat conv=%s  deep_approved but no pending plan — falling back to normal", conversation_id)
-                        search_mode = "normal"
-                    else:
-                        try:
-                            ds_plan = json.loads(pending_ds)
-                        except Exception:
-                            ds_plan = {}
-                        if ds_plan:
-                            _log.info("chat conv=%s  deep search approved — executing %d queries, %d urls",
-                                      conversation_id, len(ds_plan.get("queries", [])), len(ds_plan.get("urls", [])))
-                            actions = [ToolAction(
-                                tool=ToolName.DEEP_SEARCH,
-                                params={
-                                    "_phase": "execute",
-                                    "_plan": ds_plan,
-                                    "_org_id": self.org_id,
-                                    "_conversation_id": conversation_id,
-                                },
-                                reason="deep search (approved, executing)",
-                            )]
-                            plan = ToolPlan(actions=actions, summary="Executing approved deep search")
-                            try:
-                                tool_context = asyncio.run(execute_plan(plan, emit))
-                                _log.info("chat conv=%s  deep search execution dispatched", conversation_id)
-                            except Exception:
-                                _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
-                            for r in tool_context.results:
-                                if r.tool.value == "deep_search" and r.ok:
-                                    has_queued_jobs = True
-                                    search_result.search_context = r.data
-                                    search_result.search_status = "queued"
-                                    search_result.search_confidence = "pending"
-                                    emit({"type": "jobs_queued", "tool": "deep_search",
-                                          "message": r.data, "status": "running"})
-                            hints = set()
-
-                # Handle research approval
-                if search_mode == "research_approved":
-                    if not pending_rs:
-                        _log.warning("chat conv=%s  research_approved but no pending plan — falling back to normal", conversation_id)
-                        search_mode = "normal"
-                    else:
-                        try:
-                            rs_plan = json.loads(pending_rs)
-                        except Exception:
-                            rs_plan = {}
-                        if rs_plan:
-                            _log.info("chat conv=%s  research approved — executing %d queries",
-                                      conversation_id, len(rs_plan.get("queries", [])))
-                            actions = [ToolAction(
-                                tool=ToolName.RESEARCH,
-                                params={
-                                    "_phase": "execute",
-                                    "_plan": rs_plan,
-                                    "_org_id": self.org_id,
-                                    "_conversation_id": conversation_id,
-                                },
-                                reason="research (approved, executing)",
-                            )]
-                            plan = ToolPlan(actions=actions, summary="Executing approved research")
-                            try:
-                                tool_context = asyncio.run(execute_plan(plan, emit))
-                                _log.info("chat conv=%s  research execution dispatched", conversation_id)
-                            except Exception:
-                                _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
-                            for r in tool_context.results:
-                                if r.tool.value == "research" and r.ok:
-                                    has_queued_jobs = True
-                                    search_result.search_context = r.data
-                                    search_result.search_status = "queued"
-                                    search_result.search_confidence = "pending"
-                                    emit({"type": "jobs_queued", "tool": "research",
-                                          "message": r.data, "status": "running"})
-                            hints = set()
 
                 # Tools that can be dispatched directly without the planner.
                 # web_search: heuristic queries (zero model calls).
@@ -577,6 +578,7 @@ class ChatAgent:
             search_context=search_context,
             search_note=search_note,
             rag_context=rag_context,
+            search_status=search_status,
         )
         _span("payload_build_ms", _t)
 
