@@ -245,6 +245,20 @@ class ChatAgent:
 
                     if "web_search" in hints:
                         convo_topics = extract_conversation_topics(history)
+                        # If RAG is running, collect it early to extract
+                        # context keywords for search query enrichment.
+                        if rag_future and not convo_topics:
+                            try:
+                                early_rag = rag_future.result(timeout=2)
+                                if early_rag:
+                                    from workers.search.queries import _extract_keywords
+                                    rag_kw = _extract_keywords(early_rag[:2000])
+                                    # Deduplicate against message keywords
+                                    msg_kw_lower = {k.lower() for k in _extract_keywords(user_message)}
+                                    convo_topics = [k.lower() for k in rag_kw if k.lower() not in msg_kw_lower][:8]
+                                    _log.info("rag-enriched topics  conv=%s topics=%s", conversation_id, convo_topics)
+                            except Exception:
+                                pass  # timeout or error — proceed without
                         queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
                         _log.info("fast-path queries  conv=%s queries=%s", conversation_id, queries)
                         if queries:
