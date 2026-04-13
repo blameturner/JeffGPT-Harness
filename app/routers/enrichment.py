@@ -106,8 +106,8 @@ def update_enrichment_agent(agent_id: int, body: EnrichmentAgentUpdate, request:
 @router.post("/enrichment/agents/{agent_id}/trigger")
 def trigger_enrichment_agent(agent_id: int):
     import threading
-    from workers.enrichment.cycle import run_enrichment_cycle
-    threading.Thread(target=run_enrichment_cycle, args=[agent_id], daemon=True).start()
+    from workers.enrichment.cycle import seed_enrichment_jobs
+    threading.Thread(target=seed_enrichment_jobs, args=[agent_id], daemon=True).start()
     return {"status": "triggered", "agent_id": agent_id}
 
 

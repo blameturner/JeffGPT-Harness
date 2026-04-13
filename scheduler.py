@@ -9,11 +9,9 @@ import requests
 _log = logging.getLogger("scheduler")
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
-from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL, is_feature_enabled
-from workers.batch_summarise import run_batch_summarise
-from workers.enrichment.cycle import run_enrichment_cycle, run_log_cleanup
+from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
+from workers.enrichment.cycle import run_log_cleanup, seed_enrichment_jobs
 from workers.enrichment.db import EnrichmentDB
 
 _scheduler: BackgroundScheduler | None = None
@@ -109,6 +107,13 @@ ENRICHMENT_JOB_PREFIX = "enrichment_agent_"
 
 
 def _register_enrichment_agents(sched: BackgroundScheduler) -> int:
+    """Register enrichment agents as queue seeders.
+
+    Each enrichment agent's cron fires ``seed_enrichment_jobs(agent_id)``
+    which creates individual scrape→summarise jobs in the tool_jobs queue.
+    The queue's backoff system ensures no model contention with active
+    chat/code sessions.
+    """
     for job in list(sched.get_jobs()):
         if job.id.startswith(ENRICHMENT_JOB_PREFIX):
             sched.remove_job(job.id)
@@ -128,7 +133,7 @@ def _register_enrichment_agents(sched: BackgroundScheduler) -> int:
             tz = agent.get("timezone") or "Australia/Sydney"
             trigger = CronTrigger.from_crontab(cron, timezone=tz)
             sched.add_job(
-                run_enrichment_cycle,
+                seed_enrichment_jobs,
                 trigger,
                 id=f"{ENRICHMENT_JOB_PREFIX}{agent_id}",
                 args=[agent_id],
@@ -145,14 +150,8 @@ def _register_enrichment_agents(sched: BackgroundScheduler) -> int:
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
     sched = BackgroundScheduler(timezone="UTC")
-    sched.add_job(
-        run_enrichment_cycle,
-        IntervalTrigger(hours=1),
-        id="enrichment_cycle",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
+
+    # Log cleanup is pure DB maintenance — no model calls, safe to keep.
     sched.add_job(
         run_log_cleanup,
         CronTrigger(hour=2, minute=0),
@@ -161,17 +160,14 @@ def start_scheduler() -> BackgroundScheduler:
         coalesce=True,
         replace_existing=True,
     )
-    if is_feature_enabled("batch_summarise"):
-        sched.add_job(
-            run_batch_summarise,
-            CronTrigger(hour=4, minute=0, timezone="Australia/Sydney"),
-            id="batch_summarise",
-            max_instances=1,
-            coalesce=True,
-            replace_existing=True,
-        )
-    else:
-        _log.info("batch_summarise disabled via config, skipping job registration")
+
+    # NOTE: No general enrichment cycle.  Only agent-specific cycles are
+    # registered below.  Each fires seed_enrichment_jobs() which creates
+    # tool_jobs entries — the queue handles the actual work.
+    #
+    # NOTE: batch_summarise is retired.  Per-turn RWKV summarisation in
+    # workers/chat/history.py handles conversation compression inline.
+
     sched.start()
     registered = _register_agent_schedules(sched)
     enrichment_registered = _register_enrichment_agents(sched)

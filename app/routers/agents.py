@@ -98,10 +98,27 @@ def scheduler_reload():
 
 @router.post("/scheduler/trigger")
 def scheduler_trigger():
+    """Trigger all active enrichment agents to seed jobs into the tool queue."""
+    from workers.enrichment.cycle import seed_enrichment_jobs
+    from workers.enrichment.db import EnrichmentDB
     import threading
-    from workers.enrichment.cycle import run_enrichment_cycle
-    threading.Thread(target=run_enrichment_cycle, daemon=True).start()
-    return {"status": "triggered"}
+
+    try:
+        db = EnrichmentDB()
+        agents = db.list_enrichment_agents()
+        triggered = 0
+        for agent in agents:
+            if not agent.get("active", True):
+                continue
+            agent_id = agent.get("Id")
+            if agent_id:
+                threading.Thread(
+                    target=seed_enrichment_jobs, args=[agent_id], daemon=True,
+                ).start()
+                triggered += 1
+        return {"status": "triggered", "agents_seeded": triggered}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/scheduler/status")
