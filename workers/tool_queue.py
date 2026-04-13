@@ -355,8 +355,10 @@ class ToolJobQueue:
             workers[jt] = sum(1 for t in threads if t.is_alive())
 
         idle = seconds_since_chat()
+        if idle == float("inf"):
+            idle = -1  # no chat activity recorded yet
         backoff_state = "active"
-        if idle >= _DEFAULT_BACKOFF:
+        if idle < 0 or idle >= _DEFAULT_BACKOFF:
             backoff_state = "clear"
         elif idle >= _PRIORITY_BACKOFF.get(2, 300):
             backoff_state = "priority_1_2_only"
