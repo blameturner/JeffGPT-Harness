@@ -337,15 +337,21 @@ class ChatAgent(BaseAgent):
                         search_result.search_context = r.data
                         search_result.search_status = "awaiting_approval"
                         search_result.search_confidence = "pending"
-                        emit({
+                        fresh = self.db.get_conversation(conversation_id) or {}
+                        plan_json = fresh.get(pending_field) or ""
+                        plan_event = {
                             "type": f"{tool_label}_plan",
                             "tool": tool_label,
                             "message": r.data,
                             "status": "awaiting_approval",
-                        })
+                        }
+                        if plan_json:
+                            try:
+                                plan_event["plan"] = json.loads(plan_json)
+                            except Exception:
+                                pass
+                        emit(plan_event)
                         try:
-                            fresh = self.db.get_conversation(conversation_id) or {}
-                            plan_json = fresh.get(pending_field) or ""
                             self.db.add_message(
                                 conversation_id=conversation_id,
                                 org_id=self.org_id,
