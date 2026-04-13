@@ -601,10 +601,12 @@ class ToolJobQueue:
                     started_ts = datetime.fromisoformat(started).timestamp()
                 except Exception:
                     continue
-                # graph_extract jobs invoke LLM inference that can take
-                # 7-16 minutes on local models — use 4x the normal timeout.
+                # Long-running jobs need extended stale timeouts.
+                # graph_extract: 7-16 min (LLM inference) → 4x
+                # research: up to 60 min (iterative multi-source) → 12x
                 job_type = row.get("type") or ""
-                timeout = JOB_QUEUE_STALE_TIMEOUT * 4 if job_type == "graph_extract" else JOB_QUEUE_STALE_TIMEOUT
+                _STALE_MULTIPLIERS = {"graph_extract": 4, "research": 12}
+                timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
                     noco_id = row.get("Id")
                     db._patch(NOCODB_TABLE, noco_id, {
@@ -940,9 +942,10 @@ def _handle_summarise(payload: dict) -> dict:
         _deliver_to_conversation(conversation_id, org_id, url, summary)
         _log.info("queue summarise: delivered to conversation  conv=%s  url=%s", conversation_id, url[:60])
 
-    # Queue graph extraction for enrichment sources so relationships
-    # land in FalkorDB. Runs at lowest priority (5) when models are idle.
-    if scrape_target_id and source_type == "enrichment" and summary:
+    # Queue graph extraction so relationships land in FalkorDB.
+    # Runs at lowest priority (5) when models are idle.
+    _graph_sources = ("enrichment", "deep_search", "research")
+    if source_type in _graph_sources and summary and org_id:
         try:
             tq = get_tool_queue()
             if tq:
@@ -954,13 +957,13 @@ def _handle_summarise(payload: dict) -> dict:
                         "conversation_id": 0,
                         "org_id": org_id,
                     },
-                    source="enrichment",
+                    source=source_type,
                     org_id=org_id,
                     priority=5,
                 )
-                _log.info("queue summarise: graph extraction queued  target=%s  job=%s", scrape_target_id, graph_job_id)
+                _log.info("queue summarise: graph extraction queued  source=%s  job=%s  url=%s", source_type, graph_job_id, url[:60])
         except Exception:
-            _log.error("queue summarise: graph extraction queue FAILED  target=%s  url=%s", scrape_target_id, url[:60], exc_info=True)
+            _log.error("queue summarise: graph extraction queue FAILED  source=%s  url=%s", source_type, url[:60], exc_info=True)
 
     # Update the scrape target so it's not re-scraped until next_crawl_at.
     if scrape_target_id and source_type == "enrichment":
@@ -1013,7 +1016,7 @@ def _deliver_to_conversation(conversation_id: int, org_id: int, url: str, summar
             tokens_input=0,
             tokens_output=0,
             search_used=True,
-            search_status="completed",
+            search_status="used",
             search_confidence="high",
             search_source_count=1,
         )
@@ -1051,6 +1054,277 @@ def _handle_graph_extract(payload: dict) -> dict:
     extract_and_write_graph(user_text, assistant_text, conversation_id, org_id)
     _log.info("queue graph_extract: complete  org=%d", org_id)
     return {"status": "ok"}
+
+
+def _handle_research(payload: dict) -> dict:
+    """Run iterative research: search → scrape → summarise → assess → refine → repeat.
+
+    Runs inside a tool queue worker thread.  All async work is batched into
+    a single asyncio event loop per phase to avoid the fragility of repeated
+    asyncio.run() calls.
+    """
+    import asyncio as _aio
+    from memory import remember
+    from workers.enrichment.models import model_call
+    from workers.chat.graph import extract_and_write_graph
+    from tools.framework.executors.web_search import _search_all, _scrape_one, _summarise_one
+    from tools.framework.executors.research import (
+        _assess_progress, MAX_ITERATIONS, MAX_SOURCES_PER_ITERATION, MAX_TOTAL_SOURCES,
+        _SYNTHESISE_PROMPT,
+    )
+
+    plan = payload.get("plan") or {}
+    org_id = int(payload.get("org_id") or 0)
+    conversation_id = payload.get("conversation_id")
+
+    question = plan.get("question", "")
+    objective = plan.get("objective", "")
+    queries = list(plan.get("queries", []))
+    lookout = plan.get("lookout", [])
+    criteria = plan.get("completion_criteria", [])
+
+    if not queries or not org_id:
+        _log.info("queue research: skipped — no queries or org  org=%d", org_id)
+        return {"status": "skipped", "error": "no queries or org"}
+
+    _log.info("queue research: starting  org=%d  question=%s  queries=%d",
+              org_id, question[:60], len(queries))
+
+    # Single event loop for all async work in this handler.
+    loop = _aio.new_event_loop()
+
+    all_summaries: list[dict] = []  # {url, title, summary}
+    iteration = 0
+
+    try:
+        while iteration < MAX_ITERATIONS and queries:
+            iteration += 1
+            _log.info("queue research: iteration %d/%d  queries=%d  total_sources=%d",
+                      iteration, MAX_ITERATIONS, len(queries), len(all_summaries))
+
+            # 1. Search
+            try:
+                results = loop.run_until_complete(_search_all(queries))
+            except Exception:
+                _log.error("queue research: search failed iteration=%d", iteration, exc_info=True)
+                break
+
+            # Deduplicate against already-processed URLs
+            seen_urls = {s["url"] for s in all_summaries}
+            new_results = [r for r in results if r["url"] not in seen_urls][:MAX_SOURCES_PER_ITERATION]
+
+            if not new_results:
+                _log.info("queue research: no new URLs found in iteration %d — stopping", iteration)
+                break
+
+            _log.info("queue research: iteration %d  new_urls=%d", iteration, len(new_results))
+
+            # 2. Scrape (parallel)
+            try:
+                scraped = loop.run_until_complete(
+                    _aio.gather(*[_scrape_one(r) for r in new_results])
+                )
+            except Exception:
+                _log.error("queue research: scrape failed iteration=%d", iteration, exc_info=True)
+                break
+
+            with_text = [s for s in scraped if s.get("text") and len(s["text"]) >= 200]
+
+            if not with_text:
+                _log.info("queue research: all sources empty in iteration %d", iteration)
+                if iteration < MAX_ITERATIONS:
+                    queries = queries[len(queries)//2:]  # try remaining queries
+                    continue
+                break
+
+            # 3. Summarise each source with T1 secondary
+            for source in with_text:
+                if len(all_summaries) >= MAX_TOTAL_SOURCES:
+                    break
+                try:
+                    result = loop.run_until_complete(
+                        _summarise_one(source["url"], source["text"], question, "research_summarise")
+                    )
+                    summary_text = result.get("summary", "")
+                    if summary_text and len(summary_text) >= 50:
+                        entry = {
+                            "url": source["url"],
+                            "title": source.get("title", ""),
+                            "summary": summary_text,
+                        }
+                        all_summaries.append(entry)
+
+                        # Store each source to ChromaDB immediately
+                        try:
+                            remember(
+                                text=summary_text,
+                                metadata={
+                                    "url": source["url"],
+                                    "type": "research",
+                                    "question": question[:500],
+                                    "conversation_id": conversation_id,
+                                },
+                                org_id=org_id,
+                                collection_name="research",
+                            )
+                        except Exception:
+                            _log.warning("queue research: chroma store failed  url=%s", source["url"][:60], exc_info=True)
+
+                        # Graph extraction per source
+                        try:
+                            extract_and_write_graph(
+                                f"Research source: {source['url']}",
+                                summary_text,
+                                conversation_id or 0,
+                                org_id,
+                            )
+                        except Exception:
+                            _log.debug("queue research: graph extract failed  url=%s", source["url"][:60], exc_info=True)
+
+                        _log.info("queue research: summarised  url=%s  chars=%d  total=%d",
+                                  source["url"][:60], len(summary_text), len(all_summaries))
+                except Exception:
+                    _log.warning("queue research: summarise failed  url=%s", source["url"][:60], exc_info=True)
+
+            # 4. Assess progress — always assess when not on the last iteration,
+            #    even with few sources (thin evidence is itself a signal).
+            if iteration < MAX_ITERATIONS and all_summaries:
+                try:
+                    assessment = _assess_progress(objective, lookout, criteria, all_summaries)
+                    _log.info("queue research: assessment  complete=%s  gaps=%s  new_queries=%d",
+                              assessment.get("complete"), assessment.get("gaps", []),
+                              len(assessment.get("new_queries", [])))
+
+                    if assessment.get("complete"):
+                        _log.info("queue research: completion criteria met — stopping iteration")
+                        break
+
+                    new_queries = assessment.get("new_queries", [])
+                    if new_queries:
+                        queries = [str(q).strip() for q in new_queries if str(q).strip()][:6]
+                    else:
+                        _log.info("queue research: no new queries suggested — stopping iteration")
+                        break
+                except Exception:
+                    _log.warning("queue research: assessment failed — continuing with existing queries", exc_info=True)
+                    # Don't break — try another iteration with the same queries
+
+    finally:
+        loop.close()
+
+    # 5. Synthesise final report with T1 secondary
+    if not all_summaries:
+        _log.warning("queue research: no summaries gathered — cannot synthesise")
+        if conversation_id:
+            try:
+                from nocodb_client import NocodbClient
+                db = NocodbClient()
+                db.add_message(
+                    conversation_id=int(conversation_id),
+                    org_id=org_id,
+                    role="system",
+                    content=(
+                        f"[Research failed]\n"
+                        f"Question: {question}\n\n"
+                        f"Could not find sufficient sources after {iteration} round(s). "
+                        f"Try rephrasing the question or broadening the scope."
+                    ),
+                    model="research",
+                    tokens_input=0, tokens_output=0,
+                    search_used=True, search_status="failed",
+                    search_confidence="none", search_source_count=0,
+                )
+            except Exception:
+                _log.error("queue research: failure delivery failed  conv=%s", conversation_id, exc_info=True)
+        return {"status": "no_sources", "iterations": iteration}
+
+    evidence_block = ""
+    for i, s in enumerate(all_summaries, 1):
+        evidence_block += f"\n[{i}] {s['url']}\nTitle: {s['title']}\n{s['summary']}\n"
+
+    synth_prompt = _SYNTHESISE_PROMPT.format(
+        question=question,
+        objective=objective,
+        source_count=len(all_summaries),
+        iterations=iteration,
+        evidence_block=evidence_block[:20000],
+    )
+
+    _log.info("queue research: synthesising  sources=%d  iterations=%d", len(all_summaries), iteration)
+
+    report, synth_tokens = model_call("research_synthesise", synth_prompt)
+    _log.info("queue research: synthesis complete  tokens=%d  chars=%d", synth_tokens, len(report or ""))
+
+    if not report:
+        report = "Research synthesis failed. Raw evidence was gathered but could not be compiled into a report."
+
+    # Store final report to ChromaDB
+    try:
+        remember(
+            text=f"RESEARCH REPORT: {question}\n\n{report}",
+            metadata={
+                "type": "research_report",
+                "question": question[:500],
+                "sources": len(all_summaries),
+                "iterations": iteration,
+                "conversation_id": conversation_id,
+            },
+            org_id=org_id,
+            collection_name="research",
+        )
+    except Exception:
+        _log.error("queue research: final report chroma store failed", exc_info=True)
+
+    # Graph extraction on the final report
+    try:
+        extract_and_write_graph(
+            f"Research question: {question}",
+            report[:8000],
+            conversation_id or 0,
+            org_id,
+        )
+    except Exception:
+        _log.debug("queue research: final report graph extract failed", exc_info=True)
+
+    # Deliver to conversation
+    if conversation_id:
+        try:
+            from nocodb_client import NocodbClient
+            db = NocodbClient()
+            source_urls = "\n".join(f"[{i+1}] {s['url']}" for i, s in enumerate(all_summaries))
+            content = (
+                f"[Research complete]\n"
+                f"Question: {question}\n"
+                f"Sources analysed: {len(all_summaries)} across {iteration} round(s)\n\n"
+                f"{report}\n\n"
+                f"Sources:\n{source_urls}"
+            )
+            db.add_message(
+                conversation_id=int(conversation_id),
+                org_id=org_id,
+                role="system",
+                content=content[:8000],
+                model="research",
+                tokens_input=0,
+                tokens_output=synth_tokens,
+                search_used=True,
+                search_status="completed",
+                search_confidence="high",
+                search_source_count=len(all_summaries),
+            )
+            _log.info("queue research: delivered to conversation=%s  sources=%d", conversation_id, len(all_summaries))
+        except Exception:
+            _log.error("queue research: delivery failed  conv=%s", conversation_id, exc_info=True)
+
+    _log.info("queue research: complete  question=%s  sources=%d  iterations=%d",
+              question[:60], len(all_summaries), iteration)
+
+    return {
+        "status": "ok",
+        "sources": len(all_summaries),
+        "iterations": iteration,
+        "report_chars": len(report),
+    }
 
 
 def _set_instance(q: ToolJobQueue):

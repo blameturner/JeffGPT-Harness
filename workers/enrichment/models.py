@@ -53,7 +53,7 @@ def _raw_model_call(
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "max_tokens": max_tokens,
-            **no_think_params(),
+            **no_think_params(model_id),
         }
         if extra_params:
             params.update(extra_params)

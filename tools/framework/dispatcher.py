@@ -112,5 +112,6 @@ from tools.framework.executors import (  # noqa: E402, F401
     code_exec,
     deep_search,
     rag_lookup,
+    research,
     web_search,
 )

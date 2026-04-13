@@ -80,6 +80,7 @@ class ChatAgent:
         self.org_id = org_id
         self.url = url
         self.search_enabled = search_enabled
+        self._search_mode = "normal"
         self.db = NocodbClient()
 
     @staticmethod
@@ -225,27 +226,151 @@ class ChatAgent:
                 })
 
                 _t_tools = time.perf_counter()
+                has_queued_jobs = False
 
-                # Deep search is a UI toggle (search_mode="deep"), not
-                # auto-detected.  When active, queue deep_search jobs AND
-                # still run a normal web_search inline so the main model
-                # has immediate context while the deep results arrive later.
-                search_mode = getattr(self, '_search_mode', 'normal')
+                search_mode = self._search_mode
+
+                # Check for pending approval plans (deep search or research).
+                # If the user approved, execute. If they moved on, clear stale plans.
+                _approval_modes = ("deep_approved", "deep", "research_approved", "research")
+                pending_ds = convo.get("pending_deep_search") or ""
+                pending_rs = convo.get("pending_research") or ""
+
+                if search_mode not in _approval_modes:
+                    # User moved on — clear any stale pending plans
+                    stale_clear = {}
+                    if pending_ds:
+                        stale_clear["pending_deep_search"] = ""
+                        pending_ds = ""
+                    if pending_rs:
+                        stale_clear["pending_research"] = ""
+                        pending_rs = ""
+                    if stale_clear:
+                        try:
+                            self.db.update_conversation(conversation_id, stale_clear)
+                            _log.info("chat conv=%s  cleared stale pending plans: %s", conversation_id, sorted(stale_clear.keys()))
+                        except Exception:
+                            pass
+
+                # Handle deep search approval
+                if search_mode == "deep_approved":
+                    if not pending_ds:
+                        _log.warning("chat conv=%s  deep_approved but no pending plan — falling back to normal", conversation_id)
+                        search_mode = "normal"
+                    else:
+                        try:
+                            ds_plan = json.loads(pending_ds)
+                        except Exception:
+                            ds_plan = {}
+                        if ds_plan:
+                            _log.info("chat conv=%s  deep search approved — executing %d queries, %d urls",
+                                      conversation_id, len(ds_plan.get("queries", [])), len(ds_plan.get("urls", [])))
+                            actions = [ToolAction(
+                                tool=ToolName.DEEP_SEARCH,
+                                params={
+                                    "_phase": "execute",
+                                    "_plan": ds_plan,
+                                    "_org_id": self.org_id,
+                                    "_conversation_id": conversation_id,
+                                },
+                                reason="deep search (approved, executing)",
+                            )]
+                            plan = ToolPlan(actions=actions, summary="Executing approved deep search")
+                            try:
+                                tool_context = asyncio.run(execute_plan(plan, emit))
+                                _log.info("chat conv=%s  deep search execution dispatched", conversation_id)
+                            except Exception:
+                                _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
+                            for r in tool_context.results:
+                                if r.tool.value == "deep_search" and r.ok:
+                                    has_queued_jobs = True
+                                    search_result.search_context = r.data
+                                    search_result.search_status = "queued"
+                                    search_result.search_confidence = "pending"
+                                    emit({"type": "jobs_queued", "tool": "deep_search",
+                                          "message": r.data, "status": "running"})
+                            hints = set()
+
+                # Handle research approval
+                if search_mode == "research_approved":
+                    if not pending_rs:
+                        _log.warning("chat conv=%s  research_approved but no pending plan — falling back to normal", conversation_id)
+                        search_mode = "normal"
+                    else:
+                        try:
+                            rs_plan = json.loads(pending_rs)
+                        except Exception:
+                            rs_plan = {}
+                        if rs_plan:
+                            _log.info("chat conv=%s  research approved — executing %d queries",
+                                      conversation_id, len(rs_plan.get("queries", [])))
+                            actions = [ToolAction(
+                                tool=ToolName.RESEARCH,
+                                params={
+                                    "_phase": "execute",
+                                    "_plan": rs_plan,
+                                    "_org_id": self.org_id,
+                                    "_conversation_id": conversation_id,
+                                },
+                                reason="research (approved, executing)",
+                            )]
+                            plan = ToolPlan(actions=actions, summary="Executing approved research")
+                            try:
+                                tool_context = asyncio.run(execute_plan(plan, emit))
+                                _log.info("chat conv=%s  research execution dispatched", conversation_id)
+                            except Exception:
+                                _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
+                            for r in tool_context.results:
+                                if r.tool.value == "research" and r.ok:
+                                    has_queued_jobs = True
+                                    search_result.search_context = r.data
+                                    search_result.search_status = "queued"
+                                    search_result.search_confidence = "pending"
+                                    emit({"type": "jobs_queued", "tool": "research",
+                                          "message": r.data, "status": "running"})
+                            hints = set()
 
                 # Tools that can be dispatched directly without the planner.
-                # web_search / deep_search: heuristic queries (zero model calls).
+                # web_search: heuristic queries (zero model calls).
                 # rag_lookup: just a ChromaDB similarity search.
-                # code_exec: needs planner for code generation — only tool
-                #            that truly requires the planner.
+                # code_exec: needs planner for code generation.
                 _DIRECT_TOOLS = {"web_search", "rag_lookup"}
 
-                if hints <= _DIRECT_TOOLS:
-                    # Fast path: build plan directly without invoking
-                    # the planner model.  Zero model calls for dispatch.
+                if hints <= _DIRECT_TOOLS and hints:
                     _log.info("chat conv=%s  search fast-path  tools=%s mode=%s", conversation_id, sorted(hints), search_mode)
                     actions: list[ToolAction] = []
 
-                    if "web_search" in hints:
+                    # Deep search / research: skip inline web_search, use
+                    # T3 to generate plan for user approval.
+                    if search_mode == "deep" and "web_search" in hints:
+                        convo_topics = extract_conversation_topics(history)
+                        _log.info("chat conv=%s  deep search — T3 query generation, skipping inline search", conversation_id)
+                        actions.append(ToolAction(
+                            tool=ToolName.DEEP_SEARCH,
+                            params={
+                                "_user_message": user_message,
+                                "_conversation_topics": convo_topics or [],
+                                "_org_id": self.org_id,
+                                "_conversation_id": conversation_id,
+                            },
+                            reason="deep search (T3 queries, awaiting approval)",
+                        ))
+
+                    elif search_mode == "research" and "web_search" in hints:
+                        convo_topics = extract_conversation_topics(history)
+                        _log.info("chat conv=%s  research — T3 plan generation, skipping inline search", conversation_id)
+                        actions.append(ToolAction(
+                            tool=ToolName.RESEARCH,
+                            params={
+                                "_user_message": user_message,
+                                "_conversation_topics": convo_topics or [],
+                                "_org_id": self.org_id,
+                                "_conversation_id": conversation_id,
+                            },
+                            reason="research (T3 plan, awaiting approval)",
+                        ))
+
+                    elif "web_search" in hints:
                         convo_topics = extract_conversation_topics(history)
                         if convo_topics:
                             _log.info("chat conv=%s  topics from summary: %s", conversation_id, convo_topics)
@@ -275,22 +400,6 @@ class ChatAgent:
                                     "_collection": collection_name,
                                 },
                                 reason="web search",
-                            ))
-
-                    # When UI has deep search toggled, also queue deep_search
-                    # jobs for thorough background analysis.
-                    if search_mode == "deep" and "web_search" in hints:
-                        deep_queries = generate_broad_queries(user_message, max_queries=10)
-                        _log.info("deep search queuing  conv=%s queries=%s", conversation_id, deep_queries)
-                        if deep_queries:
-                            actions.append(ToolAction(
-                                tool=ToolName.DEEP_SEARCH,
-                                params={
-                                    "queries": deep_queries,
-                                    "_org_id": self.org_id,
-                                    "_conversation_id": conversation_id,
-                                },
-                                reason="deep search (queued)",
                             ))
 
                     if "rag_lookup" in hints:
@@ -349,7 +458,6 @@ class ChatAgent:
 
             # Map tool results back onto search_result so the downstream
             # payload build and persistence code paths stay unchanged.
-            has_queued_jobs = False
             for r in tool_context.results:
                 if r.tool.value == "web_search" and r.ok:
                     search_result.search_context = r.data
@@ -364,20 +472,21 @@ class ChatAgent:
                         "search terms the user could try to find what they need."
                     )
                 elif r.tool.value == "deep_search" and r.ok:
-                    # Deep search is queued — tell the UI.
-                    has_queued_jobs = True
+                    search_result.search_context = r.data
+                    search_result.search_status = "awaiting_approval"
+                    search_result.search_confidence = "pending"
                     emit({
-                        "type": "jobs_queued",
+                        "type": "deep_search_plan",
                         "tool": "deep_search",
                         "message": r.data,
-                        "status": "waiting",
+                        "status": "awaiting_approval",
                     })
-                    # Include acknowledgment in main model context so it
-                    # can tell the user results are being researched.
-                    if not search_result.search_context:
-                        search_result.search_context = r.data
-                        search_result.search_status = "queued"
-                        search_result.search_confidence = "pending"
+                elif r.tool.value == "research" and r.ok:
+                    # research_plan event already emitted by the executor
+                    # with the structured plan object — just set context.
+                    search_result.search_context = r.data
+                    search_result.search_status = "awaiting_approval"
+                    search_result.search_confidence = "pending"
         else:
             search_result = run_search_phase(
                 user_message=user_message,
