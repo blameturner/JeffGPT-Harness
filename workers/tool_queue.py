@@ -527,8 +527,16 @@ class ToolJobQueue:
                 if dep.result:
                     job.payload.update(dep.result)
 
-            _log.info("queue %s: RUNNING  job=%s  type=%s  priority=%d  source=%s",
-                       worker_id, job.job_id[:12], job_type, job.priority, job.source or "-")
+            # Ensure org_id is always available in the payload from the
+            # authoritative job-level field so handlers never see org=0
+            # when the caller set it on submit().
+            if job.org_id:
+                job.payload["org_id"] = job.org_id
+            elif job.payload.get("org_id"):
+                job.org_id = int(job.payload["org_id"])
+
+            _log.info("queue %s: RUNNING  job=%s  type=%s  priority=%d  source=%s  org=%d",
+                       worker_id, job.job_id[:12], job_type, job.priority, job.source or "-", job.org_id)
             t0 = time.time()
 
             try:
@@ -593,7 +601,11 @@ class ToolJobQueue:
                     started_ts = datetime.fromisoformat(started).timestamp()
                 except Exception:
                     continue
-                if now - started_ts > JOB_QUEUE_STALE_TIMEOUT:
+                # graph_extract jobs invoke LLM inference that can take
+                # 7-16 minutes on local models — use 4x the normal timeout.
+                job_type = row.get("type") or ""
+                timeout = JOB_QUEUE_STALE_TIMEOUT * 4 if job_type == "graph_extract" else JOB_QUEUE_STALE_TIMEOUT
+                if now - started_ts > timeout:
                     noco_id = row.get("Id")
                     db._patch(NOCODB_TABLE, noco_id, {
                         "Id": noco_id,
@@ -601,9 +613,9 @@ class ToolJobQueue:
                         "claimed_by": "",
                         "started_at": "",
                     })
-                    _log.warning("reset stale job %s (type=%s, stuck %.0fs)",
+                    _log.warning("reset stale job %s (type=%s, stuck %.0fs, timeout=%.0fs)",
                                  row.get("job_id"), row.get("type"),
-                                 now - started_ts)
+                                 now - started_ts, timeout)
         except Exception:
             _log.error("stale job reset failed", exc_info=True)
 
@@ -860,9 +872,9 @@ def _handle_summarise(payload: dict) -> dict:
     function_name = payload.get("function_name", "deep_search_summarise")
 
     source_type = metadata.get("source", "")
-    target_id = metadata.get("scrape_target_id", "")
+    scrape_target_id = metadata.get("scrape_target_id", "")
     _log.info("queue summarise: starting  url=%s  source=%s  target=%s  func=%s  text_chars=%d",
-              url[:80], source_type, target_id or "-", function_name, len(text))
+              url[:80], source_type, scrape_target_id or "-", function_name, len(text))
 
     if not text or len(text) < 50:
         _log.info("queue summarise: skipped — text too short (%d chars)  url=%s", len(text), url[:80])
