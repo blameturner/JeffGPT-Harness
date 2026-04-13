@@ -29,11 +29,8 @@ _RAG_LOOKUP = re.compile(
     re.I,
 )
 
-_DEEP_SEARCH = re.compile(
-    r"\b(deep\s+search|research\s+(?:this|the|into)|investigate|thorough|"
-    r"comprehensive|in[- ]depth|deep\s+dive)\b",
-    re.I,
-)
+## deep_search is NOT auto-detected — it's a UI toggle (search_mode="deep").
+## The gate only handles web_search, rag_lookup, and code_exec hints.
 
 _CODE_EXEC = re.compile(
     # "run this <optional adjective> (code|script|program|snippet)"
@@ -48,13 +45,22 @@ _CODE_EXEC = re.compile(
     re.I,
 )
 
-# Patterns the spec covers that _explicit_search_intent does NOT already hit.
-# Includes bare financial/temporal terms not already covered by heuristics.py.
+# Broad search triggers — we want to search optimistically.  RWKV
+# summarisation is fast and the planner can still return an empty plan,
+# so false positives are cheap.
 _EXTRA_SEARCH = re.compile(
-    r"\b(202[5-9]|today|tonight|this (week|month|year))\b"
-    r"|\b(news|forecast|temperature|weather)\b"
-    r"|\b(latest|recent|current)\s+\w+"
-    r"|\b(rate|rates|price|prices|cost|decision|update)\b",
+    # Temporal / current events
+    r"\b(202[4-9]|today|tonight|this (week|month|year)|right now|currently)\b"
+    r"|\b(news|forecast|temperature|weather|election|announcement)\b"
+    r"|\b(latest|recent|current|new|updated|upcoming)\s+\w+"
+    r"|\b(rate|rates|price|prices|cost|decision|update|release|version)\b"
+    # Knowledge / factual questions
+    r"|\b(what is|what are|who is|who are|how does|how do|how to|why does|why do)\b"
+    r"|\b(tell me about|explain|describe|define|meaning of|difference between)\b"
+    r"|\b(best|top|recommended|popular|comparison|versus|vs)\b"
+    # Entities that likely benefit from search
+    r"|\b(company|product|framework|library|tool|platform|service|app|api)\b"
+    r"|\b(country|city|government|policy|regulation|law|standard)\b",
     re.I,
 )
 
@@ -168,8 +174,6 @@ def gate_check(
     hints: set[str] = set()
     if _explicit_search_intent(msg)[0] or _EXTRA_SEARCH.search(msg):
         hints.add("web_search")
-    if _DEEP_SEARCH.search(msg):
-        hints.add("deep_search")
     if _RAG_LOOKUP.search(msg):
         hints.add("rag_lookup")
     if _CODE_EXEC.search(msg) or "```" in msg:
@@ -189,6 +193,13 @@ def gate_check(
     if "web_search" not in hints and conversation_context and _FOLLOW_UP.search(msg):
         if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
             hints.add("web_search")
+
+    # Optimistic search: if the message is non-trivial and no search hint
+    # was found yet, still suggest web_search.  The planner decides whether
+    # to actually search — false positives are cheap (one planner call),
+    # false negatives cost stale answers.
+    if "web_search" not in hints and len(msg) > 30:
+        hints.add("web_search")
 
     if hints:
         _log.info("gate  msg=%s hints=%s", msg[:80], sorted(hints))

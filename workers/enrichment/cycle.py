@@ -30,6 +30,7 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
         _log.info("enrichment disabled via config, skipping seed")
         return {"seeded": 0, "skipped": 0, "error": "disabled"}
 
+    t0 = time.time()
     cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     _log.info("seed_enrichment_jobs cycle=%s agent=%d", cycle_id, enrichment_agent_id)
 
@@ -115,9 +116,9 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
             seeded += 1
             _log.debug("seeded source %s url=%s", target_id, source_url[:60])
 
-    elapsed = round(time.time() - float(datetime.now(timezone.utc).timestamp()) + 0.01, 1)
-    _log.info("seed_enrichment_jobs done  agent=%d seeded=%d skipped=%d",
-              enrichment_agent_id, seeded, skipped)
+    elapsed = round(time.time() - t0, 1)
+    _log.info("seed_enrichment_jobs done  agent=%d seeded=%d skipped=%d elapsed=%.1fs",
+              enrichment_agent_id, seeded, skipped, elapsed)
     db.log_event(cycle_id, "cycle_end", message=f"seeded={seeded} skipped={skipped}")
 
     _last_runs[enrichment_agent_id] = {

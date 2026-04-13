@@ -17,6 +17,7 @@ Job chaining:
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import threading
@@ -311,8 +312,9 @@ class ToolJobQueue:
                 "metadata": {
                     "url": url,
                     "name": meta.get("title") or url,
-                    "source": "web_search",
+                    "source": source or "web_search",
                     "queries": ", ".join(meta.get("queries", []))[:500],
+                    "conversation_id": meta.get("conversation_id"),
                 },
             },
             source=source,
@@ -427,13 +429,14 @@ class ToolJobQueue:
 
     # ---- Event stream ----
 
-    def subscribe(self) -> list[dict]:
-        buf: list[dict] = []
+    def subscribe(self) -> collections.deque:
+        """Return a thread-safe deque buffer that receives job events."""
+        buf: collections.deque = collections.deque()
         with self._sub_lock:
             self._subscribers.append(buf)
         return buf
 
-    def unsubscribe(self, buf: list[dict]):
+    def unsubscribe(self, buf: collections.deque):
         with self._sub_lock:
             try:
                 self._subscribers.remove(buf)
@@ -464,19 +467,24 @@ class ToolJobQueue:
             # Model-bound jobs (summarise etc.) must respect chat activity.
             if job_type != "scrape":
                 idle = seconds_since_chat()
-                # Peek at next job priority to decide backoff threshold.
-                # If idle time is too short, skip this poll cycle.
-                min_backoff = _backoff_for_priority(config.priority_default)
-                if idle < min_backoff:
-                    _log.debug("worker %s backing off (idle=%.0fs < %.0fs)",
-                               worker_id, idle, min_backoff)
+                # Use the LOWEST possible backoff (priority 1 = 120s) as
+                # the pre-claim gate.  This lets us peek at the actual queue
+                # without blocking high-priority jobs behind the default
+                # 600s threshold.  The per-job check after claiming enforces
+                # the real threshold for the specific job's priority.
+                min_gate = _backoff_for_priority(1)
+                if idle < min_gate:
+                    _log.debug("worker %s backing off (idle=%.0fs < %.0fs gate)",
+                               worker_id, idle, min_gate)
                     continue
 
             job = self._claim_next(job_type, worker_id)
             if not job:
                 continue
 
-            # Per-job backoff check (job may have higher priority than default)
+            # Per-job backoff: enforce the actual threshold for this job's
+            # priority.  Priority 1 (research) = 120s, 2 (deep search) =
+            # 300s, 3+ (enrichment) = 600s.
             if job_type != "scrape":
                 idle = seconds_since_chat()
                 required = _backoff_for_priority(job.priority)
@@ -843,7 +851,42 @@ def _handle_summarise(payload: dict) -> dict:
         except Exception as e:
             _log.warning("ChromaDB store failed for %s: %s", url[:80], e)
 
+    # Deliver result back to the originating conversation as a message.
+    conversation_id = metadata.get("conversation_id")
+    source_type = metadata.get("source", "")
+    if conversation_id and source_type in ("deep_search", "research"):
+        _deliver_to_conversation(conversation_id, org_id, url, summary)
+
     return {"summary": summary[:3000], "chunks": chunks}
+
+
+def _deliver_to_conversation(conversation_id: int, org_id: int, url: str, summary: str):
+    """Post the completed summary back to the conversation as a system message
+    so the frontend can display it and the chat history includes the result."""
+    try:
+        from nocodb_client import NocodbClient
+        db = NocodbClient()
+        content = (
+            f"[Deep search result]\n"
+            f"Source: {url}\n\n"
+            f"{summary[:2000]}"
+        )
+        db.add_message(
+            conversation_id=conversation_id,
+            org_id=org_id,
+            role="system",
+            content=content,
+            model="tool_queue",
+            tokens_input=0,
+            tokens_output=0,
+            search_used=True,
+            search_status="completed",
+            search_confidence="high",
+            search_source_count=1,
+        )
+        _log.info("delivered result to conversation=%s url=%s", conversation_id, url[:60])
+    except Exception:
+        _log.warning("failed to deliver result to conversation=%s", conversation_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

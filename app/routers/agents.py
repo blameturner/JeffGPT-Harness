@@ -126,14 +126,27 @@ def scheduler_status(request: Request):
     from workers.enrichment.cycle import get_last_run, sources_due_count
     sched = getattr(request.app.state, "scheduler", None)
     running = bool(sched and sched.running)
-    next_run = None
+
+    # Collect next_run from all enrichment agent jobs.
+    enrichment_jobs: list[dict] = []
     if sched:
-        job = sched.get_job("enrichment_cycle")
-        if job and job.next_run_time:
-            next_run = job.next_run_time.isoformat()
+        for job in sched.get_jobs():
+            if job.id.startswith("enrichment_agent_"):
+                enrichment_jobs.append({
+                    "id": job.id,
+                    "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+                })
+
+    # Earliest next run across all enrichment agents.
+    next_run = None
+    for ej in enrichment_jobs:
+        if ej["next_run"] and (next_run is None or ej["next_run"] < next_run):
+            next_run = ej["next_run"]
+
     return {
         "running": running,
         "next_run": next_run,
+        "enrichment_agents": enrichment_jobs,
         "last_run": get_last_run(),
         "sources_due": sources_due_count(),
     }

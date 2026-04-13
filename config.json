@@ -20,7 +20,7 @@
     "web_search": true,
     "enrichment": true,
     "tools_framework": true,
-    "batch_summarise": true,
+    "batch_summarise": false,
     "search_extraction": true,
     "search_source_suggestion": true,
     "intent_classifier": true

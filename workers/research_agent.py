@@ -142,7 +142,7 @@ def run_research(
 
     async def _bounded(url, text, query):
         async with _sem:
-            return await _summarise_one(url, text, query, "web_search_summarise")
+            return await _summarise_one(url, text, query, "research_summarise")
 
     try:
         async def _summarise_all():

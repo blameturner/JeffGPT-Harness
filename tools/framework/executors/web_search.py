@@ -1,28 +1,15 @@
 """
-Web search executor — parallel SearXNG queries + reuse of the existing
-`workers.search.scraping.scrape_page` pipeline + parallel tool-model summarisation.
+Web search executor — inline search with RWKV summarisation.
 
-Design:
-  1. The planner decides the queries — this executor never re-generates them.
-  2. Fire all SearXNG queries concurrently.
-  3. De-dupe by URL, filter the existing url blocklist.
-  4. Scrape each URL via `workers.search.scraping.scrape_page` (via
-     asyncio.to_thread — it's sync). That helper already has:
-       - httpx + BeautifulSoup + injection-residue stripping + PDF handling
-       - Main-content JS extraction via the in-process Playwright worker
-       - Stealth JS injection + cookie/consent banner nuking + anti-bot detection
-       - Auto-promotion of failing domains to use_playwright=True in NocoDB
-       - Per-page char cap and snippet fallback
-  5. Filter out snippet-only fallbacks from the summarisation step (there's
-     nothing to summarise beyond the snippet itself — we already have it).
-  6. Summarise each non-trivial extract in parallel via the tool model,
-     using `acquire_model("tool")` so pick + slot is atomic and load-aware.
-  7. Store the combined context in ChromaDB via the existing `memory.remember`
-     so the RAG collection populates over time.
+Pipeline (all inline, no queue):
+  1. Up to 5 heuristic queries fired at SearXNG in parallel.
+  2. De-dupe by URL, scrape via `workers.search.scraping.scrape_page`.
+  3. Summarise each page via RWKV (`web_search_summarise` config) with
+     per-source relevance scoring (high/medium/low).
+  4. Store combined context in ChromaDB for RAG.
 
-This executor deliberately does NOT re-implement scraping. Every byte of
-scraping logic lives in `workers.search.scraping` and is shared with the
-enrichment path.
+No tool model (t3_tool) is involved — RWKV handles all summarisation.
+Scraping logic lives in `workers.search.scraping`, shared with enrichment.
 """
 
 from __future__ import annotations

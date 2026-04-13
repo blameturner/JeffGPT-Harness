@@ -42,6 +42,7 @@ async def execute(params: dict, emit) -> ToolResult:
         )
 
     org_id = params.get("_org_id") or 0
+    conversation_id = params.get("_conversation_id")
     if not org_id:
         return ToolResult(
             tool=ToolName.DEEP_SEARCH, action_index=0, ok=False,
@@ -86,6 +87,7 @@ async def execute(params: dict, emit) -> ToolResult:
                 "title": r.get("title", ""),
                 "snippet": r.get("snippet", ""),
                 "queries": queries,
+                "conversation_id": conversation_id,
             },
         )
         job_ids.extend(ids)

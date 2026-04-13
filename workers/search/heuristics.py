@@ -47,20 +47,33 @@ _CODE_PREFIXES = (
 )
 
 
+_DEFINITE_CHITCHAT = re.compile(
+    r"^(?:hi|hey|hello|thanks|thank you|ok|okay|sure|yes|no|yep|nope|cool|"
+    r"great|good|nice|cheers|bye|goodbye|lol|haha|hmm|ah|oh|wow|please|"
+    r"sorry|np|ty|thx|k|got it|understood|ack|roger|noted|will do|on it)[\s!?.]*$",
+    re.I,
+)
+
+
 def _definitely_no_search(message: str) -> bool:
+    """Return True only for messages that DEFINITELY don't need search.
+
+    Intentionally narrow — we'd rather search unnecessarily than miss
+    relevant information.  Only blocks:
+    - Empty messages
+    - Code blocks / snippets
+    - Very short chitchat (greetings, thanks, single-word acks)
+    """
     msg = message.strip()
     if not msg:
         return True
-    if len(msg) > 400:
-        return False
-    if _NO_SEARCH_TRIGGER_WORDS.search(msg):
-        return False
-    if _EXTERNAL_QUESTION.search(msg):
-        return False
+    # Code blocks should not trigger search.
     if "```" in msg or msg.lstrip().startswith(_CODE_PREFIXES):
         return True
-    if len(msg) <= 200:
+    # Definite chitchat — single-word/phrase acks, greetings, thanks.
+    if len(msg) <= 80 and _DEFINITE_CHITCHAT.search(msg):
         return True
+    # Everything else gets a chance at search.
     return False
 
 
@@ -80,8 +93,8 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
 
     prompt = (
         "Decide whether answering this user message would benefit from a web search. "
-        "Lean towards YES — it's better to search and find nothing than to miss "
-        "useful information. Return ONLY a JSON object:\n"
+        "DEFAULT TO YES. It is almost always better to search and bring relevant "
+        "context than to answer without it. Return ONLY a JSON object:\n"
         '{"needs_search": true|false, "confidence": "high"|"medium"|"low", '
         '"reason": "<15 words or fewer>"}\n\n'
         "needs_search=true (confidence high) when:\n"
@@ -90,15 +103,18 @@ def needs_web_search(message: str) -> tuple[bool, str, str]:
         "- Specific products, frameworks, tools, or technologies\n"
         "- Company or person's recent activity\n"
         "- Fact-checking or verification requests\n"
-        "- Requests for documentation, resources, or guides\n\n"
+        "- Requests for documentation, resources, or guides\n"
+        "- Any named entity (person, company, place, product, concept)\n"
+        "- Explanations of real-world topics, processes, or systems\n\n"
         "needs_search=true (confidence medium) when:\n"
         "- The topic might have recent developments\n"
+        "- Background context could improve the answer quality\n"
         "- Unclear whether the user needs current vs general info\n"
-        "- A web search could add value but isn't essential\n\n"
-        "needs_search=false when:\n"
-        "- Clearly asking for help writing code, prose, or analysis\n"
-        "- Casual conversation or follow-up within an ongoing thread\n"
-        "- Abstract or philosophical questions\n\n"
+        "- A web search could add value even if not strictly necessary\n\n"
+        "needs_search=false ONLY when:\n"
+        "- Purely asking to write/edit code with no factual lookup needed\n"
+        "- Casual chitchat with no information need\n"
+        "- Continuing a task (e.g. 'make it shorter', 'try again')\n\n"
         f"Message: {msg[:500]}"
     )
     try:

@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -57,7 +58,6 @@ def update_priority(job_id: str, body: PriorityUpdate, request: Request):
     job = q.get_job(job_id)
     if not job or job.status != "queued":
         raise HTTPException(status_code=404, detail="Job not found or not queued")
-    # Update priority in NocoDB
     try:
         db = q._db()
         if job.nocodb_id:
@@ -80,15 +80,30 @@ def cancel_job(job_id: str, request: Request):
     return {"cancelled": True}
 
 
-def _event_stream(queue):
+def _event_stream(queue, disconnect: threading.Event):
+    """Thread-safe SSE generator with disconnect detection.
+
+    The subscriber buffer is a ``collections.deque`` — ``popleft()`` is
+    atomic and O(1) under CPython's GIL, so no explicit lock is needed
+    between the producer (``_emit_event``, which holds ``_sub_lock`` when
+    appending) and this single consumer.
+    """
     buf = queue.subscribe()
     try:
-        while True:
+        while not disconnect.is_set():
+            drained = False
             while buf:
-                event = buf.pop(0)
+                try:
+                    event = buf.popleft()
+                except IndexError:
+                    break
                 yield f"data: {json.dumps(event)}\n\n"
-            time.sleep(2)
-            yield ": keepalive\n\n"
+                drained = True
+            if not drained:
+                yield ": keepalive\n\n"
+                time.sleep(2)
+    except GeneratorExit:
+        pass
     finally:
         queue.unsubscribe(buf)
 
@@ -96,4 +111,14 @@ def _event_stream(queue):
 @router.get("/events")
 def events(request: Request):
     q = _get_queue(request)
-    return StreamingResponse(_event_stream(q), media_type="text/event-stream")
+    disconnect = threading.Event()
+
+    def on_disconnect():
+        disconnect.set()
+
+    response = StreamingResponse(
+        _event_stream(q, disconnect),
+        media_type="text/event-stream",
+    )
+    response.background = on_disconnect
+    return response

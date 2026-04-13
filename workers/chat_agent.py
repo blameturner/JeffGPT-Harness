@@ -196,37 +196,77 @@ class ChatAgent:
 
                 _t_tools = time.perf_counter()
 
-                if hints == {"web_search"}:
-                    # Fast path: skip planner AND intent classifier entirely.
-                    # Generate many diverse queries heuristically (zero model
-                    # calls) and let SearxNG volume compensate for precision.
-                    _log.info("web_search fast-path  conv=%s", conversation_id)
-                    queries = generate_broad_queries(user_message, max_queries=10)
-                    _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
+                # Deep search is a UI toggle (search_mode="deep"), not
+                # auto-detected.  When active, queue deep_search jobs AND
+                # still run a normal web_search inline so the main model
+                # has immediate context while the deep results arrive later.
+                search_mode = getattr(self, '_search_mode', 'normal')
 
-                    if queries:
-                        search_mode = getattr(self, '_search_mode', 'normal')
-                        plan = ToolPlan(
-                            actions=[ToolAction(
+                # Tools that can be dispatched directly without the planner.
+                # web_search / deep_search: heuristic queries (zero model calls).
+                # rag_lookup: just a ChromaDB similarity search.
+                # code_exec: needs planner for code generation — only tool
+                #            that truly requires the planner.
+                _DIRECT_TOOLS = {"web_search", "rag_lookup"}
+
+                if hints <= _DIRECT_TOOLS:
+                    # Fast path: build plan directly without invoking
+                    # the planner model.  Zero model calls for dispatch.
+                    _log.info("fast-path  conv=%s hints=%s mode=%s", conversation_id, sorted(hints), search_mode)
+                    actions: list[ToolAction] = []
+
+                    if "web_search" in hints:
+                        queries = generate_broad_queries(user_message, max_queries=5)
+                        _log.info("fast-path queries  conv=%s queries=%s", conversation_id, queries)
+                        if queries:
+                            actions.append(ToolAction(
                                 tool=ToolName.WEB_SEARCH,
                                 params={
                                     "queries": queries,
                                     "_org_id": self.org_id,
                                     "_collection": collection_name,
-                                    "_mode": search_mode,
                                 },
                                 reason="web search",
-                            )],
-                            summary=instant_summary,
-                        )
+                            ))
+
+                    # When UI has deep search toggled, also queue deep_search
+                    # jobs for thorough background analysis.
+                    if search_mode == "deep" and "web_search" in hints:
+                        deep_queries = generate_broad_queries(user_message, max_queries=10)
+                        _log.info("deep search queuing  conv=%s queries=%s", conversation_id, deep_queries)
+                        if deep_queries:
+                            actions.append(ToolAction(
+                                tool=ToolName.DEEP_SEARCH,
+                                params={
+                                    "queries": deep_queries,
+                                    "_org_id": self.org_id,
+                                    "_conversation_id": conversation_id,
+                                },
+                                reason="deep search (queued)",
+                            ))
+
+                    if "rag_lookup" in hints:
+                        actions.append(ToolAction(
+                            tool=ToolName.RAG_LOOKUP,
+                            params={
+                                "query": user_message[:500],
+                                "_org_id": self.org_id,
+                                "_collection": collection_name,
+                            },
+                            reason="conversation history",
+                        ))
+
+                    if actions:
+                        plan = ToolPlan(actions=actions, summary=instant_summary)
                         try:
                             tool_context = asyncio.run(execute_plan(plan, emit))
-                            _log.info("web_search fast-path done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
+                            _log.info("fast-path done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
                         except Exception:
-                            _log.error("web_search fast-path failed  conv=%s", conversation_id, exc_info=True)
+                            _log.error("fast-path failed  conv=%s", conversation_id, exc_info=True)
                             tool_context = ToolContext()
                 else:
-                    # Full planner path for multi-tool or non-search hints.
+                    # Full planner path — only for tools that need model-generated
+                    # params (deep_search queries, code_exec code).
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:
@@ -258,14 +298,29 @@ class ChatAgent:
                         _log.error("tools framework failed  conv=%s", conversation_id, exc_info=True)
                         tool_context = ToolContext()
 
-            # Map web_search results back onto search_result so the downstream
+            # Map tool results back onto search_result so the downstream
             # payload build and persistence code paths stay unchanged.
+            has_queued_jobs = False
             for r in tool_context.results:
                 if r.tool.value == "web_search" and r.ok:
                     search_result.search_context = r.data
                     search_result.search_status = "used"
                     search_result.search_confidence = "high"
-                    break
+                elif r.tool.value == "deep_search" and r.ok:
+                    # Deep search is queued — tell the UI.
+                    has_queued_jobs = True
+                    emit({
+                        "type": "jobs_queued",
+                        "tool": "deep_search",
+                        "message": r.data,
+                        "status": "waiting",
+                    })
+                    # Include acknowledgment in main model context so it
+                    # can tell the user results are being researched.
+                    if not search_result.search_context:
+                        search_result.search_context = r.data
+                        search_result.search_status = "queued"
+                        search_result.search_confidence = "pending"
         else:
             search_result = run_search_phase(
                 user_message=user_message,
