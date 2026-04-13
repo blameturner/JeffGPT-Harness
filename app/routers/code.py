@@ -25,6 +25,7 @@ class CodeRequest(BaseModel):
     codebase_collection: str | None = None
     response_style: str | None = None
     knowledge_enabled: bool | None = None
+    search_enabled: bool = False
     temperature: float = 0.2
     max_tokens: int = 8192
 
@@ -49,6 +50,7 @@ def code(request: CodeRequest):
             mode=request.mode,  # type: ignore[arg-type]
             approved_plan=request.approved_plan,
             files=request.files,
+            search_enabled=request.search_enabled,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

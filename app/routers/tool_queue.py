@@ -36,7 +36,34 @@ def list_jobs(
     limit: int = 50,
 ):
     q = _get_queue(request)
-    return {"jobs": q.list_jobs(job_type=type, status=status, limit=limit)}
+    return {"jobs": q.list_jobs(job_type=type, status=status, source=source, limit=limit)}
+
+
+@router.get("/active")
+def active_jobs(
+    request: Request,
+    conversation_id: int | None = None,
+    source: str = "",
+):
+    """Lightweight endpoint for UI banners — returns counts of queued/running
+    jobs, optionally filtered by conversation_id and source."""
+    q = _get_queue(request)
+    jobs = q.list_jobs(source=source, limit=200)
+    active = [
+        j for j in jobs
+        if j["status"] in ("queued", "running")
+        and (
+            conversation_id is None
+            or j.get("conversation_id") == conversation_id
+        )
+    ]
+    return {
+        "active": len(active),
+        "queued": sum(1 for j in active if j["status"] == "queued"),
+        "running": sum(1 for j in active if j["status"] == "running"),
+        "conversation_id": conversation_id,
+        "source": source or None,
+    }
 
 
 @router.get("/jobs/{job_id}")

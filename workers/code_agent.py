@@ -127,8 +127,9 @@ class CodeAgent(ChatAgent):
         mode: Mode = "plan",
         approved_plan: str | None = None,
         files: list[dict] | None = None,
+        search_enabled: bool = False,
     ):
-        super().__init__(model=model, org_id=org_id, search_enabled=False)
+        super().__init__(model=model, org_id=org_id, search_enabled=search_enabled)
         if mode not in _SYSTEMS:
             raise ValueError(f"Invalid mode '{mode}'. Must be plan|execute|debug.")
         self.mode: Mode = mode
@@ -272,7 +273,7 @@ class CodeAgent(ChatAgent):
                 conversation_context=last_assistant,
                 mode="code",
             )
-            if not web_search_enabled:
+            if not web_search_enabled or not self.search_enabled:
                 hints.discard("web_search")
             _log.info("tools gate  conv=%s mode=%s hints=%s web_search=%s",
                       conversation_id, self.mode, sorted(hints) or "[]", web_search_enabled)
@@ -297,17 +298,8 @@ class CodeAgent(ChatAgent):
                 if hints == {"web_search"}:
                     # Fast path: skip planner, zero model calls.
                     _log.info("web_search fast-path  conv=%s", conversation_id)
-                    from workers.search.queries import generate_search_queries
-                    words = user_message.lower().split()
-                    entities = [w for w in user_message.split() if len(w) > 3 and w[0].isupper()]
-                    intent_dict = {
-                        "intent": "factual_lookup",
-                        "entities": entities or [user_message[:60]],
-                        "time_sensitive": any(w in words for w in ("latest", "recent", "current", "today", "now", "2025", "2026")),
-                        "confidence": "medium",
-                        "search_policy": "focused",
-                    }
-                    queries = generate_search_queries(intent_dict, message=user_message)
+                    from workers.search.queries import generate_broad_queries
+                    queries = generate_broad_queries(user_message, max_queries=5)
                     _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
 
                     if queries:

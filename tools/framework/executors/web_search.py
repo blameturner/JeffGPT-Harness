@@ -27,8 +27,8 @@ from workers.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
 # --- Tunables ---
-MAX_URLS_TO_PROCESS = 10
-MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
+MAX_URLS_TO_PROCESS = 5
+MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
 BATCH_TARGET = 5  # aim for this many pages per batch call
@@ -286,7 +286,7 @@ async def _summarise_batch(
         f"relevant to: {user_query}\n\n"
         f"Rules:\n"
         f"- For EACH page, output a section starting with PAGE N:\n"
-        f"- Keep each summary under 200 words.\n"
+        f"- Use 3-5 bullet points per page, under 80 words total.\n"
         f"- Include specific facts, numbers, dates, names.\n"
         f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n"
         f"- End each section with RELEVANCE: high|medium|low\n"

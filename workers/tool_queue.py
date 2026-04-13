@@ -113,7 +113,8 @@ class ToolJob:
         }
 
     def to_api(self) -> dict:
-        return {
+        meta = self.payload.get("metadata") or {}
+        d = {
             "job_id": self.job_id,
             "type": self.type,
             "status": self.status,
@@ -125,6 +126,13 @@ class ToolJob:
             "completed_at": self.completed_at,
             "depends_on": self.depends_on,
         }
+        if meta.get("conversation_id"):
+            d["conversation_id"] = meta["conversation_id"]
+        if meta.get("url"):
+            d["url"] = meta["url"]
+        if meta.get("title") or meta.get("name"):
+            d["title"] = meta.get("title") or meta.get("name")
+        return d
 
     @staticmethod
     def from_row(row: dict) -> ToolJob:
@@ -384,7 +392,7 @@ class ToolJobQueue:
             pass
         return None
 
-    def list_jobs(self, job_type: str = "", status: str = "", limit: int = 50) -> list[dict]:
+    def list_jobs(self, job_type: str = "", status: str = "", source: str = "", limit: int = 50) -> list[dict]:
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
@@ -394,6 +402,8 @@ class ToolJobQueue:
                 where_parts.append(f"(type,eq,{job_type})")
             if status:
                 where_parts.append(f"(status,eq,{status})")
+            if source:
+                where_parts.append(f"(source,eq,{source})")
             params: dict[str, Any] = {
                 "sort": "-CreatedAt",
                 "limit": limit,
