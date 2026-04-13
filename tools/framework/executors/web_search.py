@@ -113,10 +113,9 @@ def _filter_results_by_relevance(
             len(kept), dropped, len(query_keywords), RELEVANCE_KEYWORD_THRESHOLD,
         )
 
-    # Never drop everything — if all results fail, keep the originals
-    # (they might still be useful, and the RWKV relevance scorer will
-    # mark them low).
-    return kept if kept else results
+    # If ALL results are irrelevant, return empty — don't waste time
+    # scraping and summarising pages that have nothing to do with the query.
+    return kept
 
 
 # ---------------- Scrape (delegates to shared pipeline) ----------------
@@ -344,10 +343,13 @@ def _parse_batch_response(raw: str, expected: int) -> list[dict]:
 
 async def _fallback_individual(pages: list[dict], user_query: str) -> list[dict]:
     """Fallback: summarise pages individually when batch parsing fails."""
-    return [
-        await _summarise_one(p["url"], p["text"], user_query)
-        for p in pages
-    ]
+    _sem = asyncio.Semaphore(2)
+
+    async def _bounded(p):
+        async with _sem:
+            return await _summarise_one(p["url"], p["text"], user_query)
+
+    return list(await asyncio.gather(*[_bounded(p) for p in pages]))
 
 
 # ---------------- Executor ----------------
@@ -399,6 +401,17 @@ async def execute(params: dict, emit) -> ToolResult:
     # 1b. Keyword-overlap filter — drop clearly off-topic results before
     #     spending time scraping and summarising them.
     results = _filter_results_by_relevance(results, queries)
+
+    if not results:
+        emit({
+            "type": "search_complete", "source_count": 0, "ok": False,
+            "confidence": "failed", "sources": [],
+        })
+        return ToolResult(
+            tool=ToolName.WEB_SEARCH, action_index=0, ok=False,
+            data="Search results were all off-topic — no relevant pages found.",
+            elapsed_s=round(time.time() - t0, 2),
+        )
 
     # 2. Parallel scrape via the shared scrape_page pipeline
     scraped = await asyncio.gather(*[_scrape_one(r) for r in results])

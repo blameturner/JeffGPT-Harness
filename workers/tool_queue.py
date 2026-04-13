@@ -912,6 +912,23 @@ def get_tool_queue() -> ToolJobQueue | None:
     return _instance
 
 
+def _handle_graph_extract(job: ToolJob) -> dict:
+    """Extract knowledge graph relationships from a chat turn."""
+    from workers.chat.graph import extract_and_write_graph
+
+    payload = job.payload
+    user_text = payload.get("user_text") or ""
+    assistant_text = payload.get("assistant_text") or ""
+    conversation_id = payload.get("conversation_id") or 0
+    org_id = job.org_id
+
+    if not user_text and not assistant_text:
+        return {"written": 0, "error": "empty input"}
+
+    extract_and_write_graph(user_text, assistant_text, conversation_id, org_id)
+    return {"status": "ok"}
+
+
 def _set_instance(q: ToolJobQueue):
     global _instance
     _instance = q

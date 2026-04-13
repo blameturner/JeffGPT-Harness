@@ -17,8 +17,8 @@ from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
 from workers.search.queries import generate_broad_queries, generate_search_queries
 from workers.styles import chat_style_prompt
-from workers.chat.history import maybe_summarise
-from workers.chat.graph import extract_and_write_graph
+from workers.chat.history import maybe_summarise, extract_conversation_topics
+# graph extraction is now queued via tool_queue, not called directly
 from workers.chat.payload import build_chat_payload
 from workers.chat.search_phase import SearchPhaseResult, run_search_phase
 from workers.chat.rag_phase import submit_rag_future, collect_rag, cancel_rag
@@ -28,7 +28,27 @@ from workers.chat.persistence import (
     persist_assistant_message,
 )
 
+import threading
+
 _log = logging.getLogger("chat")
+
+# Per-conversation summarisation locks. When a background summary is running,
+# the event is cleared.  Next turn waits on it (with timeout) so the summary
+# is available for topic extraction and context.
+_summary_locks: dict[int, threading.Event] = {}
+_summary_locks_mu = threading.Lock()
+
+SUMMARY_WAIT_TIMEOUT = 30  # max seconds to wait for a running summary
+
+
+def _get_summary_event(conversation_id: int) -> threading.Event:
+    with _summary_locks_mu:
+        ev = _summary_locks.get(conversation_id)
+        if ev is None:
+            ev = threading.Event()
+            ev.set()  # not running by default
+            _summary_locks[conversation_id] = ev
+        return ev
 
 
 @dataclass
@@ -130,6 +150,14 @@ class ChatAgent:
             if not convo:
                 emit({"type": "error", "message": f"Conversation {conversation_id} not found"})
                 return
+            # Wait for any in-flight background summary to finish so we
+            # pick up the latest summary + topics from the DB.
+            summary_ev = _get_summary_event(conversation_id)
+            if not summary_ev.is_set():
+                emit({"type": "status", "phase": "summarising_previous", "message": "Updating conversation context..."})
+                waited = summary_ev.wait(timeout=SUMMARY_WAIT_TIMEOUT)
+                if not waited:
+                    _log.warning("summary wait timed out  conv=%s", conversation_id)
             history = [
                 {"role": m["role"], "content": m["content"]}
                 for m in self.db.list_messages(conversation_id)
@@ -216,7 +244,8 @@ class ChatAgent:
                     actions: list[ToolAction] = []
 
                     if "web_search" in hints:
-                        queries = generate_broad_queries(user_message, max_queries=5)
+                        convo_topics = extract_conversation_topics(history)
+                        queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
                         _log.info("fast-path queries  conv=%s queries=%s", conversation_id, queries)
                         if queries:
                             actions.append(ToolAction(
@@ -306,6 +335,14 @@ class ChatAgent:
                     search_result.search_context = r.data
                     search_result.search_status = "used"
                     search_result.search_confidence = "high"
+                elif r.tool.value == "web_search" and not r.ok:
+                    search_result.search_status = "no_results"
+                    search_result.search_confidence = "failed"
+                    search_result.search_note = (
+                        "Web search was attempted but found no relevant results. "
+                        "Answer from your own knowledge, and suggest 1-2 specific "
+                        "search terms the user could try to find what they need."
+                    )
                 elif r.tool.value == "deep_search" and r.ok:
                     # Deep search is queued — tell the UI.
                     has_queued_jobs = True
@@ -397,7 +434,7 @@ class ChatAgent:
         _span("rag_retrieve_ms", _t)
 
         _t = time.perf_counter()
-        history, summary_event = maybe_summarise(history)
+        history, summary_event = maybe_summarise(history, truncate_only=True)
         if summary_event:
             emit(summary_event)
         _span("summarise_ms", _t)
@@ -487,7 +524,6 @@ class ChatAgent:
         })
 
         # Only memory/graph work in background — these are non-critical.
-        import threading
 
         def _post_turn_work():
             _t_bg = time.perf_counter()
@@ -518,12 +554,74 @@ class ChatAgent:
                     _log.info("bg: knowledge remember done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
                     _log.error("bg: knowledge remember failed  conv=%s", conversation_id, exc_info=True)
-                _t = time.perf_counter()
+                # Queue graph extraction instead of running inline — it uses
+                # RWKV and would block the summariser and other work.
                 try:
-                    extract_and_write_graph(user_message, output, conversation_id, self.org_id)
-                    _log.info("bg: graph extraction done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
+                    from workers.tool_queue import get_tool_queue
+                    tq = get_tool_queue()
+                    if tq:
+                        tq.submit(
+                            job_type="graph_extract",
+                            payload={
+                                "user_text": user_message,
+                                "assistant_text": output,
+                                "conversation_id": conversation_id,
+                            },
+                            source="chat",
+                            org_id=self.org_id,
+                            priority=5,
+                        )
+                        _log.info("bg: graph extraction queued  conv=%s", conversation_id)
                 except Exception:
-                    _log.error("bg: graph extraction failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("bg: graph extraction queue failed  conv=%s", conversation_id, exc_info=True)
+
+            # Background summarisation — run summary so it's ready for
+            # the next turn.  Signal via event so next turn can wait if needed.
+            summary_ev = _get_summary_event(conversation_id)
+            summary_ev.clear()  # mark as running
+            _t = time.perf_counter()
+            try:
+                full_history = history + [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": output},
+                ]
+                summarised_history, bg_summary_event = maybe_summarise(full_history, truncate_only=False)
+                if bg_summary_event and not bg_summary_event.get("fallback"):
+                    topics = bg_summary_event.get("topics", [])
+                    summary_content = ""
+                    for m in summarised_history:
+                        if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
+                            summary_content = m["content"]
+                            break
+                    if summary_content:
+                        try:
+                            existing_msgs = self.db.list_messages(conversation_id)
+                            existing_id = None
+                            for msg in existing_msgs:
+                                if msg.get("role") == "system" and "[Conversation summary]" in (msg.get("content") or ""):
+                                    existing_id = msg.get("Id")
+                                    break
+                            if existing_id:
+                                self.db._patch("messages", existing_id, {
+                                    "Id": existing_id,
+                                    "content": summary_content,
+                                })
+                            else:
+                                self.db.add_message(
+                                    conversation_id=conversation_id,
+                                    org_id=self.org_id,
+                                    role="system",
+                                    content=summary_content,
+                                    model="summariser",
+                                )
+                        except Exception:
+                            _log.debug("bg: summary persist failed  conv=%s", conversation_id, exc_info=True)
+                    _log.info("bg: summarise done  conv=%s topics=%s %.2fs",
+                              conversation_id, topics, time.perf_counter() - _t)
+            except Exception:
+                _log.error("bg: summarise failed  conv=%s", conversation_id, exc_info=True)
+            finally:
+                summary_ev.set()  # mark as done, unblock any waiting turn
 
             _log.info("bg: post-turn complete  conv=%s total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 

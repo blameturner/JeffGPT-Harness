@@ -278,7 +278,9 @@ _FRAMING_WORDS: frozenset[str] = frozenset(
     "tell explain describe discuss define help show give list name "
     "know want need like think say said going go make made "
     "handle find look search check create run start stop try "
-    "please kindly wondering curious looking".split()
+    "please kindly wondering curious looking "
+    "okay ok cool sure surely yes yeah right nice great awesome "
+    "thanks thank hey hi hello well anyway actually basically".split()
 )
 
 
@@ -346,12 +348,36 @@ _LEADING_FLUFF = re.compile(
 _TRAILING_FLUFF = re.compile(r"[?.!,;:]+$")
 
 
+_FILLER_SENTENCE = re.compile(
+    r"^(okay|ok|cool|sure|surely|yes|yeah|right|nice|great|awesome|thanks|"
+    r"hey|hi|hello|well|anyway|actually|basically|alright|got it|sounds good)"
+    r"[^.!?]*[.!?]\s*",
+    re.IGNORECASE,
+)
+_TRAILING_FILLER = re.compile(
+    r"[.!?\s]+(surely|certainly|right|yeah|yes|please|thanks|"
+    r"can you|could you|would you|I'?m sure|there must be|"
+    r"there are more|you can find|let me know)[^.]*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _strip_preamble(text: str) -> str:
     """Remove question/instruction framing from the start of a message."""
     result = text
+    # Strip leading filler sentences ("Okay cool.", "Sure thing.", etc.)
+    for _ in range(3):
+        m = _FILLER_SENTENCE.match(result)
+        if m:
+            result = result[m.end():]
+        else:
+            break
+    # Strip trailing encouragement ("Surely there are more you can find?")
+    result = _TRAILING_FILLER.sub("", result).strip()
     for pat in _QUESTION_PREAMBLES:
+        prev = result
         result = pat.sub("", result, count=1)
-        if result != text:
+        if result != prev:
             break
     result = _LEADING_FLUFF.sub("", result).strip()
     result = _TRAILING_FLUFF.sub("", result).strip()
@@ -434,7 +460,7 @@ def _is_time_sensitive(lower: str) -> bool:
     ))
 
 
-def generate_broad_queries(message: str, *, max_queries: int = 10) -> list[str]:
+def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_topics: list[str] | None = None) -> list[str]:
     """Generate on-topic search queries from a user message.
 
     Zero model calls — heuristic extraction with focused strategies.
@@ -561,6 +587,23 @@ def generate_broad_queries(message: str, *, max_queries: int = 10) -> list[str]:
             if domain not in core.lower():
                 queries.append(f"{core} {domain}")
             break  # one domain hint is enough
+
+    # --- Q10: Conversation-context enriched queries ---
+    # When conversation topics are available from the summariser, use them
+    # to disambiguate vague queries (e.g. "transformers" → "javascript
+    # transformers array methods").
+    if conversation_topics:
+        # Filter out topics already present in the core query
+        core_lower = core.lower()
+        new_topics = [t for t in conversation_topics if t not in core_lower]
+        if new_topics:
+            # Add top topic keywords to the core query
+            topic_suffix = " ".join(new_topics[:3])
+            queries.append(f"{core} {topic_suffix}")
+            # Also a keywords + topics query
+            if keywords:
+                kw_topic = " ".join(keywords[:4]) + " " + " ".join(new_topics[:2])
+                queries.append(kw_topic)
 
     # ---- Phase 4: Deduplicate and rank ----
     seen: set[str] = set()

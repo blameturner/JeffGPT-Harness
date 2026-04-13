@@ -140,12 +140,13 @@ def events(request: Request):
     q = _get_queue(request)
     disconnect = threading.Event()
 
-    def on_disconnect():
+    async def on_disconnect():
         disconnect.set()
 
+    from starlette.background import BackgroundTask
     response = StreamingResponse(
         _event_stream(q, disconnect),
         media_type="text/event-stream",
+        background=BackgroundTask(on_disconnect),
     )
-    response.background = on_disconnect
     return response

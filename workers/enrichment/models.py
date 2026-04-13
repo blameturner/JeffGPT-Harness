@@ -39,6 +39,7 @@ def _raw_model_call(
     prompt: str,
     max_tokens: int,
     temperature: float,
+    extra_params: dict | None = None,
 ) -> tuple[str, int]:
     """Low-level model call. Slot acquisition is the caller's responsibility."""
     started = time.time()
@@ -47,15 +48,18 @@ def _raw_model_call(
         label, url, model_id, len(prompt), max_tokens,
     )
     try:
+        params = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **no_think_params(),
+        }
+        if extra_params:
+            params.update(extra_params)
         r = httpx.post(
             f"{url}/v1/chat/completions",
-            json={
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                **no_think_params(),
-            },
+            json=params,
             timeout=FAST_TIMEOUT,
         )
         r.raise_for_status()
@@ -108,12 +112,16 @@ def model_call(
     temp = temperature if temperature is not None else cfg.get("temperature", 0.2)
     mt = max_tokens if max_tokens is not None else cfg.get("max_tokens", 200)
 
+    extra: dict = {}
+    if cfg.get("frequency_penalty"):
+        extra["frequency_penalty"] = cfg["frequency_penalty"]
+
     with acquire_role(role, priority=priority) as (url, model_id):
         if not url:
             _log.error("%s: no model for role=%s", function_name, role)
             return "", 0
         _assert_not_reasoner(url, function_name)
-        return _raw_model_call(function_name, url, model_id, prompt, mt, temp)
+        return _raw_model_call(function_name, url, model_id, prompt, mt, temp, extra or None)
 
 
 # ---------------------------------------------------------------------------

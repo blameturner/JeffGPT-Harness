@@ -23,7 +23,13 @@ def build_chat_payload(
     if system:
         payload.append({"role": "system", "content": system})
     if search_context:
-        payload.append({"role": "system", "content": search_context})
+        payload.append({"role": "system", "content": (
+            "The following are LIVE web search results retrieved just now for "
+            "this conversation. Use these sources to inform your answer. "
+            "Cite specific facts from them. Do NOT claim you cannot search "
+            "the web — you already did, and these are the results.\n\n"
+            + search_context
+        )})
     if search_note:
         payload.append({"role": "system", "content": search_note})
     if rag_context:

@@ -299,7 +299,9 @@ class CodeAgent(ChatAgent):
                     # Fast path: skip planner, zero model calls.
                     _log.info("web_search fast-path  conv=%s", conversation_id)
                     from workers.search.queries import generate_broad_queries
-                    queries = generate_broad_queries(user_message, max_queries=5)
+                    from workers.chat.history import extract_conversation_topics
+                    convo_topics = extract_conversation_topics(history)
+                    queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
                     _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
 
                     if queries:

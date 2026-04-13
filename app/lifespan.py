@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
 
     from workers.tool_queue import (
         HandlerConfig, ToolJobQueue, _handle_scrape, _handle_summarise,
-        _set_instance,
+        _handle_graph_extract, _set_instance,
     )
     tool_queue = ToolJobQueue()
     tool_queue.register("scrape", HandlerConfig(
@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
     ))
     tool_queue.register("summarise", HandlerConfig(
         handler=_handle_summarise, max_workers=1, priority_default=3,
+    ))
+    tool_queue.register("graph_extract", HandlerConfig(
+        handler=_handle_graph_extract, max_workers=1, priority_default=5,
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue

@@ -30,12 +30,28 @@ def _total_chars(history: list[dict]) -> int:
     return sum(len(m.get("content") or "") for m in history)
 
 
-def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
+def extract_conversation_topics(history: list[dict]) -> list[str]:
+    """Extract TOPICS keywords from the conversation summary if present."""
+    import re
+    for m in history:
+        if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
+            content = m["content"]
+            for line in content.split("\n"):
+                if line.strip().upper().startswith("TOPICS:"):
+                    topic_str = line.split(":", 1)[1].strip()
+                    return [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
+    return []
+
+
+def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[list[dict], dict | None]:
     """Summarise older history via RWKV when it exceeds thresholds.
 
     Keeps the most recent KEEP_RECENT_EXCHANGES exchanges verbatim.
     Everything older gets compressed into a single [Conversation summary]
     system message via the ``chat_summarise`` model config.
+
+    When ``truncate_only=True``, skips the RWKV call and only truncates.
+    Used on the critical path so the model call runs in background instead.
 
     Falls back to truncation if the model call fails or is unavailable.
     """
@@ -78,24 +94,35 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
         result = [{"role": "system", "content": existing_summary}] + [_truncate_message(m) for m in recent]
         return result, None
 
-    # Call RWKV to summarise the older messages.
-    summary = _call_rwkv_summarise(older_text.strip(), existing_summary)
+    # Summarise the older messages (or skip if truncate_only).
+    if truncate_only:
+        # Preserve the existing summary if one exists from a previous
+        # background run — don't drop it during truncation.
+        if existing_summary:
+            result = [{"role": "system", "content": existing_summary}] + [_truncate_message(m) for m in recent]
+            return result, None
+        summary, topics = None, []
+    else:
+        summary, topics = _call_summarise(older_text.strip(), existing_summary)
 
     if summary:
-        summary_msg = {"role": "system", "content": f"[Conversation summary]\n{summary}"}
+        topics_line = f"\nTOPICS: {', '.join(topics)}" if topics else ""
+        summary_msg = {"role": "system", "content": f"[Conversation summary]\n{summary}{topics_line}"}
         result = [summary_msg] + [_truncate_message(m) for m in recent]
         event = {
             "type": "summarised",
             "removed": len(older),
             "summary_chars": len(summary),
+            "topics": topics,
             "fallback": False,
         }
-        _log.info("history summarised  older=%d chars=%d summary=%d",
-                   len(older), _total_chars(older), len(summary))
+        _log.info("history summarised  older=%d chars=%d summary=%d topics=%s",
+                   len(older), _total_chars(older), len(summary), topics)
         return result, event
 
-    # Fallback: truncation only (RWKV unavailable or failed).
-    _log.warning("RWKV summarise failed — falling back to truncation")
+    # Fallback: truncation only (summariser unavailable, failed, or skipped).
+    if not truncate_only:
+        _log.warning("summarise failed — falling back to truncation")
     recent = [_truncate_message(m) for m in recent]
 
     # Drop oldest kept pairs if still over budget.
@@ -116,8 +143,24 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
     return recent, event
 
 
-def _call_rwkv_summarise(older_text: str, existing_summary: str) -> str | None:
-    """Call the RWKV model to compress conversation history."""
+def _parse_summary_and_topics(raw: str) -> tuple[str, list[str]]:
+    """Split RWKV output into (summary_text, topic_keywords)."""
+    import re
+    lines = raw.strip().split("\n")
+    topics: list[str] = []
+    summary_lines: list[str] = []
+    for line in lines:
+        if line.strip().upper().startswith("TOPICS:"):
+            topic_str = line.split(":", 1)[1].strip()
+            topics = [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
+        else:
+            summary_lines.append(line)
+    summary = "\n".join(summary_lines).strip()
+    return summary, topics[:10]
+
+
+def _call_summarise(older_text: str, existing_summary: str) -> tuple[str, list[str]] | tuple[None, list[str]]:
+    """Call the summariser model to compress conversation history."""
     try:
         from config import get_function_config
         from workers.enrichment.models import model_call
@@ -134,14 +177,20 @@ def _call_rwkv_summarise(older_text: str, existing_summary: str) -> str | None:
             "Compress the following conversation history into a concise factual summary. "
             "Preserve: names, decisions, open questions, key facts, instructions, and "
             "any context the user would need to continue the conversation.\n"
-            "Keep under 400 words. Output only the summary.\n\n"
+            "Keep under 400 words.\n\n"
+            "After the summary, on a new line output:\n"
+            "TOPICS: keyword1, keyword2, keyword3, ...\n"
+            "List the 3-8 most important technical terms, product names, "
+            "languages, or domain topics discussed (e.g. \"javascript, arrays, "
+            "map function, data transformation\"). These will be used to "
+            "improve web search queries.\n\n"
             + "".join(parts)
         )
 
-        summary, _tokens = model_call("chat_summarise", prompt)
-        if summary and len(summary) > 20:
-            return summary.strip()
-        return None
+        raw, _tokens = model_call("chat_summarise", prompt)
+        if raw and len(raw) > 20:
+            return _parse_summary_and_topics(raw.strip())
+        return None, []
     except Exception:
-        _log.error("RWKV chat summarise failed", exc_info=True)
-        return None
+        _log.error("chat summarise failed", exc_info=True)
+        return None, []
