@@ -19,8 +19,8 @@ from tools.framework.contract import ToolContext
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
-from workers.chat_agent import ChatAgent
-from workers.chat.history import maybe_summarise
+from workers.chat_agent import ChatAgent, _get_summary_event, SUMMARY_WAIT_TIMEOUT
+from workers.chat.history import maybe_summarise, extract_conversation_topics
 from workers.styles import code_style_prompt
 
 _log = logging.getLogger("code")
@@ -206,6 +206,15 @@ class CodeAgent(ChatAgent):
                 if not convo:
                     emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
                     return
+                # Wait for any in-flight background summary to finish.
+                summary_ev = _get_summary_event(conversation_id)
+                if not summary_ev.is_set():
+                    emit({"type": "status", "phase": "summarising_previous", "message": "Updating conversation context..."})
+                    waited = summary_ev.wait(timeout=SUMMARY_WAIT_TIMEOUT)
+                    if waited:
+                        _log.info("code conv=%s  waited for background summary — ready", conversation_id)
+                    else:
+                        _log.warning("code conv=%s  background summary wait timed out after %ds", conversation_id, SUMMARY_WAIT_TIMEOUT)
                 history = [
                     {"role": m["role"], "content": m["content"]}
                     for m in self.db.list_code_messages(conversation_id)
@@ -377,7 +386,7 @@ class CodeAgent(ChatAgent):
             except Exception:
                 _log.error("user message persist failed", exc_info=True)
 
-        history, summary_event = maybe_summarise(history)
+        history, summary_event = maybe_summarise(history, truncate_only=True)
         if summary_event:
             emit(summary_event)
 
@@ -461,12 +470,16 @@ class CodeAgent(ChatAgent):
             "output": output,
         })
 
-        # Background: memory writes and graph extraction involve CPU-bound
-        # embedding calls. Run after the user already has their response.
+        # Background: memory writes, graph extraction, and summarisation.
         import threading
 
         def _post_turn_work():
+            _t_bg = time.perf_counter()
+            _log.info("code conv=%s  post-turn background starting  mode=%s", conversation_id, self.mode)
+
+            # 1. RAG embedding
             if output and conversation_id is not None:
+                _t = time.perf_counter()
                 try:
                     remember(
                         text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
@@ -474,10 +487,13 @@ class CodeAgent(ChatAgent):
                         org_id=self.org_id,
                         collection_name=f"code_{conversation_id}",
                     )
+                    _log.info("code conv=%s  [1/5] RAG embedded to code_%s  %.2fs", conversation_id, conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("memory write failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("code conv=%s  [1/5] RAG embed FAILED", conversation_id, exc_info=True)
 
+            # 2. Knowledge embedding
             if convo_knowledge and output:
+                _t = time.perf_counter()
                 try:
                     remember(
                         text=f"USER ({self.mode}): {user_message}\n\nASSISTANT: {output}",
@@ -485,22 +501,98 @@ class CodeAgent(ChatAgent):
                         org_id=self.org_id,
                         collection_name="code_knowledge",
                     )
+                    _log.info("code conv=%s  [2/5] knowledge embedded  %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("code_knowledge write failed  conv=%s", conversation_id, exc_info=True)
-                try:
-                    from workers.chat.graph import extract_and_write_graph
-                    extract_and_write_graph(user_message, output, conversation_id, self.org_id)
-                except Exception:
-                    _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("code conv=%s  [2/5] knowledge embed FAILED", conversation_id, exc_info=True)
 
+                # 3. Graph extraction (queued)
+                try:
+                    from workers.tool_queue import get_tool_queue
+                    tq = get_tool_queue()
+                    if tq:
+                        job_id = tq.submit(
+                            job_type="graph_extract",
+                            payload={
+                                "user_text": user_message,
+                                "assistant_text": output,
+                                "conversation_id": conversation_id,
+                                "org_id": self.org_id,
+                            },
+                            source="code",
+                            org_id=self.org_id,
+                            priority=5,
+                        )
+                        _log.info("code conv=%s  [3/5] graph extraction queued  job=%s", conversation_id, job_id)
+                except Exception:
+                    _log.error("code conv=%s  [3/5] graph extraction queue FAILED", conversation_id, exc_info=True)
+
+            # 4. Background summarisation
+            summary_ev = _get_summary_event(conversation_id)
+            summary_ev.clear()
+            _t = time.perf_counter()
+            try:
+                full_history = history + [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": output},
+                ]
+                summarised_history, bg_summary_event = maybe_summarise(full_history, truncate_only=False)
+                if bg_summary_event and not bg_summary_event.get("fallback"):
+                    topics = bg_summary_event.get("topics", [])
+                    summary_content = ""
+                    for m in summarised_history:
+                        if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
+                            summary_content = m["content"]
+                            break
+                    if summary_content:
+                        try:
+                            existing_msgs = self.db.list_code_messages(conversation_id)
+                            existing_id = None
+                            for msg in existing_msgs:
+                                if msg.get("role") == "system" and "[Conversation summary]" in (msg.get("content") or ""):
+                                    existing_id = msg.get("Id")
+                                    break
+                            if existing_id:
+                                self.db._patch("code_messages", existing_id, {
+                                    "Id": existing_id,
+                                    "content": summary_content,
+                                })
+                                _log.info("code conv=%s  [4/5] summary updated  topics=%s  %.2fs", conversation_id, topics, time.perf_counter() - _t)
+                            else:
+                                self.db.add_code_message(
+                                    conversation_id=conversation_id,
+                                    org_id=self.org_id,
+                                    role="system",
+                                    content=summary_content,
+                                    model="summariser",
+                                    mode=self.mode,
+                                )
+                                _log.info("code conv=%s  [4/5] summary created  topics=%s  %.2fs", conversation_id, topics, time.perf_counter() - _t)
+                        except Exception:
+                            _log.error("code conv=%s  [4/5] summary persist FAILED", conversation_id, exc_info=True)
+                    else:
+                        _log.info("code conv=%s  [4/5] summary produced but empty — skipped persist", conversation_id)
+                elif bg_summary_event and bg_summary_event.get("fallback"):
+                    _log.info("code conv=%s  [4/5] summary skipped — model unavailable, truncation only", conversation_id)
+                else:
+                    _log.info("code conv=%s  [4/5] summary skipped — under threshold (%d messages)", conversation_id, len(full_history))
+            except Exception:
+                _log.error("code conv=%s  [4/5] summary FAILED", conversation_id, exc_info=True)
+            finally:
+                summary_ev.set()
+
+            # 5. Plan checklist extraction (code-specific)
             if self.mode == "plan" and output and conversation_id is not None:
                 try:
                     checklist_steps = _parse_plan_checklist(output)
                     if checklist_steps:
                         self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
-                        _log.info("bg: checklist persisted  conv=%s steps=%d", conversation_id, len(checklist_steps))
+                        _log.info("code conv=%s  [5/5] plan checklist persisted  steps=%d", conversation_id, len(checklist_steps))
+                    else:
+                        _log.info("code conv=%s  [5/5] plan checklist — no steps extracted", conversation_id)
                 except Exception:
-                    _log.error("bg: checklist failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("code conv=%s  [5/5] plan checklist FAILED", conversation_id, exc_info=True)
+
+            _log.info("code conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 
