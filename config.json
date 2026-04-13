@@ -19,6 +19,8 @@
   },
   "features": {
     "web_search": true,
+    "rag_lookup": true,
+    "code_exec": false,
     "enrichment": true,
     "tools_framework": true,
     "batch_summarise": false,

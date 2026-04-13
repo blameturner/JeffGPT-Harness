@@ -17,6 +17,7 @@ import re
 
 _log = logging.getLogger("tools.gate")
 
+from config import is_feature_enabled
 from workers.search.heuristics import _definitely_no_search, _explicit_search_intent
 
 
@@ -30,7 +31,8 @@ _RAG_LOOKUP = re.compile(
 )
 
 ## deep_search is NOT auto-detected — it's a UI toggle (search_mode="deep").
-## The gate only handles web_search, rag_lookup, and code_exec hints.
+## The gate detects web_search, rag_lookup, and code_exec hints, but each
+## tool is only returned if enabled in config.json features.
 
 _CODE_EXEC = re.compile(
     # "run this <optional adjective> (code|script|program|snippet)"
@@ -152,7 +154,7 @@ def gate_check(
         hints: set[str] = set()
         if _RAG_LOOKUP.search(msg):
             hints.add("rag_lookup")
-        if _CODE_EXEC.search(msg) or "```" in msg:
+        if _CODE_EXEC.search(msg):
             hints.add("code_exec")
         # Context-aware: follow-up on a prior search-using turn reopens web_search.
         if conversation_context and _FOLLOW_UP.search(msg):
@@ -167,6 +169,8 @@ def gate_check(
                 hints.add("rag_lookup")
             if _CODE_RUN_REQUEST.search(msg):
                 hints.add("code_exec")
+        # Strip any tools disabled in config.json features.
+        hints = {h for h in hints if is_feature_enabled(h)}
         if hints:
             _log.info("gate  msg=%s hints=%s (no_search path)", msg[:80], sorted(hints))
         return hints
@@ -176,7 +180,7 @@ def gate_check(
         hints.add("web_search")
     if _RAG_LOOKUP.search(msg):
         hints.add("rag_lookup")
-    if _CODE_EXEC.search(msg) or "```" in msg:
+    if _CODE_EXEC.search(msg):
         hints.add("code_exec")
 
     # Code-mode augments — broader coverage for API lookups and error traces.
@@ -200,6 +204,9 @@ def gate_check(
     # false negatives cost stale answers.
     if "web_search" not in hints and len(msg) > 30:
         hints.add("web_search")
+
+    # Strip any tools disabled in config.json features.
+    hints = {h for h in hints if is_feature_enabled(h)}
 
     if hints:
         _log.info("gate  msg=%s hints=%s", msg[:80], sorted(hints))

@@ -38,6 +38,8 @@ _DEFAULT_MODELS: dict[str, dict] = {
 
 _DEFAULT_FEATURES: dict[str, bool] = {
     "web_search": True,
+    "rag_lookup": True,
+    "code_exec": False,
     "enrichment": True,
     "tools_framework": True,
     "batch_summarise": True,
