@@ -39,7 +39,10 @@ def extract_conversation_topics(history: list[dict]) -> list[str]:
             for line in content.split("\n"):
                 if line.strip().upper().startswith("TOPICS:"):
                     topic_str = line.split(":", 1)[1].strip()
-                    return [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
+                    topics = [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
+                    _log.debug("extract_topics: found %d topics from summary: %s", len(topics), topics)
+                    return topics
+    _log.debug("extract_topics: no summary with TOPICS found in %d messages", len(history))
     return []
 
 
@@ -116,13 +119,13 @@ def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[l
             "topics": topics,
             "fallback": False,
         }
-        _log.info("history summarised  older=%d chars=%d summary=%d topics=%s",
+        _log.info("summariser: compressed %d older messages (%d chars) into %d char summary  topics=%s",
                    len(older), _total_chars(older), len(summary), topics)
         return result, event
 
     # Fallback: truncation only (summariser unavailable, failed, or skipped).
     if not truncate_only:
-        _log.warning("summarise failed — falling back to truncation")
+        _log.warning("summariser: model call failed — falling back to truncation")
     recent = [_truncate_message(m) for m in recent]
 
     # Drop oldest kept pairs if still over budget.

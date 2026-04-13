@@ -156,8 +156,10 @@ class ChatAgent:
             if not summary_ev.is_set():
                 emit({"type": "status", "phase": "summarising_previous", "message": "Updating conversation context..."})
                 waited = summary_ev.wait(timeout=SUMMARY_WAIT_TIMEOUT)
-                if not waited:
-                    _log.warning("summary wait timed out  conv=%s", conversation_id)
+                if waited:
+                    _log.info("chat conv=%s  waited for background summary — ready", conversation_id)
+                else:
+                    _log.warning("chat conv=%s  background summary wait timed out after %ds — proceeding without", conversation_id, SUMMARY_WAIT_TIMEOUT)
             history = [
                 {"role": m["role"], "content": m["content"]}
                 for m in self.db.list_messages(conversation_id)
@@ -170,13 +172,13 @@ class ChatAgent:
             or self._default_collection(conversation_id)
         )
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
-        _log.info("conversation flags  conv=%s rag=%s knowledge=%s (raw=%s, param=%s)", conversation_id, convo_rag_enabled, convo_knowledge, convo.get("knowledge_enabled"), knowledge_enabled)
+        _log.info("chat conv=%s  flags: rag=%s knowledge=%s search=%s", conversation_id, convo_rag_enabled, convo_knowledge, self.search_enabled)
 
         _t = time.perf_counter()
         schedule_status_processing_write(self.db, conversation_id)
         _span("status_processing_ms", _t)
 
-        _log.debug("turn start  conv=%s model=%s org=%d", conversation_id, self.model, self.org_id)
+        _log.info("chat conv=%s  turn start  model=%s org=%d messages=%d", conversation_id, self.model, self.org_id, len(history))
         emit({"type": "meta", "conversation_id": conversation_id})
 
         rag_executor, rag_future = submit_rag_future(
@@ -205,7 +207,7 @@ class ChatAgent:
             hints = gate_check(user_message, conversation_context=last_assistant)
             if not web_search_enabled or not self.search_enabled:
                 hints.discard("web_search")
-            _log.info("tools gate  conv=%s hints=%s web_search=%s search_enabled=%s", conversation_id, sorted(hints) or "[]", web_search_enabled, self.search_enabled)
+            _log.info("chat conv=%s  gate check: tools=%s web_search_global=%s search_enabled=%s", conversation_id, sorted(hints) or "none", web_search_enabled, self.search_enabled)
 
             if hints:
                 tool_labels = {
@@ -240,11 +242,13 @@ class ChatAgent:
                 if hints <= _DIRECT_TOOLS:
                     # Fast path: build plan directly without invoking
                     # the planner model.  Zero model calls for dispatch.
-                    _log.info("fast-path  conv=%s hints=%s mode=%s", conversation_id, sorted(hints), search_mode)
+                    _log.info("chat conv=%s  search fast-path  tools=%s mode=%s", conversation_id, sorted(hints), search_mode)
                     actions: list[ToolAction] = []
 
                     if "web_search" in hints:
                         convo_topics = extract_conversation_topics(history)
+                        if convo_topics:
+                            _log.info("chat conv=%s  topics from summary: %s", conversation_id, convo_topics)
                         # If RAG is running, collect it early to extract
                         # context keywords for search query enrichment.
                         if rag_future and not convo_topics:
@@ -253,14 +257,15 @@ class ChatAgent:
                                 if early_rag:
                                     from workers.search.queries import _extract_keywords
                                     rag_kw = _extract_keywords(early_rag[:2000])
-                                    # Deduplicate against message keywords
                                     msg_kw_lower = {k.lower() for k in _extract_keywords(user_message)}
                                     convo_topics = [k.lower() for k in rag_kw if k.lower() not in msg_kw_lower][:8]
-                                    _log.info("rag-enriched topics  conv=%s topics=%s", conversation_id, convo_topics)
-                            except Exception:
-                                pass  # timeout or error — proceed without
+                                    _log.info("chat conv=%s  topics from RAG: %s", conversation_id, convo_topics)
+                                else:
+                                    _log.info("chat conv=%s  early RAG returned empty — no topic enrichment", conversation_id)
+                            except Exception as e:
+                                _log.info("chat conv=%s  early RAG unavailable (%s) — proceeding without topics", conversation_id, type(e).__name__)
                         queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
-                        _log.info("fast-path queries  conv=%s queries=%s", conversation_id, queries)
+                        _log.info("chat conv=%s  search queries (%d): %s", conversation_id, len(queries), [q[:60] for q in queries])
                         if queries:
                             actions.append(ToolAction(
                                 tool=ToolName.WEB_SEARCH,
@@ -303,9 +308,10 @@ class ChatAgent:
                         plan = ToolPlan(actions=actions, summary=instant_summary)
                         try:
                             tool_context = asyncio.run(execute_plan(plan, emit))
-                            _log.info("fast-path done  conv=%s results=%d elapsed=%.2fs", conversation_id, len(tool_context.results), time.perf_counter() - _t_tools)
+                            ok = sum(1 for r in tool_context.results if r.ok)
+                            _log.info("chat conv=%s  search complete  results=%d/%d elapsed=%.2fs", conversation_id, ok, len(tool_context.results), time.perf_counter() - _t_tools)
                         except Exception:
-                            _log.error("fast-path failed  conv=%s", conversation_id, exc_info=True)
+                            _log.error("chat conv=%s  search failed", conversation_id, exc_info=True)
                             tool_context = ToolContext()
                 else:
                     # Full planner path — only for tools that need model-generated
@@ -467,11 +473,11 @@ class ChatAgent:
 
         _span("pre_model_total_ms", _turn_start)
         _log.info(
-            "turn pre-model  conv=%s " + " ".join(f"{k}=%d" for k in spans),
+            "chat conv=%s  pre-model ready  " + " ".join(f"{k}=%dms" for k in spans),
             conversation_id, *spans.values(),
         )
 
-        _log.debug("model call   conv=%s messages=%d temp=%.1f max_tokens=%d", conversation_id, len(payload), temperature, max_tokens)
+        _log.info("chat conv=%s  sending to model  messages=%d temp=%.1f max_tokens=%d rag_chars=%d search_chars=%d", conversation_id, len(payload), temperature, max_tokens, len(rag_context), len(search_context))
         start = time.time()
 
         try:
@@ -489,7 +495,7 @@ class ChatAgent:
         output = "".join(chunks)
         tokens_input = int(final_usage.get("prompt_tokens") or 0)
         tokens_output = int(final_usage.get("completion_tokens") or 0)
-        _log.info("turn done    conv=%s model=%s in=%d out=%d %.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
+        _log.info("chat conv=%s  model response complete  model=%s tokens_in=%d tokens_out=%d duration=%.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
         # Persist to NocoDB BEFORE emitting done — this is the critical write
         # that must not be lost. If this fails, the user still has streamed chunks.
@@ -541,8 +547,9 @@ class ChatAgent:
 
         def _post_turn_work():
             _t_bg = time.perf_counter()
+            _log.info("chat conv=%s  post-turn background starting", conversation_id)
 
-            # Memory and graph
+            # 1. RAG embedding
             if convo_rag_enabled and output:
                 _t = time.perf_counter()
                 try:
@@ -552,10 +559,11 @@ class ChatAgent:
                         org_id=self.org_id,
                         collection_name=collection_name,
                     )
-                    _log.info("bg: rag remember done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
+                    _log.info("chat conv=%s  [1/4] RAG embedded to %s  %.2fs", conversation_id, collection_name, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("bg: rag remember failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("chat conv=%s  [1/4] RAG embed FAILED", conversation_id, exc_info=True)
 
+            # 2. Knowledge embedding
             if convo_knowledge and output:
                 _t = time.perf_counter()
                 try:
@@ -565,32 +573,32 @@ class ChatAgent:
                         org_id=self.org_id,
                         collection_name="chat_knowledge",
                     )
-                    _log.info("bg: knowledge remember done  conv=%s %.2fs", conversation_id, time.perf_counter() - _t)
+                    _log.info("chat conv=%s  [2/4] knowledge embedded  %.2fs", conversation_id, time.perf_counter() - _t)
                 except Exception:
-                    _log.error("bg: knowledge remember failed  conv=%s", conversation_id, exc_info=True)
-                # Queue graph extraction instead of running inline — it uses
-                # RWKV and would block the summariser and other work.
+                    _log.error("chat conv=%s  [2/4] knowledge embed FAILED", conversation_id, exc_info=True)
+
+                # 3. Graph extraction (queued, not inline)
                 try:
                     from workers.tool_queue import get_tool_queue
                     tq = get_tool_queue()
                     if tq:
-                        tq.submit(
+                        job_id = tq.submit(
                             job_type="graph_extract",
                             payload={
                                 "user_text": user_message,
                                 "assistant_text": output,
                                 "conversation_id": conversation_id,
+                                "org_id": self.org_id,
                             },
                             source="chat",
                             org_id=self.org_id,
                             priority=5,
                         )
-                        _log.info("bg: graph extraction queued  conv=%s", conversation_id)
+                        _log.info("chat conv=%s  [3/4] graph extraction queued  job=%s", conversation_id, job_id)
                 except Exception:
-                    _log.error("bg: graph extraction queue failed  conv=%s", conversation_id, exc_info=True)
+                    _log.error("chat conv=%s  [3/4] graph extraction queue FAILED", conversation_id, exc_info=True)
 
-            # Background summarisation — run summary so it's ready for
-            # the next turn.  Signal via event so next turn can wait if needed.
+            # 4. Background summarisation — produces summary + topics for next turn
             summary_ev = _get_summary_event(conversation_id)
             summary_ev.clear()  # mark as running
             _t = time.perf_counter()
@@ -620,6 +628,7 @@ class ChatAgent:
                                     "Id": existing_id,
                                     "content": summary_content,
                                 })
+                                _log.info("chat conv=%s  [4/4] summary updated  topics=%s  %.2fs", conversation_id, topics, time.perf_counter() - _t)
                             else:
                                 self.db.add_message(
                                     conversation_id=conversation_id,
@@ -628,16 +637,21 @@ class ChatAgent:
                                     content=summary_content,
                                     model="summariser",
                                 )
+                                _log.info("chat conv=%s  [4/4] summary created  topics=%s  %.2fs", conversation_id, topics, time.perf_counter() - _t)
                         except Exception:
-                            _log.debug("bg: summary persist failed  conv=%s", conversation_id, exc_info=True)
-                    _log.info("bg: summarise done  conv=%s topics=%s %.2fs",
-                              conversation_id, topics, time.perf_counter() - _t)
+                            _log.error("chat conv=%s  [4/4] summary persist FAILED", conversation_id, exc_info=True)
+                    else:
+                        _log.info("chat conv=%s  [4/4] summary produced but empty — skipped persist", conversation_id)
+                elif bg_summary_event and bg_summary_event.get("fallback"):
+                    _log.info("chat conv=%s  [4/4] summary skipped — model unavailable, truncation only", conversation_id)
+                else:
+                    _log.info("chat conv=%s  [4/4] summary skipped — under threshold (%d messages)", conversation_id, len(full_history))
             except Exception:
-                _log.error("bg: summarise failed  conv=%s", conversation_id, exc_info=True)
+                _log.error("chat conv=%s  [4/4] summary FAILED", conversation_id, exc_info=True)
             finally:
                 summary_ev.set()  # mark as done, unblock any waiting turn
 
-            _log.info("bg: post-turn complete  conv=%s total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
+            _log.info("chat conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 

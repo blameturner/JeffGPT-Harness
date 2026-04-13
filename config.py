@@ -307,7 +307,7 @@ ROLE_PARALLEL_SLOTS: dict[str, int] = {
 }
 
 # Tool job queue defaults
-JOB_QUEUE_POLL_INTERVAL = float(os.getenv("JOB_QUEUE_POLL_INTERVAL", "5"))
+JOB_QUEUE_POLL_INTERVAL = float(os.getenv("JOB_QUEUE_POLL_INTERVAL", "300"))
 JOB_QUEUE_STALE_TIMEOUT = int(os.getenv("JOB_QUEUE_STALE_TIMEOUT", "300"))
 CATEGORY_COLLECTIONS = {
     "documentation": "scraped_documentation",

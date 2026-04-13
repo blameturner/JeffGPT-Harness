@@ -32,7 +32,7 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
 
     t0 = time.time()
     cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    _log.info("seed_enrichment_jobs cycle=%s agent=%d", cycle_id, enrichment_agent_id)
+    _log.info("enrichment agent=%d  seed cycle starting  cycle=%s", enrichment_agent_id, cycle_id)
 
     try:
         db = EnrichmentDB()
@@ -74,17 +74,30 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
             continue
 
         if not sources:
+            _log.info("enrichment agent=%d  org=%d  no sources due — nothing to seed", enrichment_agent_id, org_id)
             db.log_event(cycle_id, "no_sources_due", org_id=org_id,
                          message="list_due_sources returned 0 rows")
             continue
 
+        # Cap seeded jobs based on the agent's token budget from NocoDB.
+        # Estimate ~600 tokens per source (prompt + summarise output).
+        agent_budget = int(agent_config.get("token_budget") or ENRICHMENT_TOKEN_BUDGET)
+        max_sources = max(1, agent_budget // 600)
+        _log.info("enrichment agent=%d  org=%d  sources_due=%d  budget=%d tokens  max_sources=%d",
+                  enrichment_agent_id, org_id, len(sources), agent_budget, max_sources)
+
         for source in sources:
+            if seeded >= max_sources:
+                _log.info("enrichment agent=%d  budget cap reached — seeded=%d/%d, remaining=%d deferred to next cycle",
+                          enrichment_agent_id, seeded, max_sources, len(sources) - seeded - skipped)
+                break
+
             source_url = source.get("url") or ""
             target_id = source.get("Id")
             consecutive_fails = int(source.get("consecutive_failures") or 0)
 
             if consecutive_fails >= 5:
-                _log.debug("skipping permanently failed source %s", source_url[:60])
+                _log.info("enrichment agent=%d  skipping source %s — %d consecutive failures", enrichment_agent_id, source_url[:60], consecutive_fails)
                 skipped += 1
                 continue
 
@@ -95,9 +108,6 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
             category = (source.get("category") or "documentation").lower()
             collection = CATEGORY_COLLECTIONS.get(category, "scraped_documentation")
 
-            # Submit a scrape→summarise pipeline to the tool queue.
-            # The scrape handler runs scrape_page(); the summarise handler
-            # uses enrichment_summarise config and stores to ChromaDB.
             tq.submit_pipeline(
                 url=source_url,
                 org_id=org_id,
@@ -114,10 +124,10 @@ def seed_enrichment_jobs(enrichment_agent_id: int) -> dict:
                 summarise_function="enrichment_summarise",
             )
             seeded += 1
-            _log.debug("seeded source %s url=%s", target_id, source_url[:60])
+            _log.info("enrichment agent=%d  seeded source %s  url=%s  category=%s", enrichment_agent_id, target_id, source_url[:60], category)
 
     elapsed = round(time.time() - t0, 1)
-    _log.info("seed_enrichment_jobs done  agent=%d seeded=%d skipped=%d elapsed=%.1fs",
+    _log.info("enrichment agent=%d  seed complete  seeded=%d  skipped=%d  elapsed=%.1fs",
               enrichment_agent_id, seeded, skipped, elapsed)
     db.log_event(cycle_id, "cycle_end", message=f"seeded={seeded} skipped={skipped}")
 

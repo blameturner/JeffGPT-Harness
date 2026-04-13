@@ -309,6 +309,18 @@ class ToolJobQueue:
             org_id=org_id,
             priority=priority,
         )
+        # Build summarise metadata — pass through ALL upstream metadata
+        # so handlers can access scrape_target_id, category, cycle_id, etc.
+        summarise_meta = {
+            "url": url,
+            "name": meta.get("title") or url,
+            "source": source or "web_search",
+            "queries": ", ".join(meta.get("queries", []))[:500],
+            "conversation_id": meta.get("conversation_id"),
+            "scrape_target_id": meta.get("scrape_target_id"),
+            "category": meta.get("category"),
+            "cycle_id": meta.get("cycle_id"),
+        }
         summarise_id = self.submit(
             job_type="summarise",
             payload={
@@ -317,13 +329,7 @@ class ToolJobQueue:
                 "org_id": org_id,
                 "collection": collection,
                 "function_name": summarise_function,
-                "metadata": {
-                    "url": url,
-                    "name": meta.get("title") or url,
-                    "source": source or "web_search",
-                    "queries": ", ".join(meta.get("queries", []))[:500],
-                    "conversation_id": meta.get("conversation_id"),
-                },
+                "metadata": summarise_meta,
             },
             source=source,
             org_id=org_id,
@@ -480,14 +486,15 @@ class ToolJobQueue:
             if job_type != "scrape":
                 idle = seconds_since_chat()
                 # Use the LOWEST possible backoff (priority 1 = 120s) as
-                # the pre-claim gate.  This lets us peek at the actual queue
-                # without blocking high-priority jobs behind the default
-                # 600s threshold.  The per-job check after claiming enforces
-                # the real threshold for the specific job's priority.
+                # the pre-claim gate so high-priority jobs aren't blocked.
+                # The per-job check after claiming enforces the real
+                # threshold and sleeps instead of churning if too early.
                 min_gate = _backoff_for_priority(1)
                 if idle < min_gate:
-                    _log.debug("worker %s backing off (idle=%.0fs < %.0fs gate)",
-                               worker_id, idle, min_gate)
+                    # Only log occasionally to avoid spam
+                    if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
+                        _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
+                                   worker_id, idle, min_gate)
                     continue
 
             job = self._claim_next(job_type, worker_id)
@@ -501,24 +508,27 @@ class ToolJobQueue:
                 idle = seconds_since_chat()
                 required = _backoff_for_priority(job.priority)
                 if idle < required:
-                    _log.debug("worker %s backoff for job priority=%d (idle=%.0fs < %.0fs)",
-                               worker_id, job.priority, idle, required)
+                    wait_secs = min(required - idle, 60)
+                    _log.info("queue %s: job %s (priority=%d) needs %.0fs idle, currently %.0fs — sleeping %.0fs",
+                              worker_id, job.job_id[:12], job.priority, required, idle, wait_secs)
                     self._unclaim(job)
+                    self._stop.wait(timeout=wait_secs)
                     continue
 
             # Dependency check
             if job.depends_on:
                 dep = self.get_job(job.depends_on)
                 if not dep or dep.status != "completed":
-                    # Dependency not ready — put back
+                    dep_status = dep.status if dep else "not_found"
+                    _log.debug("queue %s: job %s waiting on dependency %s (status=%s)",
+                               worker_id, job.job_id[:12], job.depends_on[:12], dep_status)
                     self._unclaim(job)
                     continue
-                # Merge dependency result into payload
                 if dep.result:
                     job.payload.update(dep.result)
 
-            _log.info("worker %s running job=%s type=%s priority=%d",
-                       worker_id, job.job_id, job_type, job.priority)
+            _log.info("queue %s: RUNNING  job=%s  type=%s  priority=%d  source=%s",
+                       worker_id, job.job_id[:12], job_type, job.priority, job.source or "-")
             t0 = time.time()
 
             try:
@@ -527,8 +537,8 @@ class ToolJobQueue:
                 job.result = result or {}
                 job.completed_at = datetime.now(timezone.utc).isoformat()
                 elapsed = round(time.time() - t0, 1)
-                _log.info("worker %s completed job=%s type=%s %.1fs",
-                           worker_id, job.job_id, job_type, elapsed)
+                _log.info("queue %s: COMPLETED  job=%s  type=%s  %.1fs",
+                           worker_id, job.job_id[:12], job_type, elapsed)
                 self._emit_event({
                     "type": "job_completed",
                     "job_id": job.job_id,
@@ -540,8 +550,8 @@ class ToolJobQueue:
                 job.error = str(e)[:500]
                 job.completed_at = datetime.now(timezone.utc).isoformat()
                 elapsed = round(time.time() - t0, 1)
-                _log.error("worker %s failed job=%s type=%s error=%s %.1fs",
-                           worker_id, job.job_id, job_type, e, elapsed)
+                _log.error("queue %s: FAILED  job=%s  type=%s  error=%s  %.1fs",
+                           worker_id, job.job_id[:12], job_type, e, elapsed)
                 self._emit_event({
                     "type": "job_failed",
                     "job_id": job.job_id,
@@ -779,21 +789,59 @@ def _handle_scrape(payload: dict) -> dict:
     snippet = payload.get("snippet", "")
 
     if not url:
+        _log.warning("queue scrape: empty URL — skipped")
         return {"url": url, "text": snippet, "path": "empty_url"}
 
+    _log.info("queue scrape: starting  url=%s", url[:80])
     meta: dict = {}
     try:
         text = scrape_page(url, snippet, None, meta)
     except Exception as e:
-        _log.warning("scrape handler failed for %s: %s", url[:80], e)
+        _log.warning("queue scrape: FAILED  url=%s  error=%s", url[:80], e)
         text = snippet
         meta["path"] = "error"
+
+    path = meta.get("path", "unknown")
+    text_len = len(text or "")
+    _log.info("queue scrape: complete  url=%s  path=%s  chars=%d", url[:80], path, text_len)
 
     return {
         "url": url,
         "text": (text or "")[:20000],
-        "path": meta.get("path", "unknown"),
+        "path": path,
     }
+
+
+def _update_enrichment_target_on_error(metadata: dict, error_msg: str):
+    """Mark an enrichment scrape target as errored with exponential backoff."""
+    target_id = metadata.get("scrape_target_id")
+    source_type = metadata.get("source", "")
+    if not target_id or source_type != "enrichment":
+        return
+    try:
+        from datetime import datetime, timedelta, timezone
+        from workers.enrichment.db import EnrichmentDB
+        db = EnrichmentDB()
+        rows = db._get("scrape_targets", params={
+            "where": f"(Id,eq,{target_id})", "limit": 1,
+        }).get("list", [])
+        source_row = rows[0] if rows else {}
+        consecutive = int(source_row.get("consecutive_failures") or 0) + 1
+        freq_hours = float(source_row.get("frequency_hours") or 24)
+        # Exponential backoff: double the wait each failure, cap at 16x
+        backoff_mult = min(2 ** consecutive, 16)
+        now_utc = datetime.now(timezone.utc)
+        retry_at = now_utc + timedelta(hours=freq_hours * backoff_mult)
+        db.update_scrape_target(
+            int(target_id),
+            status="error",
+            next_crawl_at=retry_at.isoformat(),
+            consecutive_failures=consecutive,
+            last_scrape_error=error_msg[:500],
+        )
+        _log.info("enrichment target error  id=%s consecutive=%d retry=%s", target_id, consecutive, retry_at.isoformat())
+    except Exception:
+        _log.warning("failed to update scrape target %s on error", target_id, exc_info=True)
 
 
 def _handle_summarise(payload: dict) -> dict:
@@ -811,8 +859,14 @@ def _handle_summarise(payload: dict) -> dict:
     metadata = payload.get("metadata") or {}
     function_name = payload.get("function_name", "deep_search_summarise")
 
+    source_type = metadata.get("source", "")
+    target_id = metadata.get("scrape_target_id", "")
+    _log.info("queue summarise: starting  url=%s  source=%s  target=%s  func=%s  text_chars=%d",
+              url[:80], source_type, target_id or "-", function_name, len(text))
+
     if not text or len(text) < 50:
-        _log.debug("summarise handler: text too short for %s", url[:80])
+        _log.info("queue summarise: skipped — text too short (%d chars)  url=%s", len(text), url[:80])
+        _update_enrichment_target_on_error(metadata, "scrape returned no usable text")
         return {"summary": text, "chunks": 0}
 
     cfg = get_function_config(function_name)
@@ -847,7 +901,10 @@ def _handle_summarise(payload: dict) -> dict:
 
     summary, _tokens = model_call(function_name, prompt)
     if not summary:
+        _log.warning("queue summarise: model returned empty — using raw text fallback  url=%s", url[:80])
         summary = text[:2000]
+
+    _log.info("queue summarise: model complete  url=%s  tokens=%d  summary_chars=%d", url[:80], _tokens, len(summary))
 
     chunks = 0
     if org_id and summary:
@@ -863,11 +920,63 @@ def _handle_summarise(payload: dict) -> dict:
         except Exception as e:
             _log.warning("ChromaDB store failed for %s: %s", url[:80], e)
 
+    _log.info("queue summarise: stored to ChromaDB  url=%s  collection=%s  chunks=%d", url[:80], collection, chunks)
+
     # Deliver result back to the originating conversation as a message.
     conversation_id = metadata.get("conversation_id")
-    source_type = metadata.get("source", "")
     if conversation_id and source_type in ("deep_search", "research"):
         _deliver_to_conversation(conversation_id, org_id, url, summary)
+        _log.info("queue summarise: delivered to conversation  conv=%s  url=%s", conversation_id, url[:60])
+
+    # Queue graph extraction for enrichment sources so relationships
+    # land in FalkorDB. Runs at lowest priority (5) when models are idle.
+    if scrape_target_id and source_type == "enrichment" and summary:
+        try:
+            tq = get_tool_queue()
+            if tq:
+                graph_job_id = tq.submit(
+                    job_type="graph_extract",
+                    payload={
+                        "user_text": f"Source: {url}",
+                        "assistant_text": summary,
+                        "conversation_id": 0,
+                        "org_id": org_id,
+                    },
+                    source="enrichment",
+                    org_id=org_id,
+                    priority=5,
+                )
+                _log.info("queue summarise: graph extraction queued  target=%s  job=%s", scrape_target_id, graph_job_id)
+        except Exception:
+            _log.error("queue summarise: graph extraction queue FAILED  target=%s  url=%s", scrape_target_id, url[:60], exc_info=True)
+
+    # Update the scrape target so it's not re-scraped until next_crawl_at.
+    if scrape_target_id and source_type == "enrichment":
+        try:
+            from datetime import datetime, timedelta, timezone
+            from workers.enrichment.db import EnrichmentDB
+            db = EnrichmentDB()
+            source_row = None
+            try:
+                rows = db._get("scrape_targets", params={
+                    "where": f"(Id,eq,{scrape_target_id})", "limit": 1,
+                }).get("list", [])
+                source_row = rows[0] if rows else None
+            except Exception:
+                pass
+            freq_hours = float((source_row or {}).get("frequency_hours") or 24)
+            now_utc = datetime.now(timezone.utc)
+            next_at = now_utc + timedelta(hours=freq_hours)
+            db.update_scrape_target(
+                int(scrape_target_id),
+                last_scraped_at=now_utc.isoformat(),
+                status="ok",
+                next_crawl_at=next_at.isoformat(),
+                consecutive_failures=0,
+            )
+            _log.info("queue summarise: target complete  id=%s  status=ok  next_crawl=%s", scrape_target_id, next_at.isoformat())
+        except Exception:
+            _log.error("queue summarise: target update FAILED  id=%s", scrape_target_id, exc_info=True)
 
     return {"summary": summary[:3000], "chunks": chunks}
 
@@ -912,20 +1021,23 @@ def get_tool_queue() -> ToolJobQueue | None:
     return _instance
 
 
-def _handle_graph_extract(job: ToolJob) -> dict:
-    """Extract knowledge graph relationships from a chat turn."""
+def _handle_graph_extract(payload: dict) -> dict:
+    """Extract knowledge graph relationships from a chat/enrichment turn."""
     from workers.chat.graph import extract_and_write_graph
 
-    payload = job.payload
     user_text = payload.get("user_text") or ""
     assistant_text = payload.get("assistant_text") or ""
     conversation_id = payload.get("conversation_id") or 0
-    org_id = job.org_id
+    org_id = int(payload.get("org_id") or 0)
 
     if not user_text and not assistant_text:
+        _log.info("queue graph_extract: skipped — empty input  org=%d", org_id)
         return {"written": 0, "error": "empty input"}
 
+    _log.info("queue graph_extract: starting  org=%d  text_chars=%d",
+              org_id, len(user_text) + len(assistant_text))
     extract_and_write_graph(user_text, assistant_text, conversation_id, org_id)
+    _log.info("queue graph_extract: complete  org=%d", org_id)
     return {"status": "ok"}
 
 
