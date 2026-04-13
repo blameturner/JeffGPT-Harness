@@ -160,21 +160,26 @@ def _assess_progress(objective: str, lookout: list[str], criteria: list[str],
         lookout=", ".join(lookout),
         completion_criteria=", ".join(criteria),
         source_count=len(summaries),
-        evidence_summary=evidence[:3500],
+        evidence_summary=evidence[:3800],
     )
 
     raw, tokens = model_call("research_assess", prompt)
     _log.info("research assessment  tokens=%d", tokens)
 
+    # On failure, default to incomplete so the loop continues gathering
+    # evidence rather than stopping prematurely on a T3 hiccup.
+    _INCOMPLETE = {"complete": False, "gaps": ["assessment failed — continuing"], "new_queries": [], "met_criteria": []}
+
     if not raw:
-        return {"complete": True, "gaps": [], "new_queries": [], "met_criteria": []}
+        _log.warning("research assessment returned empty — treating as incomplete")
+        return _INCOMPLETE
 
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
         result = json.loads(cleaned)
     except json.JSONDecodeError:
-        _log.warning("research assessment unparseable, treating as complete")
-        return {"complete": True, "gaps": [], "new_queries": [], "met_criteria": []}
+        _log.warning("research assessment unparseable — treating as incomplete")
+        return _INCOMPLETE
 
     return result
 

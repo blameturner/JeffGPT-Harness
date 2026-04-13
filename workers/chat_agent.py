@@ -232,6 +232,21 @@ class ChatAgent:
                     except Exception:
                         pass
 
+            def _mark_plan_approved(conv_id: int, plan_model: str):
+                """Update the plan message's search_status from awaiting_approval to approved."""
+                try:
+                    msgs = self.db.list_messages(conv_id)
+                    for m in reversed(msgs):
+                        if m.get("model") == plan_model and m.get("search_status") == "awaiting_approval":
+                            self.db._patch("messages", m["Id"], {
+                                "Id": m["Id"],
+                                "search_status": "approved",
+                            })
+                            _log.info("chat conv=%s  marked %s message as approved", conv_id, plan_model)
+                            break
+                except Exception:
+                    _log.warning("chat conv=%s  failed to mark %s as approved", conv_id, plan_model, exc_info=True)
+
             if search_mode == "deep_approved" and pending_ds:
                 try:
                     ds_plan = json.loads(pending_ds)
@@ -240,6 +255,8 @@ class ChatAgent:
                 if ds_plan:
                     _log.info("chat conv=%s  deep search approved — executing %d queries, %d urls",
                               conversation_id, len(ds_plan.get("queries", [])), len(ds_plan.get("urls", [])))
+                    emit({"type": "plan_approved", "tool": "deep_search"})
+                    _mark_plan_approved(conversation_id, "deep_search_plan")
                     actions = [ToolAction(
                         tool=ToolName.DEEP_SEARCH,
                         params={
@@ -276,6 +293,8 @@ class ChatAgent:
                 if rs_plan:
                     _log.info("chat conv=%s  research approved — executing %d queries",
                               conversation_id, len(rs_plan.get("queries", [])))
+                    emit({"type": "plan_approved", "tool": "research"})
+                    _mark_plan_approved(conversation_id, "research_plan")
                     actions = [ToolAction(
                         tool=ToolName.RESEARCH,
                         params={
@@ -485,12 +504,44 @@ class ChatAgent:
                         "message": r.data,
                         "status": "awaiting_approval",
                     })
+                    # Persist the plan as a message so it survives navigation
+                    # and is reviewable later. model="deep_search_plan" lets
+                    # the frontend render it as a structured card.
+                    # Re-fetch conversation to get the plan JSON written by the
+                    # executor (convo was loaded before tools ran).
+                    try:
+                        fresh = self.db.get_conversation(conversation_id) or {}
+                        plan_json = fresh.get("pending_deep_search") or ""
+                        self.db.add_message(
+                            conversation_id=conversation_id,
+                            org_id=self.org_id,
+                            role="assistant",
+                            content=r.data,
+                            model="deep_search_plan",
+                            search_status="awaiting_approval",
+                            search_context_text=plan_json,
+                        )
+                    except Exception:
+                        _log.warning("chat conv=%s  deep search plan message persist failed", conversation_id, exc_info=True)
                 elif r.tool.value == "research" and r.ok:
-                    # research_plan event already emitted by the executor
-                    # with the structured plan object — just set context.
                     search_result.search_context = r.data
                     search_result.search_status = "awaiting_approval"
                     search_result.search_confidence = "pending"
+                    # Persist the plan as a message
+                    try:
+                        fresh = self.db.get_conversation(conversation_id) or {}
+                        plan_json = fresh.get("pending_research") or ""
+                        self.db.add_message(
+                            conversation_id=conversation_id,
+                            org_id=self.org_id,
+                            role="assistant",
+                            content=r.data,
+                            model="research_plan",
+                            search_status="awaiting_approval",
+                            search_context_text=plan_json,
+                        )
+                    except Exception:
+                        _log.warning("chat conv=%s  research plan message persist failed", conversation_id, exc_info=True)
         else:
             search_result = run_search_phase(
                 user_message=user_message,

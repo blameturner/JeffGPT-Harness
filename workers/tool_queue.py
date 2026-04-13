@@ -38,11 +38,12 @@ NOCODB_TABLE = "tool_jobs"
 # ---------------------------------------------------------------------------
 # Priority thresholds: a job only runs if enough seconds have elapsed since
 # the last chat/code activity for its priority tier.
-#   priority 1 (research):     120s  (2 min)
-#   priority 2 (deep search):  300s  (5 min)
-#   priority 3+  (enrichment): 600s  (10 min)
-_PRIORITY_BACKOFF: dict[int, float] = {1: 120, 2: 300}
-_DEFAULT_BACKOFF = 600.0  # priority 3-5
+#   priority 1 (research):     30s  (user-requested, wait for stream to finish)
+#   priority 2 (deep search):  120s (user-requested, 2 min backoff for resources)
+#   priority 3  (normal):      120s (2 min)
+#   priority 4+ (enrichment):  600s (10 min, true background work)
+_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 120, 3: 120}
+_DEFAULT_BACKOFF = 600.0  # priority 4-5
 
 _last_chat_activity: float = 0.0
 _activity_lock = threading.Lock()
@@ -605,7 +606,7 @@ class ToolJobQueue:
                 # graph_extract: 7-16 min (LLM inference) → 4x
                 # research: up to 60 min (iterative multi-source) → 12x
                 job_type = row.get("type") or ""
-                _STALE_MULTIPLIERS = {"graph_extract": 4, "research": 12}
+                _STALE_MULTIPLIERS = {"graph_extract": 4, "deep_search": 8, "research": 12}
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
                     noco_id = row.get("Id")
@@ -1059,6 +1060,228 @@ def _handle_graph_extract(payload: dict) -> dict:
     return {"status": "ok"}
 
 
+def _handle_deep_search(payload: dict) -> dict:
+    """Deep search: scrape all URLs → T1 summarise each → synthesise → deliver.
+
+    Single pass (no iteration), but with a final synthesis step that produces
+    one coherent response from all sources.
+    """
+    import asyncio as _aio
+    from memory import remember
+    from workers.enrichment.models import model_call
+    from workers.chat.graph import extract_and_write_graph
+    from tools.framework.executors.web_search import _scrape_one, _summarise_one
+
+    plan = payload.get("plan") or {}
+    org_id = int(payload.get("org_id") or 0)
+    conversation_id = payload.get("conversation_id")
+
+    queries = plan.get("queries", [])
+    urls = plan.get("urls", [])
+    question = " ".join(queries[:3]) if queries else ""
+
+    if not urls or not org_id:
+        _log.info("queue deep_search: skipped — no urls or org  org=%d", org_id)
+        return {"status": "skipped", "error": "no urls or org"}
+
+    _log.info("queue deep_search: starting  org=%d  urls=%d  queries=%d",
+              org_id, len(urls), len(queries))
+
+    loop = _aio.new_event_loop()
+    all_summaries: list[dict] = []
+
+    try:
+        # 1. Scrape all URLs in parallel
+        try:
+            scraped = loop.run_until_complete(
+                _aio.gather(*[_scrape_one(r) for r in urls])
+            )
+        except Exception:
+            _log.error("queue deep_search: scrape failed", exc_info=True)
+            scraped = []
+
+        with_text = [s for s in scraped if s.get("text") and len(s["text"]) >= 200]
+        _log.info("queue deep_search: scraped  total=%d with_text=%d", len(scraped), len(with_text))
+
+        if not with_text:
+            _log.warning("queue deep_search: all sources empty")
+            if conversation_id:
+                try:
+                    from nocodb_client import NocodbClient
+                    db = NocodbClient()
+                    db.add_message(
+                        conversation_id=int(conversation_id),
+                        org_id=org_id,
+                        role="assistant",
+                        content=(
+                            "[Deep search failed]\n\n"
+                            "All sources returned empty content. "
+                            "Try different search queries or topics."
+                        ),
+                        model="deep_search",
+                        search_status="failed",
+                        search_confidence="none",
+                    )
+                except Exception:
+                    _log.error("queue deep_search: failure delivery failed", exc_info=True)
+            return {"status": "no_sources"}
+
+        # 2. Summarise each source with T1 secondary
+        for source in with_text:
+            try:
+                result = loop.run_until_complete(
+                    _summarise_one(source["url"], source["text"], question, "deep_search_summarise", priority=False)
+                )
+                summary_text = result.get("summary", "")
+                if summary_text and len(summary_text) >= 50:
+                    all_summaries.append({
+                        "url": source["url"],
+                        "title": source.get("title", ""),
+                        "summary": summary_text,
+                    })
+
+                    # Store each source to ChromaDB
+                    try:
+                        remember(
+                            text=summary_text,
+                            metadata={
+                                "url": source["url"],
+                                "type": "deep_search",
+                                "conversation_id": conversation_id,
+                            },
+                            org_id=org_id,
+                            collection_name="web_search",
+                        )
+                    except Exception:
+                        _log.warning("queue deep_search: chroma store failed  url=%s", source["url"][:60], exc_info=True)
+
+                    # Graph extraction per source
+                    try:
+                        extract_and_write_graph(
+                            f"Deep search source: {source['url']}",
+                            summary_text,
+                            conversation_id or 0,
+                            org_id,
+                        )
+                    except Exception:
+                        _log.debug("queue deep_search: graph extract failed  url=%s", source["url"][:60], exc_info=True)
+
+                    _log.info("queue deep_search: summarised  url=%s  chars=%d  total=%d",
+                              source["url"][:60], len(summary_text), len(all_summaries))
+            except Exception:
+                _log.warning("queue deep_search: summarise failed  url=%s", source["url"][:60], exc_info=True)
+
+    finally:
+        loop.close()
+
+    # 3. Synthesise a coherent response from all summaries
+    if not all_summaries:
+        _log.warning("queue deep_search: no summaries gathered")
+        if conversation_id:
+            try:
+                from nocodb_client import NocodbClient
+                db = NocodbClient()
+                db.add_message(
+                    conversation_id=int(conversation_id),
+                    org_id=org_id,
+                    role="assistant",
+                    content=(
+                        "[Deep search failed]\n\n"
+                        "Sources were found but none could be summarised successfully. "
+                        "Try different search queries or topics."
+                    ),
+                    model="deep_search",
+                    search_status="failed",
+                    search_confidence="none",
+                )
+            except Exception:
+                _log.error("queue deep_search: no-summaries delivery failed", exc_info=True)
+        return {"status": "no_summaries"}
+
+    evidence_block = ""
+    for i, s in enumerate(all_summaries, 1):
+        evidence_block += f"\n[{i}] {s['url']}\nTitle: {s['title']}\n{s['summary']}\n"
+
+    synth_prompt = (
+        f"You are synthesising web research results into a clear, comprehensive answer.\n\n"
+        f"SEARCH QUERIES: {', '.join(queries[:5])}\n\n"
+        f"Below are {len(all_summaries)} sources analysed in depth. "
+        f"Synthesise them into a well-structured response that:\n"
+        f"- Directly addresses the search queries\n"
+        f"- Cites sources by number [1], [2] etc.\n"
+        f"- Highlights key facts, data points, and conclusions\n"
+        f"- Notes any contradictions or gaps between sources\n"
+        f"- Distinguishes established facts from opinions\n\n"
+        f"SOURCES:\n{evidence_block[:19000]}"
+    )
+
+    _log.info("queue deep_search: synthesising  sources=%d", len(all_summaries))
+    report, synth_tokens = model_call("deep_search_synthesise", synth_prompt)
+    _log.info("queue deep_search: synthesis complete  tokens=%d  chars=%d", synth_tokens, len(report or ""))
+
+    if not report:
+        report = "Deep search synthesis failed. Individual source summaries were stored but could not be compiled."
+
+    # Store synthesis to ChromaDB
+    try:
+        remember(
+            text=f"DEEP SEARCH: {', '.join(queries[:3])}\n\n{report}",
+            metadata={
+                "type": "deep_search_report",
+                "queries": ", ".join(queries[:5]),
+                "sources": len(all_summaries),
+                "conversation_id": conversation_id,
+            },
+            org_id=org_id,
+            collection_name="web_search",
+        )
+    except Exception:
+        _log.error("queue deep_search: synthesis chroma store failed", exc_info=True)
+
+    # Graph extraction on synthesis
+    try:
+        extract_and_write_graph(
+            f"Deep search: {', '.join(queries[:3])}",
+            report[:8000],
+            conversation_id or 0,
+            org_id,
+        )
+    except Exception:
+        _log.debug("queue deep_search: synthesis graph extract failed", exc_info=True)
+
+    # Deliver to conversation
+    if conversation_id:
+        try:
+            from nocodb_client import NocodbClient
+            db = NocodbClient()
+            source_urls = "\n".join(f"[{i+1}] {s['url']}" for i, s in enumerate(all_summaries))
+            content = (
+                f"[Deep search complete]\n"
+                f"Sources analysed: {len(all_summaries)}\n\n"
+                f"{report}\n\n"
+                f"Sources:\n{source_urls}"
+            )
+            db.add_message(
+                conversation_id=int(conversation_id),
+                org_id=org_id,
+                role="assistant",
+                content=content[:16000],
+                model="deep_search",
+                tokens_input=0,
+                tokens_output=synth_tokens,
+                search_used=True,
+                search_status="completed",
+                search_confidence="high",
+                search_source_count=len(all_summaries),
+            )
+            _log.info("queue deep_search: delivered to conversation=%s  sources=%d", conversation_id, len(all_summaries))
+        except Exception:
+            _log.error("queue deep_search: delivery failed  conv=%s", conversation_id, exc_info=True)
+
+    _log.info("queue deep_search: complete  sources=%d  synth_tokens=%d", len(all_summaries), synth_tokens)
+    return {"status": "ok", "sources": len(all_summaries), "report_chars": len(report)}
+
+
 def _handle_research(payload: dict) -> dict:
     """Run iterative research: search → scrape → summarise → assess → refine → repeat.
 
@@ -1252,7 +1475,7 @@ def _handle_research(payload: dict) -> dict:
         objective=objective,
         source_count=len(all_summaries),
         iterations=iteration,
-        evidence_block=evidence_block[:20000],
+        evidence_block=evidence_block[:22000],
     )
 
     _log.info("queue research: synthesising  sources=%d  iterations=%d", len(all_summaries), iteration)
@@ -1308,7 +1531,7 @@ def _handle_research(payload: dict) -> dict:
                 conversation_id=int(conversation_id),
                 org_id=org_id,
                 role="assistant",
-                content=content[:8000],
+                content=content[:16000],
                 model="research",
                 tokens_input=0,
                 tokens_output=synth_tokens,

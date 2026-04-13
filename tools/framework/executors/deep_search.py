@@ -190,15 +190,16 @@ async def execute(params: dict, emit) -> ToolResult:
 
 
 async def _execute_approved_plan(params: dict, emit) -> ToolResult:
-    """Phase 2: Execute the approved plan by queuing all URLs."""
+    """Phase 2: Submit a single deep_search job to the tool queue.
+
+    The handler does scrape → summarise → synthesise internally
+    (same pattern as research), then delivers one coherent response.
+    """
     org_id = int(params.get("_org_id") or 0)
     conversation_id = params.get("_conversation_id")
     plan = params.get("_plan") or {}
 
-    queries = plan.get("queries", [])
-    urls = plan.get("urls", [])
-
-    if not urls:
+    if not plan.get("urls"):
         return ToolResult(
             tool=ToolName.DEEP_SEARCH, action_index=0, ok=False,
             data="No URLs in the approved plan.",
@@ -212,49 +213,40 @@ async def _execute_approved_plan(params: dict, emit) -> ToolResult:
             data="Tool job queue not available.",
         )
 
-    t0 = time.time()
-    job_ids: list[str] = []
-    for r in urls:
-        ids = tq.submit_pipeline(
-            url=r["url"],
-            org_id=org_id,
-            collection="web_search",
-            source="deep_search",
-            priority=2,
-            metadata={
-                "title": r.get("title", ""),
-                "snippet": r.get("snippet", ""),
-                "queries": queries,
-                "conversation_id": conversation_id,
-            },
-            summarise_function="deep_search_summarise",
-        )
-        job_ids.extend(ids)
+    job_id = tq.submit(
+        job_type="deep_search",
+        payload={
+            "plan": plan,
+            "org_id": org_id,
+            "conversation_id": conversation_id,
+        },
+        source="deep_search",
+        org_id=org_id,
+        priority=2,
+    )
 
-    elapsed = round(time.time() - t0, 2)
-    _log.info("deep_search executing  urls=%d jobs=%d elapsed=%.2fs", len(urls), len(job_ids), elapsed)
+    _log.info("deep_search job queued  conv=%s job=%s urls=%d",
+              conversation_id, job_id, len(plan["urls"]))
 
     # Clear the pending plan
     if conversation_id:
         try:
             from nocodb_client import NocodbClient
             db = NocodbClient()
-            db.update_conversation(int(conversation_id), {
-                "pending_deep_search": "",
-            })
+            db.update_conversation(int(conversation_id), {"pending_deep_search": ""})
         except Exception:
             _log.warning("failed to clear pending_deep_search  conv=%s", conversation_id, exc_info=True)
 
     emit({
         "type": "jobs_queued",
         "tool": "deep_search",
-        "message": f"Queued {len(urls)} sources for deep analysis.",
+        "message": f"Deep search queued with {len(plan['urls'])} sources. "
+                   f"A synthesised response will be delivered when analysis completes.",
         "status": "running",
     })
 
     return ToolResult(
         tool=ToolName.DEEP_SEARCH, action_index=0, ok=True,
-        data=f"Deep search approved and running. {len(urls)} sources queued for thorough analysis. "
-             f"Results will be delivered to this conversation as they complete.",
-        elapsed_s=elapsed,
+        data=f"Deep search approved and running. {len(plan['urls'])} sources will be "
+             f"analysed and a synthesised response delivered to this conversation.",
     )
