@@ -38,7 +38,7 @@ async def search_and_dedup(
     from tools.framework.executors.search.web_search import _search_one
     from workers.search.urls import _is_blocklisted
 
-    all_raw = await asyncio.gather(*[_search_one(q) for q in queries])
+    all_raw = await asyncio.gather(*[_search_one(q) for q in queries], return_exceptions=True)
     seen: set[str] = set(existing_urls or ())
     results: list[dict] = []
     for result_set in all_raw:

@@ -149,8 +149,6 @@ def _execute_approval(
             result.search_context = r.data
             result.search_status = "queued"
             result.search_confidence = "pending"
-            emit({"type": "jobs_queued", "tool": tool_label,
-                  "message": r.data, "status": "running"})
 
     return result
 

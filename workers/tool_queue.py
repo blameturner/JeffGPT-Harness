@@ -1114,14 +1114,14 @@ def _handle_deep_search(payload: dict) -> dict:
 
     evidence = build_evidence_block(all_summaries)
     synth_prompt = (
-        f"You are synthesising web research results into a clear, comprehensive answer.\n\n"
-        f"SEARCH QUERIES: {', '.join(queries[:5])}\n\n"
-        f"Below are {len(all_summaries)} sources analysed in depth. "
-        f"Synthesise them into a well-structured response that:\n"
-        f"- Directly addresses the search queries\n"
+        f"You are synthesising web research into a clear, comprehensive answer.\n\n"
+        f"USER QUESTION: {question}\n\n"
+        f"SEARCH QUERIES USED: {', '.join(queries[:5])}\n\n"
+        f"Below are {len(all_summaries)} sources. Synthesise into a response that:\n"
+        f"- Directly answers the user's question\n"
         f"- Cites sources by number [1], [2] etc.\n"
         f"- Highlights key facts, data points, and conclusions\n"
-        f"- Notes any contradictions or gaps between sources\n"
+        f"- Notes contradictions or gaps between sources\n"
         f"- Distinguishes established facts from opinions\n\n"
         f"SOURCES:\n{evidence[:18000]}"
     )
@@ -1150,7 +1150,7 @@ def _handle_research(payload: dict) -> dict:
     from tools.framework.executors.search.pipeline import (
         search_and_dedup, scrape_sources, summarise_sources,
         store_summaries, store_report, build_evidence_block,
-        deliver_to_conversation, MIN_USABLE_TEXT_CHARS,
+        deliver_to_conversation,
     )
     from tools.framework.executors.search.research import (
         assess_progress, MAX_ITERATIONS, MAX_SOURCES_PER_ITERATION,

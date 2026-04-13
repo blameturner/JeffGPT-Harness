@@ -13,7 +13,7 @@
     "deep_search_synthesise":     { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 2000, "max_input_chars": 20000 },
     "chat_summarise":             { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000, "frequency_penalty": 0.2 },
     "research_queries":           { "role": "t3_tool",     "temperature": 0.3, "max_tokens": 600,  "max_input_chars": 3000 },
-    "research_assess":            { "role": "t3_tool",     "temperature": 0.1, "max_tokens": 400,  "max_input_chars": 4000 },
+    "research_assess":            { "role": "t3_tool",     "temperature": 0.1, "max_tokens": 400,  "max_input_chars": 12000 },
     "research_summarise":         { "role": "t1_secondary","temperature": 0.2, "max_tokens": 1000, "max_input_chars": 16000 },
     "research_synthesise":        { "role": "t1_secondary","temperature": 0.3, "max_tokens": 4000, "max_input_chars": 24000 },
     "enrichment_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000, "frequency_penalty": 0.2 },

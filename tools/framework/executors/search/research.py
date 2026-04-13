@@ -168,6 +168,8 @@ def assess_progress(objective: str, lookout: list[str], criteria: list[str],
         _log.warning("assessment unparseable — treating as incomplete")
         return _INCOMPLETE
 
+    raw_complete = result.get("complete")
+    result["complete"] = raw_complete is True or str(raw_complete).lower() == "true"
     return result
 
 
