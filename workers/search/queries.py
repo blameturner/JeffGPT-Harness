@@ -350,7 +350,8 @@ _TRAILING_FLUFF = re.compile(r"[?.!,;:]+$")
 
 _FILLER_SENTENCE = re.compile(
     r"^(okay|ok|cool|sure|surely|yes|yeah|right|nice|great|awesome|thanks|"
-    r"hey|hi|hello|well|anyway|actually|basically|alright|got it|sounds good)"
+    r"hey|hi|hello|well|anyway|actually|basically|alright|got it|sounds good|"
+    r"i would like to work with you|i want to work with you|let's work on)"
     r"[^.!?]*[.!?]\s*",
     re.IGNORECASE,
 )
@@ -493,16 +494,22 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     phrases = _extract_phrases(cleaned)
     qtype = _detect_question_type(lower)
 
+    # For long messages (conversational paragraphs, not concise questions),
+    # the raw core is too noisy for SearXNG.  Switch to entity/keyword
+    # queries only — skip the raw core entirely.
+    long_message = len(core) > 150
+
     # ---- Phase 3: Build queries, most specific first ----
     queries: list[str] = []
 
     # --- Q1: Core topic (cleaned of framing) ---
-    # This is usually the single best query.
-    queries.append(core)
+    # Skip for long messages — the raw text is too noisy for SearXNG.
+    if not long_message:
+        queries.append(core)
 
     # --- Q2: Core topic with entities quoted ---
     # Keeps multi-word names together so SearXNG treats them as phrases.
-    if entities:
+    if entities and not long_message:
         quoted_core = core
         for entity in entities:
             if entity in quoted_core and f'"{entity}"' not in quoted_core:
@@ -537,8 +544,12 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
             queries.append(f'"{longest}"')
 
     # --- Q5: Question-type specific reformulation ---
+    # Skip for long messages — question-type detection on paragraphs
+    # produces nonsense ("Hetzner Server vs Intel Xeon" from "better").
     topic_str = " ".join(keywords[:5]) if keywords else core
-    if qtype == "howto":
+    if long_message:
+        pass
+    elif qtype == "howto":
         queries.append(f"how to {topic_str}")
     elif qtype == "comparison" and len(entities) >= 2:
         queries.append(f'"{entities[0]}" vs "{entities[1]}"')

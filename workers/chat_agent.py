@@ -337,7 +337,7 @@ class ChatAgent:
                     search_result.search_confidence = "high"
                 elif r.tool.value == "web_search" and not r.ok:
                     search_result.search_status = "no_results"
-                    search_result.search_confidence = "failed"
+                    search_result.search_confidence = "none"
                     search_result.search_note = (
                         "Web search was attempted but found no relevant results. "
                         "Answer from your own knowledge, and suggest 1-2 specific "

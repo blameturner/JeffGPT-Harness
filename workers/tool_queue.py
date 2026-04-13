@@ -104,7 +104,7 @@ class ToolJob:
             "source": self.source,
             "org_id": self.org_id,
             "payload_json": json.dumps(self.payload),
-            "result_json": json.dumps(self.result) if self.result else "",
+            "result_json": json.dumps(self.result) if self.result else "{}",
             "error": self.error,
             "claimed_by": self.claimed_by,
             "started_at": self.started_at,
