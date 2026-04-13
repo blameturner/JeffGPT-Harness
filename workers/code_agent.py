@@ -11,7 +11,7 @@ from typing import Iterator, Literal
 
 import requests
 
-from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, no_think_params
+from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, is_feature_enabled
 from workers.search.temporal import build_temporal_context
 from memory import remember
 from rag import retrieve
@@ -20,6 +20,7 @@ from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
 from workers.chat_agent import ChatAgent
+from workers.chat.history import maybe_summarise
 from workers.styles import code_style_prompt
 
 _log = logging.getLogger("code")
@@ -91,9 +92,10 @@ def _files_to_storage(files: list[dict] | None) -> list[dict]:
     return out
 
 
-def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> list[str]:
+def _parse_plan_checklist(plan_text: str) -> list[str]:
     if not plan_text.strip():
         return []
+    from workers.enrichment.models import model_call
     prompt = (
         "Extract the concrete step-by-step actions from this engineering "
         "plan as a JSON array of short strings (one per step, ≤ 15 words "
@@ -101,19 +103,9 @@ def _parse_plan_checklist(plan_text: str, fast_url: str, fast_model: str) -> lis
         f"PLAN:\n{plan_text[:6000]}"
     )
     try:
-        resp = requests.post(
-            f"{fast_url}/v1/chat/completions",
-            json={
-                "model": fast_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 400,
-                **no_think_params(),
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw, _tokens = model_call("tool_planner", prompt, max_tokens=400, temperature=0.0)
+        if not raw:
+            return []
         match = re.search(r"\[.*\]", raw, re.S)
         if not match:
             return []
@@ -264,6 +256,7 @@ class CodeAgent(ChatAgent):
         # so ops can disable the whole pipeline in one place. Emits tool_status
         # events through the same STORE channel the frontend already handles.
         tool_context: ToolContext = ToolContext()
+        web_search_enabled = is_feature_enabled("web_search")
         if TOOLS_FRAMEWORK_ENABLED:
             last_assistant = ""
             for turn in reversed(history):
@@ -275,8 +268,10 @@ class CodeAgent(ChatAgent):
                 conversation_context=last_assistant,
                 mode="code",
             )
-            _log.info("tools gate  conv=%s mode=%s hints=%s",
-                      conversation_id, self.mode, sorted(hints) or "[]")
+            if not web_search_enabled:
+                hints.discard("web_search")
+            _log.info("tools gate  conv=%s mode=%s hints=%s web_search=%s",
+                      conversation_id, self.mode, sorted(hints) or "[]", web_search_enabled)
 
             if hints:
                 tool_labels = {
@@ -383,6 +378,10 @@ class CodeAgent(ChatAgent):
                 )
             except Exception:
                 _log.error("user message persist failed", exc_info=True)
+
+        history, summary_event = maybe_summarise(history)
+        if summary_event:
+            emit(summary_event)
 
         payload: list[dict] = [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
@@ -497,15 +496,13 @@ class CodeAgent(ChatAgent):
                     _log.error("graph extraction failed  conv=%s", conversation_id, exc_info=True)
 
             if self.mode == "plan" and output and conversation_id is not None:
-                tool_url, tool_model = self._tool_model_url()
-                if tool_url:
-                    try:
-                        checklist_steps = _parse_plan_checklist(output, tool_url, tool_model)
-                        if checklist_steps:
-                            self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
-                            _log.info("bg: checklist persisted  conv=%s steps=%d", conversation_id, len(checklist_steps))
-                    except Exception:
-                        _log.error("bg: checklist failed  conv=%s", conversation_id, exc_info=True)
+                try:
+                    checklist_steps = _parse_plan_checklist(output)
+                    if checklist_steps:
+                        self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
+                        _log.info("bg: checklist persisted  conv=%s steps=%d", conversation_id, len(checklist_steps))
+                except Exception:
+                    _log.error("bg: checklist failed  conv=%s", conversation_id, exc_info=True)
 
         threading.Thread(target=_post_turn_work, daemon=True).start()
 

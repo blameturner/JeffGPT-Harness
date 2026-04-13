@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class ToolName(str, Enum):
     WEB_SEARCH = "web_search"
+    DEEP_SEARCH = "deep_search"
     RAG_LOOKUP = "rag_lookup"
     CODE_EXEC = "code_exec"
 

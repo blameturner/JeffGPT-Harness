@@ -76,7 +76,9 @@ def _sem_for(role: str) -> threading.Semaphore:
     with _role_sem_lock:
         sem = _role_semaphores.get(role)
         if sem is None:
-            sem = threading.Semaphore(MODEL_PARALLEL_SLOTS)
+            from config import ROLE_PARALLEL_SLOTS
+            slots = ROLE_PARALLEL_SLOTS.get(role, MODEL_PARALLEL_SLOTS)
+            sem = threading.Semaphore(slots)
             _role_semaphores[role] = sem
         return sem
 

@@ -26,8 +26,9 @@ _log = logging.getLogger("tools.planner")
 
 
 SYSTEM_PROMPT = """Output ONLY valid JSON. No markdown, no prose.
-Tools: web_search(queries:[str]), rag_lookup(query:str), code_exec(language:str,code:str)
-web_search: 2-3 DIVERSE queries targeting different aspects.
+Tools: web_search(queries:[str]), deep_search(queries:[str]), rag_lookup(query:str), code_exec(language:str,code:str)
+web_search: quick inline search, 2-3 DIVERSE queries. Results in seconds. Use for direct user questions.
+deep_search: broad background research, 4-6 queries, results queued for later. Use when user asks to research/investigate/deep dive.
 rag_lookup: only when user references prior conversations.
 code_exec: only when user wants to RUN code, not write/show code.
 Max 4 actions. "summary": one sentence shown to user.
@@ -35,6 +36,9 @@ Max 4 actions. "summary": one sentence shown to user.
 
 User: What's the latest RBA rate decision?
 {"actions":[{"tool":"web_search","params":{"queries":["RBA cash rate decision latest","Australian interest rate announcement","RBA board statement inflation"]},"reason":"current policy"}],"summary":"Checking the latest RBA rate decision..."}
+
+User: Research the latest developments in RWKV architecture
+{"actions":[{"tool":"deep_search","params":{"queries":["RWKV architecture latest developments 2025","RWKV v6 v7 improvements","RWKV vs transformer performance comparison","RWKV inference deployment"]},"reason":"broad research"}],"summary":"Researching RWKV developments..."}
 
 User: What did we discuss about auth?
 {"actions":[{"tool":"rag_lookup","params":{"query":"auth migration discussion"},"reason":"prior context"}],"summary":"Searching our previous discussions..."}

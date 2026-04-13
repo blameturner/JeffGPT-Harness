@@ -20,9 +20,27 @@ async def lifespan(app: FastAPI):
     app.state.queue = job_queue
     job_queue.start()
     _log.info("job queue running")
+
+    from workers.tool_queue import (
+        HandlerConfig, ToolJobQueue, _handle_scrape, _handle_summarise,
+        _set_instance,
+    )
+    tool_queue = ToolJobQueue()
+    tool_queue.register("scrape", HandlerConfig(
+        handler=_handle_scrape, max_workers=3, priority_default=3, dedup_key="url",
+    ))
+    tool_queue.register("summarise", HandlerConfig(
+        handler=_handle_summarise, max_workers=1, priority_default=3,
+    ))
+    _set_instance(tool_queue)
+    app.state.tool_queue = tool_queue
+    tool_queue.start()
+    _log.info("tool job queue running")
+
     _log.info("ready")
     try:
         yield
     finally:
+        tool_queue.stop()
         sched.shutdown(wait=False)
         _log.info("shutdown complete")

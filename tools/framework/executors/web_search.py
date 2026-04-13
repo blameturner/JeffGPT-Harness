@@ -31,14 +31,10 @@ import asyncio
 import logging
 import time
 
-import httpx
-
-from config import no_think_params
+from config import get_function_config
 from tools.framework.contract import ToolName, ToolResult
 from tools.framework.dispatcher import register_executor
-from workers.enrichment.models import _assert_not_reasoner
 from workers.search.engine import PER_PAGE_CHAR_CAP, searxng_search
-from workers.search.models import acquire_model
 
 _log = logging.getLogger("tools.web_search")
 
@@ -47,13 +43,6 @@ MAX_URLS_TO_PROCESS = 10
 MAX_EXTRACT_CHARS = min(4000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
-SUMMARY_TIMEOUT = 3600.0
-
-
-_SUMMARISE_SYSTEM = (
-    "You are a concise summariser. Output only the summary, no preamble, "
-    "no markdown fences."
-)
 
 
 # ---------------- SearXNG ----------------
@@ -123,17 +112,20 @@ async def _scrape_one(item: dict) -> dict:
 # ---------------- Summarisation ----------------
 
 async def _summarise_one(
-    client: httpx.AsyncClient,
     url: str,
     text: str,
     user_query: str,
 ) -> str:
     """
-    Summarise one scraped page via the tool model. Uses acquire_model so
-    pick + slot are atomic and load-aware across t3_tool → t1 → t2.
+    Summarise one scraped page via RWKV (exp_rwkv_r) using the config-driven
+    model_call dispatch.  Runs synchronously in a thread so the async executor
+    can fire multiple summaries concurrently without blocking the event loop.
     """
     if len(text) < 100:
         return text[:MAX_SUMMARY_CHARS]
+
+    cfg = get_function_config("search_summarise")
+    max_input = cfg.get("max_input_chars", 12000)
 
     prompt = (
         f"Summarise the following web page content. Focus ONLY on information "
@@ -143,36 +135,16 @@ async def _summarise_one(
         f"- Include specific facts, numbers, dates, names.\n"
         f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n\n"
         f"URL: {url}\n\n"
-        f"Content:\n{text}"
+        f"Content:\n{text[:max_input]}"
     )
 
     try:
-        with acquire_model("tool") as (tool_url, tool_model_id):
-            if not tool_url:
-                _log.warning("no tool model available for summarise url=%s", url)
-                return text[:MAX_SUMMARY_CHARS]
-            _assert_not_reasoner(tool_url)
-            _log.info("summarise start  url=%s model=%s", url[:80], tool_model_id)
-            payload = {
-                "messages": [
-                    {"role": "system", "content": _SUMMARISE_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": 600,
-                "temperature": 0.1,
-                **no_think_params(),
-            }
-            if tool_model_id:
-                payload["model"] = tool_model_id
-            resp = await client.post(
-                f"{tool_url}/v1/chat/completions",
-                json=payload,
-                timeout=SUMMARY_TIMEOUT,
-            )
-            resp.raise_for_status()
-        summary = resp.json()["choices"][0]["message"]["content"].strip()
-        _log.info("summarise ok  url=%s chars=%d", url[:80], len(summary))
-        return summary[:MAX_SUMMARY_CHARS] if summary else text[:MAX_SUMMARY_CHARS]
+        from workers.enrichment.models import model_call
+        summary, _tokens = await asyncio.to_thread(
+            model_call, "search_summarise", prompt, True,  # priority=True
+        )
+        _log.info("summarise ok  url=%s chars=%d", url[:80], len(summary or ""))
+        return (summary or text)[:MAX_SUMMARY_CHARS]
     except Exception as e:
         _log.warning("summarise failed  url=%s: %s %r", url[:80], type(e).__name__, e)
         return text[:MAX_SUMMARY_CHARS]
@@ -230,21 +202,20 @@ async def execute(params: dict, emit) -> ToolResult:
     scraped = await asyncio.gather(*[_scrape_one(r) for r in results])
 
     if mode == "deep":
-        # Deep search: summarise each page through the tool model for higher quality.
+        # Deep search: summarise each page through RWKV for higher quality.
         to_summarise = [s for s in scraped if s["text"] and len(s["text"]) >= 300]
         summaries: list[str] = []
         if to_summarise:
             _sem = asyncio.Semaphore(2)
 
-            async def _bounded_summarise(client, url, text, query):
+            async def _bounded_summarise(url, text, query):
                 async with _sem:
-                    return await _summarise_one(client, url, text, query)
+                    return await _summarise_one(url, text, query)
 
-            async with httpx.AsyncClient() as client:
-                summaries = await asyncio.gather(*[
-                    _bounded_summarise(client, s["url"], s["text"], " | ".join(queries))
-                    for s in to_summarise
-                ])
+            summaries = await asyncio.gather(*[
+                _bounded_summarise(s["url"], s["text"], " | ".join(queries))
+                for s in to_summarise
+            ])
         short_items = [s for s in scraped if s not in to_summarise and s["text"]]
         short_summaries = [s["text"][:MAX_SUMMARY_CHARS] for s in short_items]
         combined_items = to_summarise + short_items

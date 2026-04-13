@@ -29,6 +29,12 @@ _RAG_LOOKUP = re.compile(
     re.I,
 )
 
+_DEEP_SEARCH = re.compile(
+    r"\b(deep\s+search|research\s+(?:this|the|into)|investigate|thorough|"
+    r"comprehensive|in[- ]depth|deep\s+dive)\b",
+    re.I,
+)
+
 _CODE_EXEC = re.compile(
     # "run this <optional adjective> (code|script|program|snippet)"
     r"\b(run|execute|eval)\b[^.?!]{0,40}\b(this|that|the)\b(\s+\w+){0,2}\s+(code|script|program|snippet)\b"
@@ -162,6 +168,8 @@ def gate_check(
     hints: set[str] = set()
     if _explicit_search_intent(msg)[0] or _EXTRA_SEARCH.search(msg):
         hints.add("web_search")
+    if _DEEP_SEARCH.search(msg):
+        hints.add("deep_search")
     if _RAG_LOOKUP.search(msg):
         hints.add("rag_lookup")
     if _CODE_EXEC.search(msg) or "```" in msg:

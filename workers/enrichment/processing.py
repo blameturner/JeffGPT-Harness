@@ -10,7 +10,7 @@ from config import CATEGORY_COLLECTIONS
 from memory import remember
 from workers.crawler import check_robots, compute_next_crawl_at, expand_frontier, fan_out
 from workers.enrichment.db import EnrichmentDB
-from workers.enrichment.models import model_call
+from workers.enrichment.models import _tool_call, model_call
 from workers.enrichment.quality import _content_hash, _validate_content
 from workers.enrichment.relationships import _extract_relationships
 from workers.enrichment.sources import _discover_sources
@@ -168,58 +168,74 @@ def _process_source(
         db.log_event(cycle_id, "budget_exhausted", org_id, target_id, url)
         return total_tokens
 
-    # summarise + relationships share the fast model — serialise them so the
-    # harness-side slot semaphore doesn't fight itself. discover_sources hits
-    # the tool model and runs concurrently with the fast-model pair via fan_out.
-    def _fast_pair():
-        s = _summarise(text)
-        r = _extract_relationships(text, org_id)
-        return s, r
-
+    # Relationships + source discovery run in parallel via fan_out.
+    # Summarisation is delegated to the tool job queue (async, RWKV model).
     fanout_results = fan_out(
         [
-            _fast_pair,
+            lambda: _extract_relationships(text, org_id),
             lambda: _discover_sources(text, url, org_id, cycle_id, db),
         ],
         label="process_source",
         max_workers=2,
     )
-    fast_pair_result, disc_result = fanout_results
+    rels_result, disc_result = fanout_results
 
-    if fast_pair_result is None:
-        summary, s_tokens, rels, r_tokens = "", 0, 0, 0
-    else:
-        summary_result, rels_result = fast_pair_result
-        summary, s_tokens = summary_result if summary_result else ("", 0)
-        rels, r_tokens = rels_result if rels_result else (0, 0)
+    rels, r_tokens = rels_result if isinstance(rels_result, tuple) else (0, 0)
     d_tokens = disc_result if isinstance(disc_result, int) else 0
-    total_tokens += s_tokens + r_tokens + d_tokens
+    total_tokens += r_tokens + d_tokens
 
-    if not summary:
-        _log.warning("source %s summariser returned empty for %s", target_id, url)
-        db.log_event(cycle_id, "source_error", org_id, target_id, url, "summariser failed")
-        return total_tokens
-
-    chunks = 0
-    try:
-        ids = remember(
-            text=summary,
-            metadata={
+    # Delegate summarisation + ChromaDB storage to the tool job queue.
+    # The queue summarise handler calls model_call("search_summarise") via RWKV
+    # and stores the result in ChromaDB, decoupling model load from the
+    # enrichment cycle.
+    from workers.tool_queue import get_tool_queue
+    tq = get_tool_queue()
+    if tq:
+        tq.submit(
+            job_type="summarise",
+            payload={
+                "text": text[:12000],
+                "query": source.get("name") or url,
                 "url": url,
-                "name": source.get("name") or url,
-                "category": category,
-                "fetched_at": time.time(),
-                "cycle_id": cycle_id,
+                "org_id": org_id,
+                "collection": collection,
+                "metadata": {
+                    "url": url,
+                    "name": source.get("name") or url,
+                    "category": category,
+                    "fetched_at": time.time(),
+                    "cycle_id": cycle_id,
+                },
             },
+            source="enrichment",
             org_id=org_id,
-            collection_name=collection,
+            priority=4,
         )
-        chunks = len(ids or [])
-    except Exception as e:
-        db.log_event(cycle_id, "source_error", org_id, target_id, url, f"chroma: {e}")
-        return total_tokens
+        _log.info("source %s summarisation queued for %s", target_id, url[:60])
+    else:
+        # Fallback: inline summarise if queue not running
+        summary, s_tokens = _summarise(text)
+        total_tokens += s_tokens
+        if summary:
+            try:
+                remember(
+                    text=summary,
+                    metadata={
+                        "url": url,
+                        "name": source.get("name") or url,
+                        "category": category,
+                        "fetched_at": time.time(),
+                        "cycle_id": cycle_id,
+                    },
+                    org_id=org_id,
+                    collection_name=collection,
+                )
+            except Exception as e:
+                db.log_event(cycle_id, "source_error", org_id, target_id, url, f"chroma: {e}")
+        else:
+            _log.warning("source %s summariser returned empty for %s", target_id, url)
 
-    # external-domain discoveries handled above by _discover_sources in the fan-out batch
+    # Frontier expansion (internal links)
     children_created = 0
     if total_tokens < budget_remaining:
         children_created, _child_tokens = expand_frontier(
@@ -242,7 +258,6 @@ def _process_source(
         target_id,
         last_scraped_at=now_utc.isoformat(),
         content_hash=new_hash,
-        chunk_count=chunks,
         status="ok",
         consecutive_unchanged=0,
         consecutive_failures=0,
@@ -250,16 +265,15 @@ def _process_source(
         next_crawl_at=next_at.isoformat(),
     )
     elapsed = round(time.time() - started, 2)
-    _log.info("source %s done  url=%s chunks=%d rels=%d tokens=%d %.1fs",
-              target_id, url, chunks, rels, total_tokens, elapsed)
+    _log.info("source %s done  url=%s rels=%d tokens=%d %.1fs",
+              target_id, url, rels, total_tokens, elapsed)
     db.log_event(
         cycle_id, "source_scraped", org_id, target_id, url,
         message=(
             f"rels={rels} class={vr['classification']} "
             f"code={vr['reason_code']} path={fetch_path} "
-            f"len={len(text)}"
+            f"len={len(text)} summarise=queued"
         ),
-        chunks_stored=chunks,
         tokens_used=total_tokens,
         duration_seconds=elapsed,
         flags=validator_flags,

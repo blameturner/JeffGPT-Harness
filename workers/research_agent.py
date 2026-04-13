@@ -140,17 +140,16 @@ def run_research(
     # 4. Summarise each source through tool model
     _sem = asyncio.Semaphore(RESEARCH_SUMMARY_CONCURRENCY)
 
-    async def _bounded(client, url, text, query):
+    async def _bounded(url, text, query):
         async with _sem:
-            return await _summarise_one(client, url, text, query)
+            return await _summarise_one(url, text, query)
 
     try:
         async def _summarise_all():
-            async with httpx.AsyncClient() as client:
-                return await asyncio.gather(*[
-                    _bounded(client, s["url"], s["text"], question)
-                    for s in with_text
-                ])
+            return await asyncio.gather(*[
+                _bounded(s["url"], s["text"], question)
+                for s in with_text
+            ])
         summaries = asyncio.run(_summarise_all())
     except Exception:
         _log.error("research summarisation failed", exc_info=True)

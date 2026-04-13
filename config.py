@@ -29,6 +29,7 @@ _DEFAULT_MODELS: dict[str, dict] = {
     "enrichment_quality":        {"role": "t3_tool",   "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500},
     "enrichment_source_discovery": {"role": "t3_tool", "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
     "batch_summarise":           {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 24000},
+    "search_summarise":          {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000},
 }
 
 _DEFAULT_FEATURES: dict[str, bool] = {
@@ -294,6 +295,16 @@ REASONER_ROLE = "reasoner"
 
 # Bounds concurrent in-flight model calls to match llama.cpp's --parallel N.
 MODEL_PARALLEL_SLOTS = int(os.getenv("MODEL_PARALLEL_SLOTS", "2"))
+
+# Per-role overrides for MODEL_PARALLEL_SLOTS.  Roles not listed here fall
+# back to the global MODEL_PARALLEL_SLOTS value.
+ROLE_PARALLEL_SLOTS: dict[str, int] = {
+    "t3_tool": int(os.getenv("MODEL_PARALLEL_SLOTS_T3_TOOL", "1")),
+}
+
+# Tool job queue defaults
+JOB_QUEUE_POLL_INTERVAL = float(os.getenv("JOB_QUEUE_POLL_INTERVAL", "5"))
+JOB_QUEUE_STALE_TIMEOUT = int(os.getenv("JOB_QUEUE_STALE_TIMEOUT", "300"))
 CATEGORY_COLLECTIONS = {
     "documentation": "scraped_documentation",
     "news": "scraped_news",
