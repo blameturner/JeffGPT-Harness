@@ -175,6 +175,10 @@ class CodeAgent(ChatAgent):
         def emit(event: dict):
             STORE.append(job, event)
 
+        # Signal active session so queue workers back off.
+        from workers.tool_queue import touch_chat_activity
+        touch_chat_activity()
+
         system_prompt = _SYSTEMS[self.mode]
         style_key, style_prompt = code_style_prompt(response_style)
 

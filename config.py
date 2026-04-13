@@ -29,7 +29,10 @@ _DEFAULT_MODELS: dict[str, dict] = {
     "enrichment_quality":        {"role": "t3_tool",   "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500},
     "enrichment_source_discovery": {"role": "t3_tool", "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
     "batch_summarise":           {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 24000},
-    "search_summarise":          {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000},
+    "web_search_summarise":      {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 400,  "max_input_chars": 12000},
+    "deep_search_summarise":     {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 16000},
+    "chat_summarise":            {"role": "exp_rwkv_r","temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000},
+    "research_summarise":        {"role": "t1_secondary","temperature": 0.2,"max_tokens": 1000, "max_input_chars": 16000},
 }
 
 _DEFAULT_FEATURES: dict[str, bool] = {

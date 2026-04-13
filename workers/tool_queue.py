@@ -32,6 +32,38 @@ _log = logging.getLogger("tool_queue")
 
 NOCODB_TABLE = "tool_jobs"
 
+# ---------------------------------------------------------------------------
+# Chat activity tracking — queue workers yield to active sessions
+# ---------------------------------------------------------------------------
+# Priority thresholds: a job only runs if enough seconds have elapsed since
+# the last chat/code activity for its priority tier.
+#   priority 1 (research):     120s  (2 min)
+#   priority 2 (deep search):  300s  (5 min)
+#   priority 3+  (enrichment): 600s  (10 min)
+_PRIORITY_BACKOFF: dict[int, float] = {1: 120, 2: 300}
+_DEFAULT_BACKOFF = 600.0  # priority 3-5
+
+_last_chat_activity: float = 0.0
+_activity_lock = threading.Lock()
+
+
+def touch_chat_activity():
+    """Call from chat/code endpoints to signal an active session."""
+    global _last_chat_activity
+    with _activity_lock:
+        _last_chat_activity = time.time()
+
+
+def seconds_since_chat() -> float:
+    with _activity_lock:
+        if _last_chat_activity == 0:
+            return float("inf")
+        return time.time() - _last_chat_activity
+
+
+def _backoff_for_priority(priority: int) -> float:
+    return _PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -253,6 +285,7 @@ class ToolJobQueue:
         source: str = "",
         priority: int = 3,
         metadata: dict | None = None,
+        summarise_function: str = "deep_search_summarise",
     ) -> list[str]:
         """Submit a scrape→summarise pipeline.  Returns [scrape_id, summarise_id]."""
         meta = metadata or {}
@@ -274,6 +307,7 @@ class ToolJobQueue:
                 "query": " ".join(meta.get("queries", [])) if meta.get("queries") else url,
                 "org_id": org_id,
                 "collection": collection,
+                "function_name": summarise_function,
                 "metadata": {
                     "url": url,
                     "name": meta.get("title") or url,
@@ -310,7 +344,28 @@ class ToolJobQueue:
         for jt, threads in self._workers.items():
             workers[jt] = sum(1 for t in threads if t.is_alive())
 
-        return {"counts": counts, "workers": workers}
+        idle = seconds_since_chat()
+        backoff_state = "active"
+        if idle >= _DEFAULT_BACKOFF:
+            backoff_state = "clear"
+        elif idle >= _PRIORITY_BACKOFF.get(2, 300):
+            backoff_state = "priority_1_2_only"
+        elif idle >= _PRIORITY_BACKOFF.get(1, 120):
+            backoff_state = "priority_1_only"
+
+        return {
+            "counts": counts,
+            "workers": workers,
+            "backoff": {
+                "state": backoff_state,
+                "idle_seconds": round(idle, 0),
+                "thresholds": {
+                    "research": _PRIORITY_BACKOFF.get(1, 120),
+                    "deep_search": _PRIORITY_BACKOFF.get(2, 300),
+                    "background": _DEFAULT_BACKOFF,
+                },
+            },
+        }
 
     def get_job(self, job_id: str) -> ToolJob | None:
         try:
@@ -405,9 +460,31 @@ class ToolJobQueue:
             if self._stop.is_set():
                 break
 
+            # Scrape jobs are I/O-only (no model) — skip backoff for them.
+            # Model-bound jobs (summarise etc.) must respect chat activity.
+            if job_type != "scrape":
+                idle = seconds_since_chat()
+                # Peek at next job priority to decide backoff threshold.
+                # If idle time is too short, skip this poll cycle.
+                min_backoff = _backoff_for_priority(config.priority_default)
+                if idle < min_backoff:
+                    _log.debug("worker %s backing off (idle=%.0fs < %.0fs)",
+                               worker_id, idle, min_backoff)
+                    continue
+
             job = self._claim_next(job_type, worker_id)
             if not job:
                 continue
+
+            # Per-job backoff check (job may have higher priority than default)
+            if job_type != "scrape":
+                idle = seconds_since_chat()
+                required = _backoff_for_priority(job.priority)
+                if idle < required:
+                    _log.debug("worker %s backoff for job priority=%d (idle=%.0fs < %.0fs)",
+                               worker_id, job.priority, idle, required)
+                    self._unclaim(job)
+                    continue
 
             # Dependency check
             if job.depends_on:
@@ -700,7 +777,9 @@ def _handle_scrape(payload: dict) -> dict:
 
 
 def _handle_summarise(payload: dict) -> dict:
-    """Summarise text via RWKV and store in ChromaDB."""
+    """Summarise text and store in ChromaDB.  Uses the function_name from
+    payload to select the right model config (deep_search_summarise,
+    enrichment_summarise, research_summarise, etc.)."""
     from config import get_function_config
     from workers.enrichment.models import model_call
 
@@ -710,28 +789,45 @@ def _handle_summarise(payload: dict) -> dict:
     org_id = int(payload.get("org_id") or 0)
     collection = payload.get("collection", "web_search")
     metadata = payload.get("metadata") or {}
+    function_name = payload.get("function_name", "deep_search_summarise")
 
     if not text or len(text) < 50:
         _log.debug("summarise handler: text too short for %s", url[:80])
         return {"summary": text, "chunks": 0}
 
-    cfg = get_function_config("search_summarise")
+    cfg = get_function_config(function_name)
     max_input = cfg.get("max_input_chars", 12000)
+    max_tokens = cfg.get("max_tokens", 300)
 
-    prompt = (
-        "Summarise the following web page content. Focus ONLY on information "
-        f"relevant to: {query}\n\n"
-        "Rules:\n"
-        "- Keep under 300 words.\n"
-        "- Include specific facts, numbers, dates, names.\n"
-        "- Skip navigation, boilerplate, cookie notices, unrelated content.\n\n"
-        f"URL: {url}\n\n"
-        f"Content:\n{text[:max_input]}"
-    )
+    # Deep/research summarise gets a more thorough prompt
+    if "deep" in function_name or "research" in function_name:
+        prompt = (
+            f"Provide a comprehensive analysis of the following web page. "
+            f"Focus on information relevant to: {query}\n\n"
+            f"Include:\n"
+            f"- Key facts, data points, statistics, dates\n"
+            f"- Main arguments or conclusions\n"
+            f"- Notable quotes or claims with attribution\n"
+            f"- Methodology or evidence quality where applicable\n"
+            f"- Any caveats, limitations, or biases\n\n"
+            f"URL: {url}\n\n"
+            f"Content:\n{text[:max_input]}"
+        )
+    else:
+        prompt = (
+            "Summarise the following web page content. Focus ONLY on information "
+            f"relevant to: {query}\n\n"
+            "Rules:\n"
+            "- Keep under 300 words.\n"
+            "- Include specific facts, numbers, dates, names.\n"
+            "- Skip navigation, boilerplate, cookie notices, unrelated content.\n\n"
+            f"URL: {url}\n\n"
+            f"Content:\n{text[:max_input]}"
+        )
 
-    summary, _tokens = model_call("search_summarise", prompt)
+    summary, _tokens = model_call(function_name, prompt)
     if not summary:
-        summary = text[:1500]
+        summary = text[:2000]
 
     chunks = 0
     if org_id and summary:
@@ -747,7 +843,7 @@ def _handle_summarise(payload: dict) -> dict:
         except Exception as e:
             _log.warning("ChromaDB store failed for %s: %s", url[:80], e)
 
-    return {"summary": summary[:1500], "chunks": chunks}
+    return {"summary": summary[:3000], "chunks": chunks}
 
 
 # ---------------------------------------------------------------------------

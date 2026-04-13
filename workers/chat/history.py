@@ -12,6 +12,8 @@ _log = logging.getLogger("chat.history")
 MAX_HISTORY_CHARS = 8_000          # hard cap on total history chars sent to model
 KEEP_RECENT_EXCHANGES = 3          # minimum full exchanges (user+assistant pairs) to preserve
 MAX_SINGLE_MESSAGE_CHARS = 2_000   # truncate any single message longer than this
+SUMMARISE_THRESHOLD_CHARS = 6_000  # trigger RWKV summarisation above this
+SUMMARISE_THRESHOLD_MESSAGES = 8   # or this many messages
 
 
 def _truncate_message(msg: dict) -> dict:
@@ -24,41 +26,86 @@ def _truncate_message(msg: dict) -> dict:
     return {**msg, "content": trimmed}
 
 
+def _total_chars(history: list[dict]) -> int:
+    return sum(len(m.get("content") or "") for m in history)
+
+
 def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
+    """Summarise older history via RWKV when it exceeds thresholds.
+
+    Keeps the most recent KEEP_RECENT_EXCHANGES exchanges verbatim.
+    Everything older gets compressed into a single [Conversation summary]
+    system message via the ``chat_summarise`` model config.
+
+    Falls back to truncation if the model call fails or is unavailable.
+    """
     if not history:
         return history, None
 
-    total_chars = sum(len(m.get("content") or "") for m in history)
+    total = _total_chars(history)
 
-    # If history is already small enough, just truncate individual long messages.
-    if total_chars <= MAX_HISTORY_CHARS and len(history) <= KEEP_RECENT_EXCHANGES * 2 + 2:
+    # Small enough — just truncate individual long messages, no summary needed.
+    if total <= SUMMARISE_THRESHOLD_CHARS and len(history) <= SUMMARISE_THRESHOLD_MESSAGES:
         return [_truncate_message(m) for m in history], None
 
-    _log.info(
-        "history trimming  messages=%d chars=%d cap=%d",
-        len(history), total_chars, MAX_HISTORY_CHARS,
-    )
-
-    # Keep the last N exchanges (user+assistant pairs).
-    # Walk backwards to find pair boundaries.
+    # Split: recent messages to keep verbatim, older messages to summarise.
     keep_count = min(len(history), KEEP_RECENT_EXCHANGES * 2)
+    older = history[:-keep_count] if keep_count < len(history) else []
     recent = history[-keep_count:]
 
-    # Truncate each kept message individually.
+    if not older:
+        # Not enough older messages to warrant summarisation — just truncate.
+        return [_truncate_message(m) for m in recent], None
+
+    # Build text block from older messages for summarisation.
+    older_text = ""
+    for m in older:
+        role = m.get("role", "user")
+        content = (m.get("content") or "")[:MAX_SINGLE_MESSAGE_CHARS]
+        older_text += f"{role}: {content}\n\n"
+
+    # Check if there's already a summary message we should preserve/extend.
+    existing_summary = ""
+    if older and older[0].get("role") == "system" and "[Conversation summary]" in (older[0].get("content") or ""):
+        existing_summary = older[0]["content"]
+        older_text = ""
+        for m in older[1:]:
+            role = m.get("role", "user")
+            content = (m.get("content") or "")[:MAX_SINGLE_MESSAGE_CHARS]
+            older_text += f"{role}: {content}\n\n"
+
+    if not older_text.strip() and existing_summary:
+        # Only the previous summary exists, no new messages to compress.
+        result = [{"role": "system", "content": existing_summary}] + [_truncate_message(m) for m in recent]
+        return result, None
+
+    # Call RWKV to summarise the older messages.
+    summary = _call_rwkv_summarise(older_text.strip(), existing_summary)
+
+    if summary:
+        summary_msg = {"role": "system", "content": f"[Conversation summary]\n{summary}"}
+        result = [summary_msg] + [_truncate_message(m) for m in recent]
+        event = {
+            "type": "summarised",
+            "removed": len(older),
+            "summary_chars": len(summary),
+            "fallback": False,
+        }
+        _log.info("history summarised  older=%d chars=%d summary=%d",
+                   len(older), _total_chars(older), len(summary))
+        return result, event
+
+    # Fallback: truncation only (RWKV unavailable or failed).
+    _log.warning("RWKV summarise failed — falling back to truncation")
     recent = [_truncate_message(m) for m in recent]
 
-    # If still over budget after keeping minimum exchanges, drop oldest kept pairs.
+    # Drop oldest kept pairs if still over budget.
     while len(recent) > 2:
-        chars = sum(len(m.get("content") or "") for m in recent)
-        if chars <= MAX_HISTORY_CHARS:
+        if _total_chars(recent) <= MAX_HISTORY_CHARS:
             break
-        # Drop oldest pair (user + assistant)
         recent = recent[2:] if len(recent) >= 4 else recent[-2:]
 
     dropped = len(history) - len(recent)
-    if dropped > 0:
-        _log.info("history trimmed  kept=%d dropped=%d", len(recent), dropped)
-
     event = None
     if dropped > 0:
         event = {
@@ -67,5 +114,35 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
             "summary_chars": 0,
             "fallback": True,
         }
-
     return recent, event
+
+
+def _call_rwkv_summarise(older_text: str, existing_summary: str) -> str | None:
+    """Call the RWKV model to compress conversation history."""
+    try:
+        from config import get_function_config
+        from workers.enrichment.models import model_call
+
+        cfg = get_function_config("chat_summarise")
+        max_input = cfg.get("max_input_chars", 16000)
+
+        parts = []
+        if existing_summary:
+            parts.append(f"Previous summary:\n{existing_summary}\n\n")
+        parts.append(f"New messages to incorporate:\n{older_text[:max_input]}")
+
+        prompt = (
+            "Compress the following conversation history into a concise factual summary. "
+            "Preserve: names, decisions, open questions, key facts, instructions, and "
+            "any context the user would need to continue the conversation.\n"
+            "Keep under 400 words. Output only the summary.\n\n"
+            + "".join(parts)
+        )
+
+        summary, _tokens = model_call("chat_summarise", prompt)
+        if summary and len(summary) > 20:
+            return summary.strip()
+        return None
+    except Exception:
+        _log.error("RWKV chat summarise failed", exc_info=True)
+        return None

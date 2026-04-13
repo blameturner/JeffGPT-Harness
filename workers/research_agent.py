@@ -137,12 +137,12 @@ def run_research(
 
     emit({"type": "research_status", "phase": "summarising", "message": f"Summarising {len(with_text)} sources..."})
 
-    # 4. Summarise each source through tool model
+    # 4. Summarise each source through RWKV
     _sem = asyncio.Semaphore(RESEARCH_SUMMARY_CONCURRENCY)
 
     async def _bounded(url, text, query):
         async with _sem:
-            return await _summarise_one(url, text, query)
+            return await _summarise_one(url, text, query, "web_search_summarise")
 
     try:
         async def _summarise_all():
@@ -150,15 +150,15 @@ def run_research(
                 _bounded(s["url"], s["text"], question)
                 for s in with_text
             ])
-        summaries = asyncio.run(_summarise_all())
+        summary_results = asyncio.run(_summarise_all())
     except Exception:
         _log.error("research summarisation failed", exc_info=True)
-        summaries = [s["text"][:MAX_SUMMARY_CHARS] for s in with_text]
+        summary_results = [{"summary": s["text"][:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "unknown"} for s in with_text]
 
     # 5. Build source list for citations
     sources_block = ""
-    for i, (s, summary) in enumerate(zip(with_text, summaries), 1):
-        sources_block += f"\n[{i}] {s['url']}\nTitle: {s['title']}\nSummary: {summary}\n"
+    for i, (s, sr) in enumerate(zip(with_text, summary_results), 1):
+        sources_block += f"\n[{i}] {s['url']}\nTitle: {s['title']}\nSummary: {sr['summary']}\n"
 
     emit({"type": "research_status", "phase": "synthesising", "message": "Synthesising research document..."})
 

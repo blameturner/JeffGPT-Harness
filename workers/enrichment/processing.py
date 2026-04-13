@@ -199,6 +199,7 @@ def _process_source(
                 "url": url,
                 "org_id": org_id,
                 "collection": collection,
+                "function_name": "enrichment_summarise",
                 "metadata": {
                     "url": url,
                     "name": source.get("name") or url,

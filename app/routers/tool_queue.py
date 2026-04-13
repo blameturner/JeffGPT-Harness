@@ -4,6 +4,9 @@ import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from workers.tool_queue import NOCODB_TABLE
 
 _log = logging.getLogger("main.tool_queue")
 
@@ -28,6 +31,7 @@ def list_jobs(
     request: Request,
     type: str = "",
     status: str = "",
+    source: str = "",
     limit: int = 50,
 ):
     q = _get_queue(request)
@@ -41,6 +45,30 @@ def get_job(job_id: str, request: Request):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job.to_api()
+
+
+class PriorityUpdate(BaseModel):
+    priority: int
+
+
+@router.patch("/jobs/{job_id}/priority")
+def update_priority(job_id: str, body: PriorityUpdate, request: Request):
+    q = _get_queue(request)
+    job = q.get_job(job_id)
+    if not job or job.status != "queued":
+        raise HTTPException(status_code=404, detail="Job not found or not queued")
+    # Update priority in NocoDB
+    try:
+        db = q._db()
+        if job.nocodb_id:
+            db._patch(NOCODB_TABLE, job.nocodb_id, {
+                "Id": job.nocodb_id,
+                "priority": max(1, min(5, body.priority)),
+            })
+            return {"updated": True, "priority": body.priority}
+    except Exception:
+        pass
+    raise HTTPException(status_code=500, detail="Failed to update priority")
 
 
 @router.delete("/jobs/{job_id}")
