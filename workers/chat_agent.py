@@ -206,7 +206,6 @@ class ChatAgent:
                     last_assistant = (turn.get("content") or "")[:800]
                     break
             search_mode = self._search_mode
-            has_queued_jobs = False
             _t_tools = time.perf_counter()
 
             # --- Approval handling runs BEFORE the gate check ---
@@ -259,7 +258,6 @@ class ChatAgent:
                         _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
                     for r in tool_context.results:
                         if r.tool.value == "deep_search" and r.ok:
-                            has_queued_jobs = True
                             search_result.search_context = r.data
                             search_result.search_status = "queued"
                             search_result.search_confidence = "pending"
@@ -296,7 +294,6 @@ class ChatAgent:
                         _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
                     for r in tool_context.results:
                         if r.tool.value == "research" and r.ok:
-                            has_queued_jobs = True
                             search_result.search_context = r.data
                             search_result.search_status = "queued"
                             search_result.search_confidence = "pending"
@@ -309,8 +306,14 @@ class ChatAgent:
 
             # --- Gate check for normal tool dispatch ---
             # Skip if approval already handled the request.
+            # When the user explicitly selected deep/research mode, bypass
+            # the gate check and search_enabled flag — they opted in.
             hints = set()
-            if search_mode not in _approval_modes:
+            if search_mode in _approval_modes:
+                pass  # approval already handled above
+            elif search_mode in ("deep", "research"):
+                hints.add("web_search")  # force web_search hint for explicit mode
+            else:
                 hints = gate_check(user_message, conversation_context=last_assistant)
                 if not web_search_enabled or not self.search_enabled:
                     hints.discard("web_search")

@@ -997,8 +997,11 @@ def _handle_summarise(payload: dict) -> dict:
 
 
 def _deliver_to_conversation(conversation_id: int, org_id: int, url: str, summary: str):
-    """Post the completed summary back to the conversation as a system message
-    so the frontend can display it and the chat history includes the result."""
+    """Post a completed deep search result back to the conversation.
+
+    Uses role="assistant" with model="deep_search" so the frontend renders
+    it as a visible message (system messages are typically hidden).
+    """
     try:
         from nocodb_client import NocodbClient
         db = NocodbClient()
@@ -1010,13 +1013,13 @@ def _deliver_to_conversation(conversation_id: int, org_id: int, url: str, summar
         db.add_message(
             conversation_id=conversation_id,
             org_id=org_id,
-            role="system",
+            role="assistant",
             content=content,
-            model="tool_queue",
+            model="deep_search",
             tokens_input=0,
             tokens_output=0,
             search_used=True,
-            search_status="used",
+            search_status="completed",
             search_confidence="high",
             search_source_count=1,
         )
@@ -1104,7 +1107,9 @@ def _handle_research(payload: dict) -> dict:
 
             # 1. Search
             try:
-                results = loop.run_until_complete(_search_all(queries))
+                from workers.search.urls import _is_blocklisted
+                raw_results = loop.run_until_complete(_search_all(queries))
+                results = [r for r in raw_results if not _is_blocklisted(r["url"])]
             except Exception:
                 _log.error("queue research: search failed iteration=%d", iteration, exc_info=True)
                 break
@@ -1143,7 +1148,7 @@ def _handle_research(payload: dict) -> dict:
                     break
                 try:
                     result = loop.run_until_complete(
-                        _summarise_one(source["url"], source["text"], question, "research_summarise")
+                        _summarise_one(source["url"], source["text"], question, "research_summarise", priority=False)
                     )
                     summary_text = result.get("summary", "")
                     if summary_text and len(summary_text) >= 50:
@@ -1222,7 +1227,7 @@ def _handle_research(payload: dict) -> dict:
                 db.add_message(
                     conversation_id=int(conversation_id),
                     org_id=org_id,
-                    role="system",
+                    role="assistant",
                     content=(
                         f"[Research failed]\n"
                         f"Question: {question}\n\n"
@@ -1302,7 +1307,7 @@ def _handle_research(payload: dict) -> dict:
             db.add_message(
                 conversation_id=int(conversation_id),
                 org_id=org_id,
-                role="system",
+                role="assistant",
                 content=content[:8000],
                 model="research",
                 tokens_input=0,

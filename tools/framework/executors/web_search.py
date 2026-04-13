@@ -175,13 +175,15 @@ async def _summarise_one(
     text: str,
     user_query: str,
     function_name: str = "web_search_summarise",
+    priority: bool = True,
 ) -> dict:
     """
-    Summarise one scraped page via RWKV (exp_rwkv_r) using the config-driven
-    model_call dispatch.  Returns {summary, relevance, source_type}.
+    Summarise one scraped page using the config-driven model_call dispatch.
+    Returns {summary, relevance, source_type}.
 
-    The RWKV prompt asks for a structured output so we get relevance scoring
-    without needing the tool model.
+    Uses a thorough analysis prompt for deep_search/research functions
+    (which run on T1 secondary), and a concise 300-word prompt for
+    normal web_search (which runs on RWKV).
     """
     if len(text) < 100:
         return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "snippet"}
@@ -189,24 +191,43 @@ async def _summarise_one(
     cfg = get_function_config(function_name)
     max_input = cfg.get("max_input_chars", 12000)
 
-    prompt = (
-        f"Summarise the following web page content. Focus ONLY on information "
-        f"relevant to: {user_query}\n\n"
-        f"Rules:\n"
-        f"- Keep under 300 words.\n"
-        f"- Include specific facts, numbers, dates, names.\n"
-        f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n"
-        f"- On the LAST line output ONLY: RELEVANCE: high|medium|low\n"
-        f"  (high = directly answers the query, medium = related context, "
-        f"low = tangential or mostly irrelevant)\n\n"
-        f"URL: {url}\n\n"
-        f"Content:\n{text[:max_input]}"
-    )
+    # Deep search and research use a thorough analysis prompt since
+    # they run on capable models (T1 secondary).
+    if "deep" in function_name or "research" in function_name:
+        prompt = (
+            f"Provide a comprehensive analysis of the following web page. "
+            f"Focus on information relevant to: {user_query}\n\n"
+            f"Include:\n"
+            f"- Key facts, data points, statistics, dates\n"
+            f"- Main arguments or conclusions\n"
+            f"- Notable quotes or claims with attribution\n"
+            f"- Methodology or evidence quality where applicable\n"
+            f"- Any caveats, limitations, or biases\n\n"
+            f"On the LAST line output ONLY: RELEVANCE: high|medium|low\n"
+            f"(high = directly answers the query, medium = related context, "
+            f"low = tangential or mostly irrelevant)\n\n"
+            f"URL: {url}\n\n"
+            f"Content:\n{text[:max_input]}"
+        )
+    else:
+        prompt = (
+            f"Summarise the following web page content. Focus ONLY on information "
+            f"relevant to: {user_query}\n\n"
+            f"Rules:\n"
+            f"- Keep under 300 words.\n"
+            f"- Include specific facts, numbers, dates, names.\n"
+            f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n"
+            f"- On the LAST line output ONLY: RELEVANCE: high|medium|low\n"
+            f"  (high = directly answers the query, medium = related context, "
+            f"low = tangential or mostly irrelevant)\n\n"
+            f"URL: {url}\n\n"
+            f"Content:\n{text[:max_input]}"
+        )
 
     try:
         from workers.enrichment.models import model_call
         raw, _tokens = await asyncio.to_thread(
-            model_call, function_name, prompt, True,  # priority=True
+            model_call, function_name, prompt, priority,
         )
         if not raw:
             return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "unknown"}

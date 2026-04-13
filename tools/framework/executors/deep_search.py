@@ -128,8 +128,11 @@ async def execute(params: dict, emit) -> ToolResult:
     t0 = time.time()
 
     # SearXNG in parallel to find candidate URLs
-    results = await _search_all(queries)
-    _log.info("deep_search searxng  queries=%d urls=%d", len(queries), len(results))
+    from workers.search.urls import _is_blocklisted
+    raw_results = await _search_all(queries)
+    results = [r for r in raw_results if not _is_blocklisted(r["url"])]
+    _log.info("deep_search searxng  queries=%d raw=%d after_blocklist=%d",
+              len(queries), len(raw_results), len(results))
 
     elapsed = round(time.time() - t0, 2)
 
