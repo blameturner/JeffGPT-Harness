@@ -1,17 +1,3 @@
-"""
-Web search executor — inline search with RWKV summarisation.
-
-Pipeline (all inline, no queue):
-  1. Up to 5 heuristic queries fired at SearXNG in parallel.
-  2. De-dupe by URL, scrape via `workers.search.scraping.scrape_page`.
-  3. Summarise pages via RWKV in batches (`web_search_summarise_batch`
-     config) with per-source relevance scoring (high/medium/low).
-     Pages that don't fit a batch fall back to single-page summarisation.
-  4. Store combined context in ChromaDB for RAG.
-
-No tool model (t3_tool) is involved — RWKV handles all summarisation.
-Scraping logic lives in `workers.search.scraping`, shared with enrichment.
-"""
 
 from __future__ import annotations
 
@@ -26,21 +12,16 @@ from tools.framework.dispatcher import register_executor
 from workers.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
-# --- Tunables ---
 MAX_URLS_TO_PROCESS = 5
 MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
 BATCH_TARGET = 5  # aim for this many pages per batch call
-# Minimum fraction of query keywords that must appear in a result's
-# title+snippet for it to pass the relevance filter (0.0 = no filter).
 RELEVANCE_KEYWORD_THRESHOLD = 0.25
 
 
-# ---------------- SearXNG ----------------
 
 async def _search_one(query: str) -> list[dict]:
-    """Run one SearXNG query via the existing engine helper, off-thread."""
     try:
         results = await asyncio.to_thread(
             searxng_search, query, SEARXNG_PER_QUERY,
@@ -52,7 +33,6 @@ async def _search_one(query: str) -> list[dict]:
 
 
 async def _search_all(queries: list[str]) -> list[dict]:
-    """Parallel SearXNG + URL de-dupe. Blocklist filtering is handled downstream by scrape_page."""
     all_results = await asyncio.gather(*[_search_one(q) for q in queries])
 
     seen: set[str] = set()
@@ -71,16 +51,9 @@ def _filter_results_by_relevance(
     results: list[dict],
     queries: list[str],
 ) -> list[dict]:
-    """Drop SearXNG results whose title+snippet share no meaningful keywords
-    with the search queries.  This prevents clearly off-topic pages from
-    being scraped and summarised (expensive).
-
-    Uses a lightweight keyword-overlap heuristic — no model calls.
-    """
     if not results or RELEVANCE_KEYWORD_THRESHOLD <= 0:
         return results
 
-    # Build the set of meaningful keywords from all queries.
     from workers.search.queries import _extract_keywords
     query_keywords: set[str] = set()
     for q in queries:
@@ -112,22 +85,10 @@ def _filter_results_by_relevance(
             "relevance_filter  kept=%d dropped=%d keywords=%d threshold=%.2f",
             len(kept), dropped, len(query_keywords), RELEVANCE_KEYWORD_THRESHOLD,
         )
-
-    # If ALL results are irrelevant, return empty — don't waste time
-    # scraping and summarising pages that have nothing to do with the query.
     return kept
 
 
-# ---------------- Scrape (delegates to shared pipeline) ----------------
-
 async def _scrape_one(item: dict) -> dict:
-    """
-    Delegate to workers.search.scraping.scrape_page via asyncio.to_thread.
-
-    Returns {url, title, text, path} where `path` is the fetch route tag
-    reported by scrape_page ("scraper", "playwright_auto", "pdf", "snippet"
-    etc. — see scrape_page source).
-    """
     from workers.search.scraping import scrape_page
 
     url = item["url"]
@@ -152,11 +113,7 @@ async def _scrape_one(item: dict) -> dict:
     }
 
 
-# ---------------- Summarisation ----------------
-
 def _parse_relevance(text: str) -> tuple[str, str]:
-    """Extract (summary_body, relevance) from RWKV output that ends with
-    ``RELEVANCE: high|medium|low``."""
     lines = text.strip().rsplit("\n", 1)
     relevance = "medium"
     summary = text.strip()
@@ -177,14 +134,6 @@ async def _summarise_one(
     function_name: str = "web_search_summarise",
     priority: bool = True,
 ) -> dict:
-    """
-    Summarise one scraped page using the config-driven model_call dispatch.
-    Returns {summary, relevance, source_type}.
-
-    Uses a thorough analysis prompt for deep_search/research functions
-    (which run on T1 secondary), and a concise 300-word prompt for
-    normal web_search (which runs on RWKV).
-    """
     if len(text) < 100:
         return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "snippet"}
 
@@ -245,15 +194,8 @@ def _build_batches(
     max_input: int,
     batch_target: int,
 ) -> list[list[dict]]:
-    """Group pages into batches that fit within max_input chars.
-
-    Each page dict has {url, text}. Batches aim for ``batch_target`` pages
-    but will split early when adding a page would exceed ``max_input``.
-    Oversized single pages get their own batch (they'll be truncated at
-    prompt-build time).
-    """
-    prompt_overhead = 400  # room for instructions, delimiters
-    per_page_overhead = 80  # URL header, separator per page
+    prompt_overhead = 400
+    per_page_overhead = 80
     budget = max_input - prompt_overhead
 
     batches: list[list[dict]] = []
@@ -283,19 +225,12 @@ async def _summarise_batch(
     pages: list[dict],
     user_query: str,
 ) -> list[dict]:
-    """Summarise multiple pages in a single RWKV call.
-
-    Falls back to individual ``_summarise_one`` calls if the batch response
-    can't be parsed (e.g. model only outputs partial markers).
-    """
     if len(pages) == 1:
         return [await _summarise_one(pages[0]["url"], pages[0]["text"], user_query)]
 
     cfg = get_function_config("web_search_summarise_batch")
     max_input = cfg.get("max_input_chars", 14000)
 
-    # Build multi-page prompt — each page already capped at MAX_EXTRACT_CHARS,
-    # so give each page its full text rather than dividing the budget.
     sections: list[str] = []
     for i, p in enumerate(pages, 1):
         sections.append(f"--- PAGE {i} ---\nURL: {p['url']}\n{p['text']}")
@@ -345,10 +280,7 @@ async def _summarise_batch(
 
 
 def _parse_batch_response(raw: str, expected: int) -> list[dict]:
-    """Parse a multi-page batch response into per-page dicts."""
-    # Split on PAGE N: markers
     parts = re.split(r"(?:^|\n)\s*PAGE\s+\d+\s*:\s*", raw, flags=re.IGNORECASE)
-    # First element is usually empty or preamble
     sections = [p.strip() for p in parts if p.strip()]
 
     results: list[dict] = []
@@ -363,7 +295,6 @@ def _parse_batch_response(raw: str, expected: int) -> list[dict]:
 
 
 async def _fallback_individual(pages: list[dict], user_query: str) -> list[dict]:
-    """Fallback: summarise pages individually when batch parsing fails."""
     _sem = asyncio.Semaphore(2)
 
     async def _bounded(p):
@@ -373,17 +304,10 @@ async def _fallback_individual(pages: list[dict], user_query: str) -> list[dict]
     return list(await asyncio.gather(*[_bounded(p) for p in pages]))
 
 
-# ---------------- Executor ----------------
 
 @register_executor(ToolName.WEB_SEARCH)
 async def execute(params: dict, emit) -> ToolResult:
-    """
-    Full web_search pipeline. See module docstring.
 
-    params:
-      queries: list[str]  — 1-3 planner-generated queries
-      _org_id: int        — injected by chat_agent for ChromaDB scoping
-    """
     raw_queries = params.get("queries") or []
     if isinstance(raw_queries, str):
         raw_queries = [raw_queries]
@@ -404,7 +328,6 @@ async def execute(params: dict, emit) -> ToolResult:
     emit({"type": "searching", "queries": queries})
     t0 = time.time()
 
-    # 1. Parallel SearXNG
     results = await _search_all(queries)
     _log.info("searxng  queries=%d urls_deduped=%d", len(queries), len(results))
 
@@ -419,8 +342,7 @@ async def execute(params: dict, emit) -> ToolResult:
             elapsed_s=round(time.time() - t0, 2),
         )
 
-    # 1b. Keyword-overlap filter — drop clearly off-topic results before
-    #     spending time scraping and summarising them.
+
     results = _filter_results_by_relevance(results, queries)
 
     if not results:
@@ -434,10 +356,8 @@ async def execute(params: dict, emit) -> ToolResult:
             elapsed_s=round(time.time() - t0, 2),
         )
 
-    # 2. Parallel scrape via the shared scrape_page pipeline
     scraped = await asyncio.gather(*[_scrape_one(r) for r in results])
 
-    # 3. Summarise pages via RWKV in batches — reduces model calls.
     with_text = [s for s in scraped if s["text"] and len(s["text"]) >= 100]
     query_str = " | ".join(queries)
 
@@ -463,7 +383,6 @@ async def execute(params: dict, emit) -> ToolResult:
         for br in batch_results:
             summary_results.extend(br)
 
-    # Include snippet-only items with low relevance
     snippet_only = [s for s in scraped if s["text"] and s not in with_text]
     for s in snippet_only:
         summary_results.append({
@@ -473,7 +392,6 @@ async def execute(params: dict, emit) -> ToolResult:
         })
     combined_items = with_text + snippet_only
 
-    # 4. Build combined context + per-source metadata for UI + ChromaDB.
     context_parts: list[str] = []
     sources_meta: list[dict] = []
     for s, sr in zip(combined_items, summary_results):
@@ -530,7 +448,6 @@ async def execute(params: dict, emit) -> ToolResult:
         "sources": sources_meta,
     })
 
-    # 5. Store combined context into ChromaDB for future RAG lookups.
     if combined:
         try:
             from memory import remember

@@ -1,24 +1,28 @@
+"""ChatAgent — orchestrates chat conversation turns.
+
+Inherits from BaseAgent for model calling, streaming, and utilities.
+Uses extracted modules for approval handling, background work, and streaming.
+"""
+
 import asyncio
 import json
 import logging
 import time
+import threading
 import uuid
-from dataclasses import dataclass
-from typing import Callable, Iterator
+from typing import Callable
 
-import requests
-
-from config import MODELS, TOOLS_FRAMEWORK_ENABLED, get_model_url, is_feature_enabled, refresh_models
-from nocodb_client import NocodbClient
+from config import TOOLS_FRAMEWORK_ENABLED, is_feature_enabled
 from memory import remember
 from tools.framework.contract import ToolAction, ToolContext, ToolName, ToolPlan
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
-from workers.search.queries import generate_broad_queries, generate_search_queries
+from workers.agents.base import BaseAgent, ChatResult, _get_summary_event, SUMMARY_WAIT_TIMEOUT
+from workers.agents.approval import APPROVAL_MODES, handle_approvals
+from workers.search.queries import generate_broad_queries
 from workers.styles import chat_style_prompt
 from workers.chat.history import maybe_summarise, extract_conversation_topics
-# graph extraction is now queued via tool_queue, not called directly
 from workers.chat.payload import build_chat_payload
 from workers.chat.search_phase import SearchPhaseResult, run_search_phase
 from workers.chat.rag_phase import submit_rag_future, collect_rag, cancel_rag
@@ -28,79 +32,12 @@ from workers.chat.persistence import (
     persist_assistant_message,
 )
 
-import threading
-
 _log = logging.getLogger("chat")
 
-# Per-conversation summarisation locks. When a background summary is running,
-# the event is cleared.  Next turn waits on it (with timeout) so the summary
-# is available for topic extraction and context.
-_summary_locks: dict[int, threading.Event] = {}
-_summary_locks_mu = threading.Lock()
 
-SUMMARY_WAIT_TIMEOUT = 30  # max seconds to wait for a running summary
-
-
-def _get_summary_event(conversation_id: int) -> threading.Event:
-    with _summary_locks_mu:
-        ev = _summary_locks.get(conversation_id)
-        if ev is None:
-            ev = threading.Event()
-            ev.set()  # not running by default
-            _summary_locks[conversation_id] = ev
-        return ev
-
-
-@dataclass
-class ChatResult:
-    output: str
-    model: str
-    conversation_id: int
-    tokens_input: int
-    tokens_output: int
-    duration_seconds: float
-    rag_enabled: bool
-    context_chars: int
-
-
-class ChatAgent:
-    def __init__(self, model: str, org_id: int, search_enabled: bool = False):
-        url = get_model_url(model)
-        if not url:
-            refresh_models()
-            url = get_model_url(model)
-        if not url:
-            options = sorted({
-                v["role"] for v in MODELS.values() if isinstance(v, dict)
-            })
-            raise ValueError(
-                f"Model '{model}' not available. Options: {options}"
-            )
-        self.model = model
-        self.org_id = org_id
-        self.url = url
-        self.search_enabled = search_enabled
-        self._search_mode = "normal"
-        self.db = NocodbClient()
-
-    @staticmethod
-    def _default_collection(conversation_id: int) -> str:
-        return f"chat_{conversation_id}"
-
-    @staticmethod
-    def _truthy(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return False
-
-    @staticmethod
-    def _tool_model_url() -> tuple[str | None, str | None]:
-        from workers.search.models import _tool_model
-        return _tool_model()
+class ChatAgent(BaseAgent):
+    # __init__, _truthy, _default_collection, _tool_model_url, _call_model,
+    # send, _search_mode all inherited from BaseAgent.
 
     def run_job(
         self,
@@ -209,136 +146,62 @@ class ChatAgent:
             _t_tools = time.perf_counter()
 
             # --- Approval handling runs BEFORE the gate check ---
-            # When the user approves a pending plan, the message text
-            # ("Approved", "Go ahead") won't trigger any gate hints.
-            # So we handle approvals independently.
-            _approval_modes = ("deep_approved", "research_approved")
-            pending_ds = convo.get("pending_deep_search") or ""
-            pending_rs = convo.get("pending_research") or ""
+            approval = handle_approvals(
+                db=self.db,
+                convo=convo,
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                search_mode=search_mode,
+                emit=emit,
+            )
+            if approval.handled:
+                tool_context = approval.tool_context
+                if approval.search_status:
+                    search_result.search_status = approval.search_status
+                    search_result.search_context = approval.search_context
+                    search_result.search_confidence = approval.search_confidence
 
-            # Clear stale plans when user moves on to something else
-            if search_mode not in ("deep_approved", "deep", "research_approved", "research"):
-                stale_clear = {}
-                if pending_ds:
-                    stale_clear["pending_deep_search"] = ""
-                    pending_ds = ""
-                if pending_rs:
-                    stale_clear["pending_research"] = ""
-                    pending_rs = ""
-                if stale_clear:
-                    try:
-                        self.db.update_conversation(conversation_id, stale_clear)
-                        _log.info("chat conv=%s  cleared stale pending plans: %s", conversation_id, sorted(stale_clear.keys()))
-                    except Exception:
-                        pass
-
-            def _mark_plan_approved(conv_id: int, plan_model: str):
-                """Update the plan message's search_status from awaiting_approval to approved."""
-                try:
-                    msgs = self.db.list_messages(conv_id)
-                    for m in reversed(msgs):
-                        if m.get("model") == plan_model and m.get("search_status") == "awaiting_approval":
-                            self.db._patch("messages", m["Id"], {
-                                "Id": m["Id"],
-                                "search_status": "approved",
-                            })
-                            _log.info("chat conv=%s  marked %s message as approved", conv_id, plan_model)
-                            break
-                except Exception:
-                    _log.warning("chat conv=%s  failed to mark %s as approved", conv_id, plan_model, exc_info=True)
-
-            if search_mode == "deep_approved" and pending_ds:
-                try:
-                    ds_plan = json.loads(pending_ds)
-                except Exception:
-                    ds_plan = {}
-                if ds_plan:
-                    _log.info("chat conv=%s  deep search approved — executing %d queries, %d urls",
-                              conversation_id, len(ds_plan.get("queries", [])), len(ds_plan.get("urls", [])))
-                    emit({"type": "plan_approved", "tool": "deep_search"})
-                    _mark_plan_approved(conversation_id, "deep_search_plan")
-                    actions = [ToolAction(
-                        tool=ToolName.DEEP_SEARCH,
-                        params={
-                            "_phase": "execute",
-                            "_plan": ds_plan,
-                            "_org_id": self.org_id,
-                            "_conversation_id": conversation_id,
-                        },
-                        reason="deep search (approved, executing)",
-                    )]
-                    plan = ToolPlan(actions=actions, summary="Executing approved deep search")
-                    try:
-                        tool_context = asyncio.run(execute_plan(plan, emit))
-                        _log.info("chat conv=%s  deep search execution dispatched", conversation_id)
-                    except Exception:
-                        _log.error("chat conv=%s  deep search execution failed", conversation_id, exc_info=True)
-                        tool_context = ToolContext()
-                    for r in tool_context.results:
-                        if r.tool.value == "deep_search" and r.ok:
-                            search_result.search_context = r.data
-                            search_result.search_status = "queued"
-                            search_result.search_confidence = "pending"
-                            emit({"type": "jobs_queued", "tool": "deep_search",
-                                  "message": r.data, "status": "running"})
-                else:
-                    _log.warning("chat conv=%s  deep_approved but plan was empty", conversation_id)
-            elif search_mode == "deep_approved":
-                _log.warning("chat conv=%s  deep_approved but no pending plan — falling back to normal", conversation_id)
-
-            elif search_mode == "research_approved" and pending_rs:
-                try:
-                    rs_plan = json.loads(pending_rs)
-                except Exception:
-                    rs_plan = {}
-                if rs_plan:
-                    _log.info("chat conv=%s  research approved — executing %d queries",
-                              conversation_id, len(rs_plan.get("queries", [])))
-                    emit({"type": "plan_approved", "tool": "research"})
-                    _mark_plan_approved(conversation_id, "research_plan")
-                    actions = [ToolAction(
-                        tool=ToolName.RESEARCH,
-                        params={
-                            "_phase": "execute",
-                            "_plan": rs_plan,
-                            "_org_id": self.org_id,
-                            "_conversation_id": conversation_id,
-                        },
-                        reason="research (approved, executing)",
-                    )]
-                    plan = ToolPlan(actions=actions, summary="Executing approved research")
-                    try:
-                        tool_context = asyncio.run(execute_plan(plan, emit))
-                        _log.info("chat conv=%s  research execution dispatched", conversation_id)
-                    except Exception:
-                        _log.error("chat conv=%s  research execution failed", conversation_id, exc_info=True)
-                        tool_context = ToolContext()
-                    for r in tool_context.results:
-                        if r.tool.value == "research" and r.ok:
-                            search_result.search_context = r.data
-                            search_result.search_status = "queued"
-                            search_result.search_confidence = "pending"
-                            emit({"type": "jobs_queued", "tool": "research",
-                                  "message": r.data, "status": "running"})
-                else:
-                    _log.warning("chat conv=%s  research_approved but plan was empty", conversation_id)
-            elif search_mode == "research_approved":
-                _log.warning("chat conv=%s  research_approved but no pending plan — falling back to normal", conversation_id)
-
-            # --- Gate check for normal tool dispatch ---
-            # Skip if approval already handled the request.
-            # When the user explicitly selected deep/research mode, bypass
-            # the gate check and search_enabled flag — they opted in.
+            # --- Dispatch based on search_mode ---
+            # Deep/research are explicit UI toggles — dispatch directly,
+            # no gate check, no search_enabled flag, no hint indirection.
+            # Normal mode goes through the heuristic gate as before.
             hints = set()
-            if search_mode in _approval_modes:
+            if search_mode in APPROVAL_MODES:
                 pass  # approval already handled above
             elif search_mode in ("deep", "research"):
-                hints.add("web_search")  # force web_search hint for explicit mode
+                convo_topics = extract_conversation_topics(history)
+                mode_label = "deep search" if search_mode == "deep" else "research"
+                tool_name = ToolName.DEEP_SEARCH if search_mode == "deep" else ToolName.RESEARCH
+                _log.info("chat conv=%s  %s — T3 plan generation", conversation_id, mode_label)
+                emit({
+                    "type": "tool_status",
+                    "phase": "planning",
+                    "summary": f"Preparing {mode_label} plan for: {user_message[:80]}",
+                    "tools": [tool_name.value],
+                })
+                actions = [ToolAction(
+                    tool=tool_name,
+                    params={
+                        "_user_message": user_message,
+                        "_conversation_topics": convo_topics or [],
+                        "_org_id": self.org_id,
+                        "_conversation_id": conversation_id,
+                    },
+                    reason=f"{mode_label} (T3 plan, awaiting approval)",
+                )]
+                plan = ToolPlan(actions=actions, summary=f"Generating {mode_label} plan")
+                try:
+                    tool_context = asyncio.run(execute_plan(plan, emit))
+                    ok = sum(1 for r in tool_context.results if r.ok)
+                    _log.info("chat conv=%s  %s plan complete  results=%d/%d elapsed=%.2fs", conversation_id, mode_label, ok, len(tool_context.results), time.perf_counter() - _t_tools)
+                except Exception:
+                    _log.error("chat conv=%s  %s plan failed", conversation_id, mode_label, exc_info=True)
+                    tool_context = ToolContext()
             else:
                 hints = gate_check(user_message, conversation_context=last_assistant)
                 if not web_search_enabled or not self.search_enabled:
                     hints.discard("web_search")
-            _log.info("chat conv=%s  gate check: tools=%s web_search_global=%s search_enabled=%s mode=%s", conversation_id, sorted(hints) or "none", web_search_enabled, self.search_enabled, search_mode)
+            _log.info("chat conv=%s  gate: hints=%s mode=%s", conversation_id, sorted(hints) or "none", search_mode)
 
             if hints:
                 tool_labels = {
@@ -362,40 +225,10 @@ class ChatAgent:
                 _DIRECT_TOOLS = {"web_search", "rag_lookup"}
 
                 if hints <= _DIRECT_TOOLS and hints:
-                    _log.info("chat conv=%s  search fast-path  tools=%s mode=%s", conversation_id, sorted(hints), search_mode)
+                    _log.info("chat conv=%s  search fast-path  tools=%s", conversation_id, sorted(hints))
                     actions: list[ToolAction] = []
 
-                    # Deep search / research: skip inline web_search, use
-                    # T3 to generate plan for user approval.
-                    if search_mode == "deep" and "web_search" in hints:
-                        convo_topics = extract_conversation_topics(history)
-                        _log.info("chat conv=%s  deep search — T3 query generation, skipping inline search", conversation_id)
-                        actions.append(ToolAction(
-                            tool=ToolName.DEEP_SEARCH,
-                            params={
-                                "_user_message": user_message,
-                                "_conversation_topics": convo_topics or [],
-                                "_org_id": self.org_id,
-                                "_conversation_id": conversation_id,
-                            },
-                            reason="deep search (T3 queries, awaiting approval)",
-                        ))
-
-                    elif search_mode == "research" and "web_search" in hints:
-                        convo_topics = extract_conversation_topics(history)
-                        _log.info("chat conv=%s  research — T3 plan generation, skipping inline search", conversation_id)
-                        actions.append(ToolAction(
-                            tool=ToolName.RESEARCH,
-                            params={
-                                "_user_message": user_message,
-                                "_conversation_topics": convo_topics or [],
-                                "_org_id": self.org_id,
-                                "_conversation_id": conversation_id,
-                            },
-                            reason="research (T3 plan, awaiting approval)",
-                        ))
-
-                    elif "web_search" in hints:
+                    if "web_search" in hints:
                         convo_topics = extract_conversation_topics(history)
                         if convo_topics:
                             _log.info("chat conv=%s  topics from summary: %s", conversation_id, convo_topics)
@@ -496,54 +329,42 @@ class ChatAgent:
                         "Answer from your own knowledge, and suggest 1-2 specific "
                         "search terms the user could try to find what they need."
                     )
-                elif r.tool.value == "deep_search" and r.ok:
-                    search_result.search_context = r.data
-                    search_result.search_status = "awaiting_approval"
-                    search_result.search_confidence = "pending"
-                    emit({
-                        "type": "deep_search_plan",
-                        "tool": "deep_search",
-                        "message": r.data,
-                        "status": "awaiting_approval",
-                    })
-                    # Persist the plan as a message so it survives navigation
-                    # and is reviewable later. model="deep_search_plan" lets
-                    # the frontend render it as a structured card.
-                    # Re-fetch conversation to get the plan JSON written by the
-                    # executor (convo was loaded before tools ran).
-                    try:
-                        fresh = self.db.get_conversation(conversation_id) or {}
-                        plan_json = fresh.get("pending_deep_search") or ""
-                        self.db.add_message(
-                            conversation_id=conversation_id,
-                            org_id=self.org_id,
-                            role="assistant",
-                            content=r.data,
-                            model="deep_search_plan",
-                            search_status="awaiting_approval",
-                            search_context_text=plan_json,
+                elif r.tool.value in ("deep_search", "research"):
+                    tool_label = r.tool.value
+                    from tools.framework.executors.search.pipeline import PLAN_CONFIGS
+                    pending_field = PLAN_CONFIGS[tool_label].db_field
+                    if r.ok:
+                        search_result.search_context = r.data
+                        search_result.search_status = "awaiting_approval"
+                        search_result.search_confidence = "pending"
+                        emit({
+                            "type": f"{tool_label}_plan",
+                            "tool": tool_label,
+                            "message": r.data,
+                            "status": "awaiting_approval",
+                        })
+                        try:
+                            fresh = self.db.get_conversation(conversation_id) or {}
+                            plan_json = fresh.get(pending_field) or ""
+                            self.db.add_message(
+                                conversation_id=conversation_id,
+                                org_id=self.org_id,
+                                role="assistant",
+                                content=r.data,
+                                model=f"{tool_label}_plan",
+                                search_status="awaiting_approval",
+                                search_context_text=plan_json,
+                            )
+                        except Exception:
+                            _log.warning("chat conv=%s  %s plan persist failed", conversation_id, tool_label, exc_info=True)
+                    else:
+                        search_result.search_status = "error"
+                        search_result.search_confidence = "none"
+                        label = tool_label.replace("_", " ")
+                        search_result.search_note = (
+                            f"{label.title()} plan generation failed. Tell the user "
+                            f"and suggest they try again or rephrase their question."
                         )
-                    except Exception:
-                        _log.warning("chat conv=%s  deep search plan message persist failed", conversation_id, exc_info=True)
-                elif r.tool.value == "research" and r.ok:
-                    search_result.search_context = r.data
-                    search_result.search_status = "awaiting_approval"
-                    search_result.search_confidence = "pending"
-                    # Persist the plan as a message
-                    try:
-                        fresh = self.db.get_conversation(conversation_id) or {}
-                        plan_json = fresh.get("pending_research") or ""
-                        self.db.add_message(
-                            conversation_id=conversation_id,
-                            org_id=self.org_id,
-                            role="assistant",
-                            content=r.data,
-                            model="research_plan",
-                            search_status="awaiting_approval",
-                            search_context_text=plan_json,
-                        )
-                    except Exception:
-                        _log.warning("chat conv=%s  research plan message persist failed", conversation_id, exc_info=True)
         else:
             search_result = run_search_phase(
                 user_message=user_message,
@@ -854,169 +675,4 @@ class ChatAgent:
         )
         yield from job.events
 
-    def _call_model(
-        self,
-        messages: list[dict],
-        temperature: float,
-        max_tokens: int,
-        emit: Callable[[dict], None],
-    ) -> tuple[list[str], dict, str]:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-
-        chunks: list[str] = []
-        final_usage: dict = {}
-        final_model: str = self.model
-        in_think_block = False
-        think_tokens = 0
-        first_content_emitted = False
-        reasoning_chunks: list[str] = []
-
-        with requests.post(
-            f"{self.url}/v1/chat/completions",
-            json=payload,
-            stream=True,
-            timeout=(30, 3600),
-        ) as response:
-            response.raise_for_status()
-            response.encoding = "utf-8"
-            for raw_line in response.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
-                if not raw_line.startswith("data:"):
-                    continue
-                data = raw_line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
-                if event.get("model"):
-                    final_model = event["model"]
-                usage = event.get("usage")
-                if usage:
-                    final_usage = usage
-
-                choices = event.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-
-                # Some models put thinking in reasoning_content, actual answer in content.
-                # Others put everything in content with <think> tags.
-                reasoning = delta.get("reasoning_content")
-                text = delta.get("content")
-
-                if reasoning and not text:
-                    # Model is still thinking — stream to UI as thinking event
-                    think_tokens += 1
-                    reasoning_chunks.append(reasoning)
-                    emit({"type": "thinking", "text": reasoning})
-                    continue
-
-                if not text:
-                    continue
-
-                # Filter <think>...</think> tags in content (Qwen/RWKV style)
-                if not first_content_emitted and "<think>" in text:
-                    in_think_block = True
-                    think_tokens += 1
-                    # Strip the <think> tag, emit remaining text as thinking
-                    after_tag = text.split("<think>", 1)[1] if "<think>" in text else ""
-                    if after_tag:
-                        reasoning_chunks.append(after_tag)
-                        emit({"type": "thinking", "text": after_tag})
-                    continue
-                if in_think_block:
-                    think_tokens += 1
-                    if "</think>" in text:
-                        in_think_block = False
-                        # Emit any text before the closing tag as thinking
-                        before_tag = text.split("</think>", 1)[0]
-                        if before_tag:
-                            reasoning_chunks.append(before_tag)
-                            emit({"type": "thinking", "text": before_tag})
-                        # Emit any text after the closing tag as content
-                        after_tag = text.split("</think>", 1)[1].strip()
-                        if after_tag:
-                            first_content_emitted = True
-                            chunks.append(after_tag)
-                            emit({"type": "chunk", "text": after_tag})
-                        if think_tokens > 1:
-                            _log.info("model thinking done  tokens=%d", think_tokens)
-                    else:
-                        reasoning_chunks.append(text)
-                        emit({"type": "thinking", "text": text})
-                    continue
-
-                first_content_emitted = True
-                chunks.append(text)
-                emit({"type": "chunk", "text": text})
-
-        # Fallback: if model put everything in thinking (reasoning_content field
-        # OR <think> tags) and never produced actual content, use the reasoning
-        # as the output.  Better than losing the response entirely.
-        if not chunks and reasoning_chunks:
-            _log.warning("model returned no content, using thinking as fallback  think_tokens=%d reasoning_chars=%d",
-                         think_tokens, sum(len(r) for r in reasoning_chunks))
-            full_reasoning = "".join(reasoning_chunks)
-            chunks.append(full_reasoning)
-            emit({"type": "chunk", "text": full_reasoning})
-
-        if think_tokens > 0:
-            _log.info("model thinking summary  think_tokens=%d content_tokens=%d", think_tokens, len(chunks))
-
-        return chunks, final_usage, final_model
-
-    def send(
-        self,
-        user_message: str,
-        conversation_id: int | None = None,
-        system: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
-        rag_enabled: bool | None = None,
-        rag_collection: str | None = None,
-        knowledge_enabled: bool | None = None,
-    ) -> ChatResult:
-        parts: list[str] = []
-        final: dict = {}
-        conv_id = conversation_id or 0
-        for event in self.send_streaming(
-            user_message=user_message,
-            conversation_id=conversation_id,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            rag_enabled=rag_enabled,
-            rag_collection=rag_collection,
-            knowledge_enabled=knowledge_enabled,
-        ):
-            etype = event.get("type")
-            if etype == "meta":
-                conv_id = event.get("conversation_id") or conv_id
-            elif etype == "chunk":
-                parts.append(event.get("text", ""))
-            elif etype == "done":
-                final = event
-            elif etype == "error":
-                raise RuntimeError(event.get("message") or "chat stream error")
-
-        return ChatResult(
-            output="".join(parts),
-            model=final.get("model", self.model),
-            conversation_id=final.get("conversation_id", conv_id),
-            tokens_input=int(final.get("tokens_input") or 0),
-            tokens_output=int(final.get("tokens_output") or 0),
-            duration_seconds=float(final.get("duration_seconds") or 0.0),
-            rag_enabled=bool(final.get("rag_enabled")),
-            context_chars=int(final.get("context_chars") or 0),
-        )
+    # _call_model, send inherited from BaseAgent

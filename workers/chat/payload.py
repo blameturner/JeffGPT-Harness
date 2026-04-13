@@ -44,7 +44,9 @@ def build_chat_payload(
             "The following are LIVE web search results retrieved just now for "
             "this conversation. Use these sources to inform your answer. "
             "Cite specific facts from them. Do NOT claim you cannot search "
-            "the web — you already did, and these are the results.\n\n"
+            "the web — you already did, and these are the results. "
+            "Do NOT output tool calls, function calls, or any special tokens. "
+            "Just write your answer in plain text using the results below.\n\n"
             + search_context
         )})
     if search_note:

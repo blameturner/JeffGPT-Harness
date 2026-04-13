@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from app.schemas import ConversationUpdate
 from nocodb_client import NocodbClient
-from workers.chat_agent import ChatAgent
+from workers.agents.chat import ChatAgent
 from workers.jobs import STORE, run_in_background
 
 _log = logging.getLogger("main.chat")
@@ -77,25 +77,25 @@ def chat(request: ChatRequest):
 
 class ResearchRequest(BaseModel):
     org_id: int
-    model: str
     question: str
     conversation_id: int | None = None
 
 
 @router.post("/research")
 def research(request: ResearchRequest):
-    from workers.research_agent import run_research, estimate_research_time
-    _log.info("POST /research  model=%s org=%d question=%s", request.model, request.org_id, request.question[:80])
-    estimate = estimate_research_time()
-    job = STORE.create()
-    run_in_background(job, lambda j: run_research(
-        question=request.question,
-        org_id=request.org_id,
-        model=request.model,
-        job=j,
-        conversation_id=request.conversation_id,
-    ))
-    return {"job_id": job.id, "estimate": estimate}
+    """Submit a research job directly to the tool queue."""
+    from workers.tool_queue import get_tool_queue
+    _log.info("POST /research  org=%d question=%s", request.org_id, request.question[:80])
+    tq = get_tool_queue()
+    if not tq:
+        raise HTTPException(status_code=503, detail="Tool queue not available")
+    plan = {"question": request.question, "queries": [request.question], "objective": "", "lookout": [], "completion_criteria": []}
+    job_id = tq.submit(
+        job_type="research",
+        payload={"plan": plan, "org_id": request.org_id, "conversation_id": request.conversation_id},
+        source="api", org_id=request.org_id, priority=1,
+    )
+    return {"job_id": job_id}
 
 
 @router.get("/collections")

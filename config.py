@@ -17,62 +17,28 @@ load_dotenv()
 # Platform config (config.json)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MODELS: dict[str, dict] = {
-    "chat":                      {"role": "t1_primary"},
-    "code":                      {"role": "t1_primary"},
-    "tool_planner":              {"role": "t3_tool",   "temperature": 0.1, "max_tokens": 200,  "max_input_chars": 1000},
-    "intent_classifier":         {"role": "t3_tool",   "temperature": 0.1, "max_tokens": 300,  "max_input_chars": 2000},
-    "search_extraction":         {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 500,  "max_input_chars": 12000, "frequency_penalty": 0.2},
-    "search_source_suggestion":  {"role": "t3_tool",   "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
-    "enrichment_summarise":      {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 300,  "max_input_chars": 12000, "frequency_penalty": 0.2},
-    "enrichment_relationships":  {"role": "t1_secondary","temperature": 0.1, "max_tokens": 800,  "max_input_chars": 8000, "frequency_penalty": 0.3},
-    "enrichment_quality":        {"role": "t3_tool",   "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500},
-    "enrichment_source_discovery": {"role": "t3_tool", "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 3000},
-    "batch_summarise":           {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 24000, "frequency_penalty": 0.2},
-    "web_search_summarise":      {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 400,  "max_input_chars": 12000, "frequency_penalty": 0.2},
-    "web_search_summarise_batch":{"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 500,  "max_input_chars": 10000, "frequency_penalty": 0.2},
-    "deep_search_summarise":     {"role": "exp_rwkv_r","temperature": 0.2, "max_tokens": 800,  "max_input_chars": 16000, "frequency_penalty": 0.2},
-    "chat_summarise":            {"role": "exp_rwkv_r","temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000, "frequency_penalty": 0.2},
-    "research_summarise":        {"role": "t1_secondary","temperature": 0.2,"max_tokens": 1000, "max_input_chars": 16000},
-}
-
-_DEFAULT_FEATURES: dict[str, bool] = {
-    "web_search": True,
-    "rag_lookup": True,
-    "code_exec": False,
-    "enrichment": True,
-    "tools_framework": True,
-    "batch_summarise": True,
-    "search_extraction": True,
-    "search_source_suggestion": True,
-    "intent_classifier": True,
-}
-
 
 def load_platform_config() -> dict:
-    """Load config.json from project root, merge with defaults."""
+    """Load config.json from project root. This is the single source of truth
+    for all model function configs and feature toggles."""
     config_path = Path(__file__).parent / "config.json"
-    user_cfg: dict = {}
-    if config_path.is_file():
-        try:
-            with open(config_path) as f:
-                user_cfg = json.load(f)
-            _log.info("platform config loaded from %s", config_path)
-        except Exception as e:
-            _log.error("failed to load config.json, using defaults: %s", e)
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        _log.info("platform config loaded from %s", config_path)
+    except FileNotFoundError:
+        _log.error("config.json not found at %s — cannot start without it", config_path)
+        raise SystemExit(1)
+    except Exception as e:
+        _log.error("failed to parse config.json: %s", e)
+        raise SystemExit(1)
 
-    # Deep-merge models: user overrides per-function, defaults fill gaps.
-    models = {}
-    user_models = user_cfg.get("models", {})
-    for fn_name, defaults in _DEFAULT_MODELS.items():
-        merged = {**defaults}
-        if fn_name in user_models:
-            merged.update({k: v for k, v in user_models[fn_name].items() if v is not None})
-        models[fn_name] = merged
+    models = cfg.get("models", {})
+    features = cfg.get("features", {})
 
-    # Features: user overrides per-toggle, defaults fill gaps.
-    features = {**_DEFAULT_FEATURES}
-    features.update(user_cfg.get("features", {}))
+    if not models:
+        _log.error("config.json has no 'models' section")
+        raise SystemExit(1)
 
     return {"models": models, "features": features}
 
@@ -81,21 +47,26 @@ PLATFORM: dict = load_platform_config()
 
 
 def get_function_config(function_name: str) -> dict:
-    """Return model config for a named function.
+    """Return model config for a named function from config.json.
 
-    Returns dict with keys: role, temperature, max_tokens, max_input_chars.
-    Falls back to defaults if function_name is unknown.
+    Raises KeyError if the function is not defined — every model call
+    must have an explicit entry in config.json.
     """
     cfg = PLATFORM.get("models", {}).get(function_name)
     if cfg:
         return cfg
-    _log.warning("unknown function %r in platform config, using t3_tool default", function_name)
-    return {"role": "t3_tool", "temperature": 0.2, "max_tokens": 200, "max_input_chars": 2000}
+    raise KeyError(
+        f"function {function_name!r} not defined in config.json — "
+        "add it to the 'models' section"
+    )
 
 
 def is_feature_enabled(name: str) -> bool:
-    """Check if a feature toggle is enabled. Defaults to True if unknown."""
-    return PLATFORM.get("features", {}).get(name, True)
+    """Check if a feature toggle is enabled. Must be defined in config.json."""
+    features = PLATFORM.get("features", {})
+    if name not in features:
+        _log.warning("feature %r not in config.json, defaulting to True", name)
+    return features.get(name, True)
 
 MODEL_DISCOVERY_TIMEOUT_S = int(os.getenv("MODEL_DISCOVERY_TIMEOUT_S", "60"))
 MODEL_DISCOVERY_INTERVAL_S = 2

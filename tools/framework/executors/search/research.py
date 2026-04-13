@@ -1,21 +1,15 @@
-"""
-Research executor — iterative deep investigation with approval flow.
+"""Research executor — iterative deep investigation with approval flow.
 
-Unlike deep search (single pass: query → scrape → summarise → deliver),
-research runs an iterative loop:
-
+Two phases:
   1. T3 generates research plan (queries, objectives, assessment criteria)
-  2. User approves or revises the plan
-  3. Queued execution on T1 secondary:
+     → returned for user approval.
+  2. After approval, background job runs iterative loop:
      a. Search + scrape + summarise (per-source, thorough)
-     b. T3 assesses coverage gaps in gathered evidence
-     c. If gaps found: T3 generates refined queries → repeat from (a)
-     d. Max 3 iterations to bound compute
-  4. T1 secondary synthesises final research report
-  5. Stores to ChromaDB + FalkorDB, delivers to conversation
-
-The whole execution phase runs as a single tool_queue job at priority 1
-(highest background priority, 120s backoff from chat).
+     b. T3 assesses coverage gaps
+     c. If gaps: T3 generates refined queries → repeat from (a)
+     d. Max 3 iterations
+     e. T1 synthesises final research report
+     f. Stores to ChromaDB + FalkorDB, delivers to conversation
 """
 
 from __future__ import annotations
@@ -23,11 +17,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-import time
 
 from tools.framework.contract import ToolName, ToolResult
 from tools.framework.dispatcher import register_executor
+from tools.framework.executors.search.pipeline import (
+    parse_llm_json,
+    store_pending_plan,
+    clear_pending_plan,
+)
 from workers.enrichment.models import model_call
 
 _log = logging.getLogger("tools.research")
@@ -126,28 +123,23 @@ def _generate_plan(question: str, conversation_topics: list[str] | None = None) 
     )
 
     raw, tokens = model_call("research_queries", prompt)
-    _log.info("research plan generation  tokens=%d", tokens)
+    _log.info("plan generation  tokens=%d", tokens)
 
     if not raw:
-        _log.warning("research plan generation returned empty")
+        _log.warning("plan generation returned empty")
         return None
 
-    try:
-        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
-        plan = json.loads(cleaned)
-    except json.JSONDecodeError:
-        _log.warning("research plan unparseable: %s", raw[:300])
-        return None
-
+    plan = parse_llm_json(raw)
     if not isinstance(plan, dict) or "queries" not in plan:
-        _log.warning("research plan missing required fields: %s", sorted(plan.keys()) if isinstance(plan, dict) else type(plan))
+        _log.warning("plan missing required fields: %s",
+                     sorted(plan.keys()) if isinstance(plan, dict) else type(plan))
         return None
 
     return plan
 
 
-def _assess_progress(objective: str, lookout: list[str], criteria: list[str],
-                     summaries: list[dict]) -> dict:
+def assess_progress(objective: str, lookout: list[str], criteria: list[str],
+                    summaries: list[dict]) -> dict:
     """Use T3 to assess whether research is complete or needs more work."""
     evidence = "\n\n".join(
         f"[{i+1}] {s['url']}\n{s['summary'][:600]}"
@@ -159,25 +151,21 @@ def _assess_progress(objective: str, lookout: list[str], criteria: list[str],
         lookout=", ".join(lookout),
         completion_criteria=", ".join(criteria),
         source_count=len(summaries),
-        evidence_summary=evidence[:3800],
+        evidence_summary=evidence[:10000],
     )
 
     raw, tokens = model_call("research_assess", prompt)
-    _log.info("research assessment  tokens=%d", tokens)
+    _log.info("assessment  tokens=%d", tokens)
 
-    # On failure, default to incomplete so the loop continues gathering
-    # evidence rather than stopping prematurely on a T3 hiccup.
     _INCOMPLETE = {"complete": False, "gaps": ["assessment failed — continuing"], "new_queries": [], "met_criteria": []}
 
     if not raw:
-        _log.warning("research assessment returned empty — treating as incomplete")
+        _log.warning("assessment returned empty — treating as incomplete")
         return _INCOMPLETE
 
-    try:
-        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
-        result = json.loads(cleaned)
-    except json.JSONDecodeError:
-        _log.warning("research assessment unparseable — treating as incomplete")
+    result = parse_llm_json(raw)
+    if not isinstance(result, dict):
+        _log.warning("assessment unparseable — treating as incomplete")
         return _INCOMPLETE
 
     return result
@@ -189,48 +177,36 @@ def _assess_progress(objective: str, lookout: list[str], criteria: list[str],
 
 @register_executor(ToolName.RESEARCH)
 async def execute(params: dict, emit) -> ToolResult:
-    """
-    Research has two phases:
-
-    Phase 1 (plan): T3 generates research plan → return for user approval
-    Phase 2 (execute): Iterative search loop → T1 synthesise → deliver
-    """
+    """Phase 1: generate plan. Phase 2: submit background job."""
     phase = params.get("_phase", "plan")
     org_id = params.get("_org_id") or 0
     conversation_id = params.get("_conversation_id")
 
     if not org_id:
-        return ToolResult(
-            tool=ToolName.RESEARCH, action_index=0, ok=False,
-            data="research missing org context",
-        )
+        return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=False,
+                          data="research missing org context")
 
     if phase == "execute":
-        return await _execute_research(params, emit)
+        return await _execute_approved(params, emit)
 
     # ---- Phase 1: Generate plan for approval ----
     user_message = params.get("_user_message") or ""
     conversation_topics = params.get("_conversation_topics") or []
 
     if not user_message:
-        return ToolResult(
-            tool=ToolName.RESEARCH, action_index=0, ok=False,
-            data="No question provided for research.",
-        )
+        return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=False,
+                          data="No question provided for research.")
 
     emit({"type": "tool_status", "phase": "planning", "message": "Designing research approach..."})
 
-    plan = await asyncio.get_event_loop().run_in_executor(
+    plan = await asyncio.get_running_loop().run_in_executor(
         None, _generate_plan, user_message, conversation_topics,
     )
 
     if not plan:
-        return ToolResult(
-            tool=ToolName.RESEARCH, action_index=0, ok=False,
-            data="Failed to generate research plan.",
-        )
+        return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=False,
+                          data="Failed to generate research plan.")
 
-    # Store plan on conversation for approval
     full_plan = {
         "question": user_message,
         "objective": plan.get("objective", ""),
@@ -241,16 +217,11 @@ async def execute(params: dict, emit) -> ToolResult:
 
     if conversation_id:
         try:
-            from nocodb_client import NocodbClient
-            db = NocodbClient()
-            db.update_conversation(int(conversation_id), {
-                "pending_research": json.dumps(full_plan),
-            })
-            _log.info("research plan stored  conv=%s queries=%d", conversation_id, len(full_plan["queries"]))
+            store_pending_plan(conversation_id, "research", full_plan)
+            _log.info("plan stored  conv=%s queries=%d", conversation_id, len(full_plan["queries"]))
         except Exception:
-            _log.error("research plan storage failed  conv=%s", conversation_id, exc_info=True)
+            _log.error("plan storage failed  conv=%s", conversation_id, exc_info=True)
 
-    # Build plan summary for the chat model
     query_list = "\n".join(f"- {q}" for q in full_plan["queries"])
     lookout_list = "\n".join(f"- {l}" for l in full_plan["lookout"])
     criteria_list = "\n".join(f"- {c}" for c in full_plan["completion_criteria"])
@@ -266,77 +237,40 @@ async def execute(params: dict, emit) -> ToolResult:
         f"Please review and approve this plan, or suggest changes."
     )
 
-    emit({
-        "type": "research_plan",
-        "tool": "research",
-        "message": plan_summary,
-        "status": "awaiting_approval",
-        "plan": full_plan,
-    })
-
-    return ToolResult(
-        tool=ToolName.RESEARCH, action_index=0, ok=True,
-        data=plan_summary,
-    )
+    return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=True, data=plan_summary)
 
 
-async def _execute_research(params: dict, emit) -> ToolResult:
-    """Phase 2: Queue the research job for background execution on T1."""
+async def _execute_approved(params: dict, emit) -> ToolResult:
+    """Phase 2: Submit background job to tool queue."""
     org_id = int(params.get("_org_id") or 0)
     conversation_id = params.get("_conversation_id")
     plan = params.get("_plan") or {}
 
     if not plan.get("queries"):
-        return ToolResult(
-            tool=ToolName.RESEARCH, action_index=0, ok=False,
-            data="No queries in the approved research plan.",
-        )
+        return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=False,
+                          data="No queries in the approved research plan.")
 
-    # Submit as a single research job to the tool queue.
-    # The job handler runs the iterative loop.
     from workers.tool_queue import get_tool_queue
     tq = get_tool_queue()
     if not tq:
-        return ToolResult(
-            tool=ToolName.RESEARCH, action_index=0, ok=False,
-            data="Tool job queue not available.",
-        )
+        return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=False,
+                          data="Tool job queue not available.")
 
     job_id = tq.submit(
         job_type="research",
-        payload={
-            "plan": plan,
-            "org_id": org_id,
-            "conversation_id": conversation_id,
-        },
-        source="research",
-        org_id=org_id,
-        priority=1,
+        payload={"plan": plan, "org_id": org_id, "conversation_id": conversation_id},
+        source="research", org_id=org_id, priority=1,
     )
+    _log.info("job queued  conv=%s job=%s queries=%d", conversation_id, job_id, len(plan["queries"]))
 
-    _log.info("research job queued  conv=%s job=%s queries=%d",
-              conversation_id, job_id, len(plan["queries"]))
-
-    # Clear the pending plan
     if conversation_id:
         try:
-            from nocodb_client import NocodbClient
-            db = NocodbClient()
-            db.update_conversation(int(conversation_id), {"pending_research": ""})
+            clear_pending_plan(conversation_id, "research")
         except Exception:
-            pass
+            _log.warning("failed to clear pending plan  conv=%s", conversation_id, exc_info=True)
 
-    emit({
-        "type": "jobs_queued",
-        "tool": "research",
-        "message": f"Research queued with {len(plan['queries'])} queries. "
-                   f"Will iterate up to {MAX_ITERATIONS} rounds until completion criteria are met.",
-        "status": "running",
-    })
+    msg = (f"Research queued with {len(plan['queries'])} queries. "
+           f"Will iterate up to {MAX_ITERATIONS} rounds until completion criteria are met.")
+    emit({"type": "jobs_queued", "tool": "research", "message": msg, "status": "running"})
 
-    return ToolResult(
-        tool=ToolName.RESEARCH, action_index=0, ok=True,
-        data=f"Research approved and queued. The investigation will run iteratively "
-             f"with up to {MAX_ITERATIONS} rounds of search and analysis. "
-             f"A comprehensive report will be delivered to this conversation when complete.",
-    )
+    return ToolResult(tool=ToolName.RESEARCH, action_index=0, ok=True, data=msg)

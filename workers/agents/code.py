@@ -1,3 +1,9 @@
+"""CodeAgent — code-focused agent with plan/execute/debug modes.
+
+Inherits from BaseAgent for model calling, streaming, and utilities.
+Independent from ChatAgent — shares infrastructure via BaseAgent.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,8 +15,6 @@ import time
 import uuid
 from typing import Iterator, Literal
 
-import requests
-
 from config import BASE_SYSTEM_PROMPT, TOOLS_FRAMEWORK_ENABLED, is_feature_enabled
 from workers.search.temporal import build_temporal_context
 from memory import remember
@@ -19,7 +23,7 @@ from tools.framework.contract import ToolContext
 from tools.framework.dispatcher import execute_plan
 from tools.framework.gate import gate_check
 from tools.framework.planner import generate_plan
-from workers.chat_agent import ChatAgent, _get_summary_event, SUMMARY_WAIT_TIMEOUT
+from workers.agents.base import BaseAgent, _get_summary_event, SUMMARY_WAIT_TIMEOUT
 from workers.chat.history import maybe_summarise, extract_conversation_topics
 from workers.styles import code_style_prompt
 
@@ -118,7 +122,7 @@ def _parse_plan_checklist(plan_text: str) -> list[str]:
         return []
 
 
-class CodeAgent(ChatAgent):
+class CodeAgent(BaseAgent):
 
     def __init__(
         self,

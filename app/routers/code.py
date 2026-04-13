@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from app.schemas import ConversationUpdate
 from nocodb_client import NocodbClient
-from workers.code_agent import CodeAgent
+from workers.agents.code import CodeAgent
 from workers.jobs import STORE, run_in_background
 
 _log = logging.getLogger("main.code")

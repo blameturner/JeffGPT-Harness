@@ -110,8 +110,10 @@ async def execute_plan(
 # Adding a new tool? Add one more import on the line below and you're done.
 from tools.framework.executors import (  # noqa: E402, F401
     code_exec,
-    deep_search,
     rag_lookup,
+)
+from tools.framework.executors.search import (  # noqa: E402, F401
+    deep_search,
     research,
     web_search,
 )
