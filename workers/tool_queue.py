@@ -606,7 +606,7 @@ class ToolJobQueue:
                 # graph_extract: 7-16 min (LLM inference) → 4x
                 # research: up to 60 min (iterative multi-source) → 12x
                 job_type = row.get("type") or ""
-                _STALE_MULTIPLIERS = {"graph_extract": 4, "deep_search": 8, "research": 12}
+                _STALE_MULTIPLIERS = {"graph_extract": 4, "deep_search": 8, "research": 20}
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
                     noco_id = row.get("Id")
@@ -1089,15 +1089,23 @@ def _handle_deep_search(payload: dict) -> dict:
               org_id, len(plan_urls), len(queries))
 
     loop = _aio.new_event_loop()
+    _aio.set_event_loop(loop)
     all_summaries: list[dict] = []
     with_text: list[dict] = []
 
     try:
-        # 1. Scrape all plan URLs in parallel
+        # 1. Scrape all plan URLs in parallel (return_exceptions so one bad URL doesn't kill the batch)
         try:
-            scraped = loop.run_until_complete(
-                _aio.gather(*[_scrape_one(r) for r in plan_urls])
+            results = loop.run_until_complete(
+                _aio.gather(*[_scrape_one(r) for r in plan_urls], return_exceptions=True)
             )
+            scraped = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    _log.warning("queue deep_search: scrape exception  url=%s  error=%s",
+                                 plan_urls[i].get("url", "?")[:60], r)
+                else:
+                    scraped.append(r)
         except Exception:
             _log.error("queue deep_search: scrape failed", exc_info=True)
             scraped = []
@@ -1113,7 +1121,7 @@ def _handle_deep_search(payload: dict) -> dict:
         _log.info("queue deep_search: scraped  total=%d usable=%d", len(scraped), len(with_text))
 
         if not with_text:
-            _log.warning("queue deep_search: no usable sources after all attempts")
+            _log.warning("queue deep_search: no usable sources")
             if conversation_id:
                 try:
                     from nocodb_client import NocodbClient
@@ -1135,7 +1143,7 @@ def _handle_deep_search(payload: dict) -> dict:
                     _log.error("queue deep_search: failure delivery failed", exc_info=True)
             return {"status": "no_sources"}
 
-        # 3. Summarise each usable source with T1 secondary
+        # 2. Summarise each usable source with T1 secondary
         for source in with_text:
             try:
                 result = loop.run_until_complete(
@@ -1177,6 +1185,9 @@ def _handle_deep_search(payload: dict) -> dict:
 
                     _log.info("queue deep_search: summarised  url=%s  chars=%d  total=%d",
                               source["url"][:60], len(summary_text), len(all_summaries))
+                else:
+                    _log.info("queue deep_search: summary too short, dropped  url=%s  chars=%d",
+                              source["url"][:60], len(summary_text))
             except Exception:
                 _log.warning("queue deep_search: summarise failed  url=%s", source["url"][:60], exc_info=True)
 
@@ -1221,7 +1232,7 @@ def _handle_deep_search(payload: dict) -> dict:
         f"- Highlights key facts, data points, and conclusions\n"
         f"- Notes any contradictions or gaps between sources\n"
         f"- Distinguishes established facts from opinions\n\n"
-        f"SOURCES:\n{evidence_block[:19000]}"
+        f"SOURCES:\n{evidence_block[:18000]}"
     )
 
     _log.info("queue deep_search: synthesising  sources=%d", len(all_summaries))
@@ -1258,7 +1269,8 @@ def _handle_deep_search(payload: dict) -> dict:
     except Exception:
         _log.debug("queue deep_search: synthesis graph extract failed", exc_info=True)
 
-    # Deliver to conversation
+    # Deliver to conversation — put sources before report so truncation
+    # cuts the report body, not the source URL list.
     if conversation_id:
         try:
             from nocodb_client import NocodbClient
@@ -1267,8 +1279,8 @@ def _handle_deep_search(payload: dict) -> dict:
             content = (
                 f"[Deep search complete]\n"
                 f"Sources analysed: {len(all_summaries)}\n\n"
-                f"{report}\n\n"
-                f"Sources:\n{source_urls}"
+                f"Sources:\n{source_urls}\n\n"
+                f"{report}"
             )
             db.add_message(
                 conversation_id=int(conversation_id),
@@ -1327,6 +1339,7 @@ def _handle_research(payload: dict) -> dict:
 
     # Single event loop for all async work in this handler.
     loop = _aio.new_event_loop()
+    _aio.set_event_loop(loop)
 
     all_summaries: list[dict] = []  # {url, title, summary}
     iteration = 0
@@ -1347,6 +1360,8 @@ def _handle_research(payload: dict) -> dict:
                 seen_search: set[str] = {s["url"] for s in all_summaries}
                 results = []
                 for result_set in all_raw:
+                    if isinstance(result_set, Exception):
+                        continue
                     for r in result_set:
                         url = (r.get("url") or "").strip()
                         if not url or url in seen_search or _is_blocklisted(url):
@@ -1365,14 +1380,21 @@ def _handle_research(payload: dict) -> dict:
 
             _log.info("queue research: iteration %d  new_urls=%d", iteration, len(new_results))
 
-            # 2. Scrape (parallel)
+            # 2. Scrape (parallel, return_exceptions so one bad URL doesn't kill the batch)
             try:
-                scraped = loop.run_until_complete(
-                    _aio.gather(*[_scrape_one(r) for r in new_results])
+                raw_scraped = loop.run_until_complete(
+                    _aio.gather(*[_scrape_one(r) for r in new_results], return_exceptions=True)
                 )
+                scraped = []
+                for i, r in enumerate(raw_scraped):
+                    if isinstance(r, Exception):
+                        _log.warning("queue research: scrape exception  url=%s  error=%s",
+                                     new_results[i].get("url", "?")[:60], r)
+                    else:
+                        scraped.append(r)
             except Exception:
                 _log.error("queue research: scrape failed iteration=%d", iteration, exc_info=True)
-                break
+                scraped = []
 
             with_text = []
             for s in scraped:
@@ -1386,7 +1408,7 @@ def _handle_research(payload: dict) -> dict:
             if not with_text:
                 _log.info("queue research: all sources empty in iteration %d", iteration)
                 if iteration < MAX_ITERATIONS:
-                    queries = queries[len(queries)//2:]  # try remaining queries
+                    queries = queries[len(queries)//2:]
                     continue
                 break
 
@@ -1407,7 +1429,6 @@ def _handle_research(payload: dict) -> dict:
                         }
                         all_summaries.append(entry)
 
-                        # Store each source to ChromaDB immediately
                         try:
                             remember(
                                 text=summary_text,
@@ -1423,7 +1444,6 @@ def _handle_research(payload: dict) -> dict:
                         except Exception:
                             _log.warning("queue research: chroma store failed  url=%s", source["url"][:60], exc_info=True)
 
-                        # Graph extraction per source
                         try:
                             extract_and_write_graph(
                                 f"Research source: {source['url']}",
@@ -1436,11 +1456,13 @@ def _handle_research(payload: dict) -> dict:
 
                         _log.info("queue research: summarised  url=%s  chars=%d  total=%d",
                                   source["url"][:60], len(summary_text), len(all_summaries))
+                    else:
+                        _log.info("queue research: summary too short, dropped  url=%s  chars=%d",
+                                  source["url"][:60], len(summary_text))
                 except Exception:
                     _log.warning("queue research: summarise failed  url=%s", source["url"][:60], exc_info=True)
 
-            # 4. Assess progress — always assess when not on the last iteration,
-            #    even with few sources (thin evidence is itself a signal).
+            # 4. Assess progress
             if iteration < MAX_ITERATIONS and all_summaries:
                 try:
                     assessment = _assess_progress(objective, lookout, criteria, all_summaries)
@@ -1448,19 +1470,23 @@ def _handle_research(payload: dict) -> dict:
                               assessment.get("complete"), assessment.get("gaps", []),
                               len(assessment.get("new_queries", [])))
 
-                    if assessment.get("complete"):
+                    # Strict boolean check — string "true" from T3 won't stop iteration
+                    if assessment.get("complete") is True:
                         _log.info("queue research: completion criteria met — stopping iteration")
                         break
 
                     new_queries = assessment.get("new_queries", [])
                     if new_queries:
-                        queries = [str(q).strip() for q in new_queries if str(q).strip()][:6]
+                        # Filter to actual strings only — T3 can return nulls, ints, bools
+                        queries = [q.strip() for q in new_queries if isinstance(q, str) and q.strip()][:6]
+                        if not queries:
+                            _log.info("queue research: new_queries were all invalid — stopping iteration")
+                            break
                     else:
                         _log.info("queue research: no new queries suggested — stopping iteration")
                         break
                 except Exception:
                     _log.warning("queue research: assessment failed — continuing with existing queries", exc_info=True)
-                    # Don't break — try another iteration with the same queries
 
     finally:
         loop.close()
@@ -1500,7 +1526,7 @@ def _handle_research(payload: dict) -> dict:
         objective=objective,
         source_count=len(all_summaries),
         iterations=iteration,
-        evidence_block=evidence_block[:22000],
+        evidence_block=evidence_block[:21000],
     )
 
     _log.info("queue research: synthesising  sources=%d  iterations=%d", len(all_summaries), iteration)
@@ -1549,8 +1575,8 @@ def _handle_research(payload: dict) -> dict:
                 f"[Research complete]\n"
                 f"Question: {question}\n"
                 f"Sources analysed: {len(all_summaries)} across {iteration} round(s)\n\n"
-                f"{report}\n\n"
-                f"Sources:\n{source_urls}"
+                f"Sources:\n{source_urls}\n\n"
+                f"{report}"
             )
             db.add_message(
                 conversation_id=int(conversation_id),
