@@ -58,21 +58,20 @@ def maybe_summarise(history: list[dict]) -> tuple[list[dict], dict | None]:
         return [_truncate_message(m) for m in recent], None
 
     # Build text block from older messages for summarisation.
-    older_text = ""
-    for m in older:
-        role = m.get("role", "user")
-        content = (m.get("content") or "")[:MAX_SINGLE_MESSAGE_CHARS]
-        older_text += f"{role}: {content}\n\n"
-
     # Check if there's already a summary message we should preserve/extend.
     existing_summary = ""
+    msgs_to_summarise = older
     if older and older[0].get("role") == "system" and "[Conversation summary]" in (older[0].get("content") or ""):
         existing_summary = older[0]["content"]
-        older_text = ""
-        for m in older[1:]:
-            role = m.get("role", "user")
-            content = (m.get("content") or "")[:MAX_SINGLE_MESSAGE_CHARS]
-            older_text += f"{role}: {content}\n\n"
+        msgs_to_summarise = older[1:]
+
+    # Feed full message content to the summariser so it can capture
+    # important context.  The RWKV call itself is bounded by max_input_chars.
+    older_text = ""
+    for m in msgs_to_summarise:
+        role = m.get("role", "user")
+        content = m.get("content") or ""
+        older_text += f"{role}: {content}\n\n"
 
     if not older_text.strip() and existing_summary:
         # Only the previous summary exists, no new messages to compress.
