@@ -1114,15 +1114,23 @@ def _handle_deep_search(payload: dict) -> dict:
 
     evidence = build_evidence_block(all_summaries)
     synth_prompt = (
-        f"You are synthesising web research into a clear, comprehensive answer.\n\n"
+        f"You are synthesising web research into a clear, well-structured answer.\n\n"
         f"USER QUESTION: {question}\n\n"
         f"SEARCH QUERIES USED: {', '.join(queries[:5])}\n\n"
-        f"Below are {len(all_summaries)} sources. Synthesise into a response that:\n"
-        f"- Directly answers the user's question\n"
-        f"- Cites sources by number [1], [2] etc.\n"
-        f"- Highlights key facts, data points, and conclusions\n"
-        f"- Notes contradictions or gaps between sources\n"
-        f"- Distinguishes established facts from opinions\n\n"
+        f"You have {len(all_summaries)} sources below. Write a comprehensive response.\n\n"
+        f"STRUCTURE YOUR RESPONSE AS:\n\n"
+        f"## Summary\n"
+        f"2-3 sentences answering the question directly.\n\n"
+        f"## Key Findings\n"
+        f"Numbered list. Each finding MUST cite a source: [1], [2] etc.\n"
+        f"Include specific data: numbers, dates, prices, names. No vague statements.\n\n"
+        f"## Sources\n"
+        f"Numbered list of URLs matching your citations.\n\n"
+        f"RULES:\n"
+        f"- Every factual claim needs a citation [N].\n"
+        f"- If sources disagree, present both sides with citations.\n"
+        f"- Distinguish facts (from official sources) from opinions (from blogs/forums).\n"
+        f"- Use specific numbers and dates, never 'some sources say' or 'it appears'.\n\n"
         f"SOURCES:\n{evidence[:18000]}"
     )
 

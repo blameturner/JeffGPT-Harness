@@ -37,74 +37,107 @@ MAX_TOTAL_SOURCES = 20
 # Prompts
 # ---------------------------------------------------------------------------
 
-_PLAN_PROMPT = """You are a research strategist. Given a user's research question and conversation context, design a thorough research plan.
+_PLAN_PROMPT = """You are a research strategist. Design a thorough research plan for the question below.
 
-Your plan must include:
-1. **objective**: One sentence stating what the research aims to determine
-2. **queries**: 6-10 specific search queries targeting different angles (technical, historical, comparative, expert opinion, data/statistics, contrary evidence)
-3. **lookout**: 3-5 specific things to look for in sources (e.g. "peer-reviewed data on X", "cost comparisons between A and B", "expert dissent on Y")
-4. **completion_criteria**: 2-3 conditions that mean the research is thorough enough to conclude (e.g. "found at least 3 independent sources agreeing on cost trends", "identified both supporting and contrary evidence")
+OUTPUT FORMAT: Return ONLY a JSON object. No prose before or after. No markdown fences.
+The first character of your response MUST be {{ and the last MUST be }}.
 
-Return ONLY a JSON object with these four keys. No prose, no markdown fences.
-First character must be `{{`, last must be `}}`.
+REQUIRED KEYS (all four are mandatory):
+
+1. "objective" (string): One sentence — what the research aims to determine or answer.
+
+2. "queries" (array of 6-10 strings): Search queries targeting DIFFERENT angles:
+   - At least 1 technical/definitional query
+   - At least 1 comparison query (X vs Y)
+   - At least 1 query with quoted phrases for exact matching
+   - At least 1 query targeting recent data (include year or "latest" or "2024")
+   - At least 1 query seeking contrary evidence or criticism
+   - Each query must be a specific search string, NOT a description of what to search
+
+3. "lookout" (array of 3-5 strings): Specific evidence to look for, e.g.:
+   - "peer-reviewed data on X"
+   - "cost comparisons between A and B with actual numbers"
+   - "expert criticism or dissent on Y"
+
+4. "completion_criteria" (array of 2-3 strings): Conditions that mean research is thorough enough, e.g.:
+   - "found at least 3 independent sources with quantitative data"
+   - "identified both supporting and contrary evidence"
 
 USER QUESTION:
 {question}
 
 {context_section}"""
 
-_ASSESS_PROMPT = """You are evaluating research progress. Given the research objective, what we're looking for, completion criteria, and evidence gathered so far, determine if the research is complete or needs more investigation.
+_ASSESS_PROMPT = """You are evaluating whether a research investigation has gathered enough evidence.
 
 OBJECTIVE: {objective}
-
 LOOKING FOR: {lookout}
-
 COMPLETION CRITERIA: {completion_criteria}
 
-EVIDENCE GATHERED SO FAR ({source_count} sources):
+EVIDENCE GATHERED ({source_count} sources):
 {evidence_summary}
 
-Assess:
-1. Which completion criteria are met?
-2. What gaps remain?
-3. Should we search for more? If yes, provide 3-5 NEW search queries targeting the gaps.
+YOUR TASK: Determine if the completion criteria are met.
 
-Return a JSON object:
-{{
-  "complete": true/false,
-  "met_criteria": ["criteria that are satisfied"],
-  "gaps": ["specific gaps remaining"],
-  "new_queries": ["query1", "query2", ...] (empty array if complete)
-}}
+OUTPUT FORMAT: Return ONLY a JSON object. No prose before or after. No markdown fences.
+The first character of your response MUST be {{ and the last MUST be }}.
 
-No prose, no markdown. First character `{{`, last `}}`."""
+REQUIRED KEYS:
 
-_SYNTHESISE_PROMPT = """You are a research analyst producing a formal research report.
+1. "complete" — JSON boolean: true if ALL completion criteria are met, false otherwise.
+   IMPORTANT: Use the JSON boolean true or false, NOT the strings "true" or "false".
+
+2. "met_criteria" — array of strings: Which completion criteria are satisfied. Empty array if none.
+
+3. "gaps" — array of strings: Specific evidence gaps remaining. Be precise — name what is missing.
+   Example: ["no quantitative pricing data found", "only 1 source on competitor comparison"]
+
+4. "new_queries" — array of 3-5 search query strings targeting the gaps. Empty array if complete.
+   Each query must be a specific search string that would find the missing evidence.
+   Do NOT repeat queries that were already used."""
+
+_SYNTHESISE_PROMPT = """You are a research analyst. Write a formal research report answering the question below.
 
 RESEARCH QUESTION: {question}
-
 RESEARCH OBJECTIVE: {objective}
 
-You have {source_count} sources gathered across {iterations} rounds of investigation.
+You have {source_count} sources gathered across {iterations} round(s) of investigation.
 
 EVIDENCE:
 {evidence_block}
 
-Write a comprehensive research report with this structure:
+REPORT STRUCTURE (follow this exactly):
 
-1. **Executive Summary** (3-4 sentences — the key finding and confidence level)
-2. **Key Findings** (numbered, each citing source numbers [1], [2] etc.)
-3. **Analysis** (synthesise across sources, identify patterns, resolve contradictions)
-4. **Contrary Evidence & Limitations** (what disagrees, what's missing, confidence caveats)
-5. **Conclusion** (direct answer to the research question with appropriate hedging)
-6. **Sources** (numbered list of URLs)
+## Executive Summary
+3-4 sentences. State the key finding, the confidence level (high/medium/low), and the basis for that confidence.
 
-Rules:
-- Cite sources by number [1], [2] etc.
-- Distinguish primary sources (papers, official docs, data) from secondary (blogs, forums)
-- State hypotheses clearly as hypotheses, not facts
-- If evidence is contradictory, present both sides and explain which is stronger and why
-- Be specific — include numbers, dates, names, not vague summaries"""
+## Key Findings
+Numbered list. Each finding MUST cite at least one source by number [1], [2] etc.
+Include specific data points: numbers, percentages, dates, prices, names.
+Do NOT make vague statements like "sources suggest" — state the specific fact and cite it.
+
+## Analysis
+Synthesise across sources. Identify patterns, trends, and consensus.
+Where sources disagree, explain the disagreement and which position has stronger evidence.
+Distinguish primary sources (official data, research papers, documentation) from secondary (blogs, forums, opinions).
+
+## Contrary Evidence & Limitations
+What evidence contradicts the main findings? What important questions remain unanswered?
+What are the confidence caveats? (e.g. "limited to English-language sources", "most data from 2024")
+If no contrary evidence was found, say so explicitly.
+
+## Conclusion
+Direct answer to the research question. Use hedging language appropriate to the confidence level.
+State clearly what is established fact vs. what is the analyst's assessment.
+
+## Sources
+Numbered list of all source URLs used, matching the citation numbers in the report.
+
+RULES:
+- Every factual claim MUST have a citation [N].
+- Use numbers, dates, and specifics — never "some sources say" or "it appears that".
+- If evidence is contradictory, present BOTH sides with citations.
+- State hypotheses as hypotheses, facts as facts. Never confuse the two."""
 
 
 # ---------------------------------------------------------------------------

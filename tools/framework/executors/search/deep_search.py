@@ -24,18 +24,25 @@ from workers.enrichment.models import model_call
 
 _log = logging.getLogger("tools.deep_search")
 
-_QUERY_GENERATION_PROMPT = """You are a search query strategist. Given a user's question and optional conversation context, generate 6-10 precise search queries that will find high-quality, authoritative answers.
+_QUERY_GENERATION_PROMPT = """You are a search query strategist. Generate 6-10 precise search queries for the question below.
 
-Rules:
-- Each query should target a DIFFERENT angle or aspect of the question
-- Use specific technical terms, not vague rephrasing
-- Include at least one query with quoted phrases for exact matching
-- Include at least one query targeting recent/current information (add year or "latest")
-- Avoid generic queries that would match millions of irrelevant pages
-- Think about what authoritative sources would title their articles
+OUTPUT FORMAT: Return ONLY a JSON array of query strings. No prose before or after. No markdown fences.
+The first character of your response MUST be [ and the last MUST be ].
 
-Return ONLY a JSON array of query strings. No prose, no markdown fences.
-First character must be `[`, last must be `]`.
+QUERY REQUIREMENTS (each query is a search engine input string):
+- Each query targets a DIFFERENT angle: technical, comparative, pricing, recent news, criticism
+- At least 1 query with "quoted phrases" for exact matching
+- At least 1 query with a year (2024 or 2025) or "latest" for recency
+- At least 1 query seeking contrary evidence or limitations
+- Use specific technical terms, product names, and proper nouns
+- Do NOT write descriptions of what to search — write the actual search string
+- Avoid generic queries that match millions of pages
+
+BAD: "search for GPU pricing information"
+GOOD: "NVIDIA H100 price per unit 2024"
+
+BAD: "find comparisons between products"
+GOOD: "AMD MI300X vs NVIDIA H100 performance benchmark comparison"
 
 USER QUESTION:
 {question}
