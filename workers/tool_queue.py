@@ -1,14 +1,3 @@
-"""
-General-purpose tool job queue backed by NocoDB.
-
-Manages typed jobs with per-type handler functions and configurable worker
-pools. Tool types plug in via `register()`.
-
-Jobs are persisted to the ``tool_jobs`` NocoDB table so they survive harness
-restarts. Priority ordering (1 = highest) lets user-facing work jump ahead
-of background work.
-"""
-
 from __future__ import annotations
 
 import collections
@@ -27,15 +16,8 @@ _log = logging.getLogger("tool_queue")
 
 NOCODB_TABLE = "tool_jobs"
 
-# ---------------------------------------------------------------------------
-# Chat activity tracking — queue workers yield to active sessions
-# ---------------------------------------------------------------------------
-# Priority thresholds: a job only runs if enough seconds have elapsed since
-# the last chat/code activity for its priority tier.
-#   priority 1: 30s  (user-requested, wait for stream to finish)
-#   priority 2: 120s (user-requested, 2 min backoff for resources)
-#   priority 3: 120s (normal)
-#   priority 4+: 600s (10 min, true background work)
+# priority tiers gate jobs by seconds-since-last-chat-activity;
+# p1/p2=user-facing (short backoff), p3=normal, p4+=true background (long backoff)
 _PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 120, 3: 120}
 _DEFAULT_BACKOFF = 600.0  # priority 4-5
 
@@ -44,7 +26,6 @@ _activity_lock = threading.Lock()
 
 
 def touch_chat_activity():
-    """Call from chat/code endpoints to signal an active session."""
     global _last_chat_activity
     with _activity_lock:
         _last_chat_activity = time.time()
@@ -60,10 +41,6 @@ def seconds_since_chat() -> float:
 def _backoff_for_priority(priority: int) -> float:
     return _PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
 
-
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
 
 @dataclass
 class HandlerConfig:
@@ -161,10 +138,6 @@ class ToolJob:
         )
 
 
-# ---------------------------------------------------------------------------
-# ToolJobQueue
-# ---------------------------------------------------------------------------
-
 class ToolJobQueue:
 
     def __init__(self):
@@ -177,13 +150,9 @@ class ToolJobQueue:
         self._subscribers: list[list[dict]] = []
         self._sub_lock = threading.Lock()
 
-    # ---- Registration ----
-
     def register(self, job_type: str, config: HandlerConfig):
         self._handlers[job_type] = config
         self._wake_events[job_type] = threading.Event()
-
-    # ---- Lifecycle ----
 
     def start(self):
         self._stop.clear()
@@ -217,8 +186,6 @@ class ToolJobQueue:
         self._workers.clear()
         _log.info("tool job queue stopped")
 
-    # ---- Producer API ----
-
     def submit(
         self,
         job_type: str,
@@ -232,7 +199,6 @@ class ToolJobQueue:
         if not config:
             raise ValueError(f"unknown job type: {job_type}")
 
-        # Dedup check
         if config.dedup_key and not depends_on:
             dedup_val = payload.get(config.dedup_key, "")
             if dedup_val:
@@ -281,8 +247,6 @@ class ToolJobQueue:
             ids.append(jid)
         return ids
 
-    # ---- Status API ----
-
     def status(self) -> dict:
         try:
             db = self._db()
@@ -305,7 +269,7 @@ class ToolJobQueue:
 
         idle = seconds_since_chat()
         if idle == float("inf"):
-            idle = -1  # no chat activity recorded yet
+            idle = -1  # no chat activity yet
         backoff_state = "active"
         if idle < 0 or idle >= _DEFAULT_BACKOFF:
             backoff_state = "clear"
@@ -388,10 +352,7 @@ class ToolJobQueue:
         except Exception:
             return False
 
-    # ---- Event stream ----
-
     def subscribe(self) -> collections.deque:
-        """Return a thread-safe deque buffer that receives job events."""
         buf: collections.deque = collections.deque()
         with self._sub_lock:
             self._subscribers.append(buf)
@@ -409,8 +370,6 @@ class ToolJobQueue:
             for sub in self._subscribers:
                 sub.append(event)
 
-    # ---- Worker loop ----
-
     def _worker_loop(self, job_type: str):
         config = self._handlers[job_type]
         wake = self._wake_events[job_type]
@@ -424,17 +383,13 @@ class ToolJobQueue:
             if self._stop.is_set():
                 break
 
-            # Scrape jobs are I/O-only (no model) — skip backoff for them.
-            # Model-bound jobs (summarise etc.) must respect chat activity.
+            # scrape is pure I/O so it ignores chat backoff; model-bound jobs must not
             if job_type != "scrape":
                 idle = seconds_since_chat()
-                # Use the LOWEST possible backoff (priority 1 = 120s) as
-                # the pre-claim gate so high-priority jobs aren't blocked.
-                # The per-job check after claiming enforces the real
-                # threshold and sleeps instead of churning if too early.
+                # pre-claim gate uses the smallest backoff so p1 isn't blocked here;
+                # real priority-specific threshold is enforced post-claim below
                 min_gate = _backoff_for_priority(1)
                 if idle < min_gate:
-                    # Only log occasionally to avoid spam
                     if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
                         _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
                                    worker_id, idle, min_gate)
@@ -444,8 +399,7 @@ class ToolJobQueue:
             if not job:
                 continue
 
-            # Per-job backoff: enforce the actual threshold for this job's
-            # priority (see _PRIORITY_BACKOFF at top of file).
+            # per-job backoff: unclaim and sleep if priority threshold not met
             if job_type != "scrape":
                 idle = seconds_since_chat()
                 required = _backoff_for_priority(job.priority)
@@ -457,7 +411,6 @@ class ToolJobQueue:
                     self._stop.wait(timeout=wait_secs)
                     continue
 
-            # Dependency check
             if job.depends_on:
                 dep = self.get_job(job.depends_on)
                 if not dep or dep.status != "completed":
@@ -469,9 +422,7 @@ class ToolJobQueue:
                 if dep.result:
                     job.payload.update(dep.result)
 
-            # Ensure org_id is always available in the payload from the
-            # authoritative job-level field so handlers never see org=0
-            # when the caller set it on submit().
+            # mirror job-level org_id into payload — handlers read from payload
             if job.org_id:
                 job.payload["org_id"] = job.org_id
             elif job.payload.get("org_id"):
@@ -510,10 +461,7 @@ class ToolJobQueue:
                 })
 
             self._persist_update(job)
-            # Wake workers for dependent jobs
             self._wake_dependents(job.job_id)
-
-    # ---- Stale checker ----
 
     def _stale_checker_loop(self):
         while not self._stop.is_set():
@@ -543,8 +491,7 @@ class ToolJobQueue:
                     started_ts = datetime.fromisoformat(started).timestamp()
                 except Exception:
                     continue
-                # Long-running jobs need extended stale timeouts.
-                # graph_extract: 7-16 min (LLM inference) → 4x
+                # graph_extract runs LLM inference 7-16min so it needs an extended stale timeout
                 job_type = row.get("type") or ""
                 _STALE_MULTIPLIERS = {"graph_extract": 4}
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
@@ -561,8 +508,6 @@ class ToolJobQueue:
                                  now - started_ts, timeout)
         except Exception:
             _log.error("stale job reset failed", exc_info=True)
-
-    # ---- NocoDB operations ----
 
     @staticmethod
     def _db():
@@ -617,7 +562,7 @@ class ToolJobQueue:
                 "started_at": now,
             })
 
-            # Re-fetch to verify we got the claim
+            # re-fetch to verify claim won the race (nocodb has no CAS)
             verify = db._get(NOCODB_TABLE, params={
                 "where": f"(Id,eq,{noco_id})",
                 "limit": 1,
@@ -639,7 +584,6 @@ class ToolJobQueue:
             return None
 
     def _unclaim(self, job: ToolJob):
-        """Put a job back to queued (dependency not ready)."""
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables or not job.nocodb_id:
@@ -654,14 +598,12 @@ class ToolJobQueue:
             _log.error("unclaim failed job=%s", job.job_id, exc_info=True)
 
     def _find_dedup(self, job_type: str, key: str, value: str) -> str | None:
-        """Check if a job with this dedup key value is already pending/running."""
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
                 return None
 
-            # For URL dedup, query by type+status and filter payload in Python.
-            # NocoDB where-clauses can't reliably match URLs with special chars.
+            # url dedup has to filter in python — nocodb where-clauses choke on urls with special chars
             if key == "url":
                 rows = db._get(NOCODB_TABLE, params={
                     "where": f"(type,eq,{job_type})~and(status,in,queued,running)",
@@ -680,14 +622,11 @@ class ToolJobQueue:
                         return row.get("job_id")
                 return None
 
-            # For non-URL keys, search payload_json directly is impractical.
-            # Future: add a dedup_hash column.
             return None
         except Exception:
             return None
 
     def _wake_dependents(self, completed_job_id: str):
-        """Wake workers for jobs that depend on the completed job."""
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
@@ -697,7 +636,6 @@ class ToolJobQueue:
                 "limit": 50,
             }).get("list", [])
             if rows:
-                # Wake all relevant worker types
                 types_to_wake = {r.get("type") for r in rows}
                 for jt in types_to_wake:
                     ev = self._wake_events.get(jt)
@@ -708,7 +646,7 @@ class ToolJobQueue:
             _log.error("wake_dependents failed for job=%s", completed_job_id, exc_info=True)
 
     def _load_pending(self):
-        """On startup, reset any running jobs back to queued (crash recovery)."""
+        # crash recovery: any rows left as running from a previous process are orphaned
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
@@ -731,15 +669,6 @@ class ToolJobQueue:
         except Exception:
             _log.error("load_pending failed", exc_info=True)
 
-
-# ---------------------------------------------------------------------------
-# Built-in handlers
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
 
 _instance: ToolJobQueue | None = None
 

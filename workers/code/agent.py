@@ -1,9 +1,3 @@
-"""CodeAgent — code-focused agent with plan/execute/debug modes.
-
-Inherits from BaseAgent for model calling, streaming, and utilities.
-Independent from ChatAgent — shares infrastructure via BaseAgent.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -180,7 +174,7 @@ class CodeAgent(BaseAgent):
         def emit(event: dict):
             STORE.append(job, event)
 
-        # Signal active session so queue workers back off.
+        # signal active session so queue workers back off
         from workers.tool_queue import touch_chat_activity
         touch_chat_activity()
 
@@ -210,7 +204,7 @@ class CodeAgent(BaseAgent):
                 if not convo:
                     emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
                     return
-                # Wait for any in-flight background summary to finish.
+                # must wait on prev turn's bg summary — else we'd read stale summary from DB
                 summary_ev = _get_summary_event(conversation_id)
                 if not summary_ev.is_set():
                     emit({"type": "status", "phase": "summarising_previous", "message": "Updating conversation context..."})
@@ -270,9 +264,6 @@ class CodeAgent(BaseAgent):
             except Exception:
                 _log.error("codebase RAG retrieve failed", exc_info=True)
 
-        # Tools framework — gate → plan → dispatch. Shares the same flag as chat
-        # so ops can disable the whole pipeline in one place. Emits tool_status
-        # events through the same STORE channel the frontend already handles.
         tool_context: ToolContext = ToolContext()
         web_search_enabled = is_feature_enabled("web_search")
         if TOOLS_FRAMEWORK_ENABLED:
@@ -308,7 +299,6 @@ class CodeAgent(BaseAgent):
                 code_collection = f"code_{conversation_id}" if conversation_id else "code_knowledge"
 
                 if hints == {"web_search"}:
-                    # Fast path: skip planner, zero model calls.
                     _log.info("web_search fast-path  conv=%s", conversation_id)
                     from tools.search.queries import generate_broad_queries
                     from workers.chat.history import extract_conversation_topics
@@ -337,7 +327,6 @@ class CodeAgent(BaseAgent):
                             _log.error("web_search fast-path failed  conv=%s", conversation_id, exc_info=True)
                             tool_context = ToolContext()
                 else:
-                    # Full planner path for non-search hints.
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:
@@ -410,8 +399,7 @@ class CodeAgent(BaseAgent):
         tool_block = tool_context.to_system_block()
         if tool_block:
             payload.append({"role": "system", "content": tool_block})
-        # style placed last so it sits closest to the user turn without
-        # breaking history/turn alternation.
+        # style last — sits closest to user turn without breaking role alternation
         payload.append({"role": "system", "content": style_prompt})
         payload.extend(history)
         payload.append({"role": "user", "content": composed_message})
@@ -437,8 +425,7 @@ class CodeAgent(BaseAgent):
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("turn done    conv=%s mode=%s model=%s in=%d out=%d %.1fs", conversation_id, self.mode, final_model, tokens_input, tokens_output, duration)
 
-        # Persist assistant message immediately — this is the critical write
-        # that survives page navigation. Everything after this is background work.
+        # must persist BEFORE emitting done — drop here loses the turn even though chunks streamed
         if output and conversation_id is not None:
             try:
                 self.db.add_code_message(
@@ -473,14 +460,12 @@ class CodeAgent(BaseAgent):
             "output": output,
         })
 
-        # Background: memory writes, graph extraction, and summarisation.
         import threading
 
         def _post_turn_work():
             _t_bg = time.perf_counter()
             _log.info("code conv=%s  post-turn background starting  mode=%s", conversation_id, self.mode)
 
-            # 1. RAG embedding
             if output and conversation_id is not None:
                 _t = time.perf_counter()
                 try:
@@ -494,7 +479,6 @@ class CodeAgent(BaseAgent):
                 except Exception:
                     _log.error("code conv=%s  [1/5] RAG embed FAILED", conversation_id, exc_info=True)
 
-            # 2. Knowledge embedding
             if convo_knowledge and output:
                 _t = time.perf_counter()
                 try:
@@ -508,7 +492,6 @@ class CodeAgent(BaseAgent):
                 except Exception:
                     _log.error("code conv=%s  [2/5] knowledge embed FAILED", conversation_id, exc_info=True)
 
-                # 3. Graph extraction (queued)
                 try:
                     from workers.tool_queue import get_tool_queue
                     tq = get_tool_queue()
@@ -529,9 +512,9 @@ class CodeAgent(BaseAgent):
                 except Exception:
                     _log.error("code conv=%s  [3/5] graph extraction queue FAILED", conversation_id, exc_info=True)
 
-            # 4. Background summarisation
+            # bg summary produces summary+topics consumed by the NEXT turn's gate
             summary_ev = _get_summary_event(conversation_id)
-            summary_ev.clear()
+            summary_ev.clear()  # blocks next turn until set()
             _t = time.perf_counter()
             try:
                 full_history = history + [
@@ -581,9 +564,8 @@ class CodeAgent(BaseAgent):
             except Exception:
                 _log.error("code conv=%s  [4/5] summary FAILED", conversation_id, exc_info=True)
             finally:
-                summary_ev.set()
+                summary_ev.set()  # must set even on failure or next turn blocks forever
 
-            # 5. Plan checklist extraction (code-specific)
             if self.mode == "plan" and output and conversation_id is not None:
                 try:
                     checklist_steps = _parse_plan_checklist(output)

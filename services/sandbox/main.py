@@ -1,21 +1,3 @@
-"""
-Code execution sandbox for MST-AG.
-
-Runs Python or Bash code in an isolated environment. Returns stdout, stderr,
-exit_code and a timed_out flag.
-
-Security model (defence in depth):
-  - Runs as non-root user "sandbox".
-  - No host volume mounts.
-  - Resource limits enforced by docker-compose (cpus, memory).
-  - Internal-network only — no ports exposed publicly.
-  - Per-request timeout (default 30s, hard-capped at 120s).
-  - Output size capped (50KB stdout, 10KB stderr) to bound response sizes.
-
-If stronger isolation is needed later, per-request container spawning can
-be added without changing the HTTP contract.
-"""
-
 from __future__ import annotations
 
 import logging

@@ -51,7 +51,7 @@ def _heuristic_quality_gate(text: str) -> tuple[bool, str, dict]:
 
     unique_ratio = len(set(tokens)) / len(tokens)
     metrics["unique_ratio"] = round(unique_ratio, 3)
-    # require min corpus size before trusting ratio — a 50-word glossary can legitimately be low
+    # small corpora can legitimately have low ratio (e.g. 50-word glossary)
     if len(tokens) > 500 and unique_ratio < VALIDATOR_MIN_UNIQUE_RATIO:
         return False, "low_lexical_diversity", metrics
 
@@ -141,7 +141,7 @@ def _looks_like_injection(text: str) -> tuple[bool, str, int]:
     prompt = _INJECTION_CHECK_PROMPT.format(span=span[:800])
     raw, tokens = model_call("content_quality", prompt, max_tokens=4)
     if not raw:
-        # fail open — don't reject valid content because model is unavailable
+        # fail open — don't reject valid content if classifier is down
         return False, "injection_check_unavailable", 0
     verdict = raw.strip().upper()
     if verdict.startswith("ADVERSARIAL"):

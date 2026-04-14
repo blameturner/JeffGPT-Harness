@@ -115,7 +115,7 @@ Emit the JSON array now. First character `[`, last character `]`. No prose."""
 
 
 def _salvage_json_array(text: str) -> list | None:
-    # truncated JSON from token limits — find last complete object, close the array
+    # handle JSON truncated at token limit — close the array after the last complete object
     last_close = text.rfind("}")
     if last_close == -1:
         return None

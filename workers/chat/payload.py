@@ -34,7 +34,6 @@ def build_chat_payload(
     if system:
         payload.append({"role": "system", "content": system})
 
-    # Normal search results or no search
     if search_context:
         payload.append({"role": "system", "content": _SEARCH_RESULTS_PROMPT + search_context})
     if search_note:

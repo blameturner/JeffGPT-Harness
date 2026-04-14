@@ -96,7 +96,7 @@ def stats_usage(org_id: int, period: str = "30d"):
             "p50_duration_seconds": _percentile(durations, 0.50),
             "p95_duration_seconds": _percentile(durations, 0.95),
             "p99_duration_seconds": _percentile(durations, 0.99),
-            "time_to_first_token_ms": 0,  # not tracked yet
+            "time_to_first_token_ms": 0,
             "error_count": entry["error_count"],
             "error_rate": round(entry["error_count"] / max(entry["requests"], 1), 4),
         })

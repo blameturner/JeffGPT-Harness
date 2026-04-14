@@ -216,8 +216,7 @@ class NocodbClient:
         search_context_text: str = "",
         **extra_fields,
     ) -> dict:
-        # Extra kwargs are passed through verbatim if non-empty; NocoDB
-        # silently drops unknown columns so schema-optional fields are safe.
+        # nocodb silently drops unknown columns — schema-optional fields are safe to pass
         _log.info("add_message  conv=%d role=%s model=%s content_len=%d", conversation_id, role, model, len(content))
         payload = {
             "conversation_id": conversation_id,

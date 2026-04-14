@@ -16,7 +16,7 @@ MAX_URLS_TO_PROCESS = 5
 MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
-BATCH_TARGET = 5  # aim for this many pages per batch call
+BATCH_TARGET = 5
 RELEVANCE_KEYWORD_THRESHOLD = 0.25
 
 
@@ -67,7 +67,6 @@ def _filter_results_by_relevance(
     dropped = 0
     for r in results:
         haystack = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
-        # Count how many query keywords appear in the result.
         hits = sum(1 for kw in query_keywords if kw in haystack)
         ratio = hits / len(query_keywords)
 

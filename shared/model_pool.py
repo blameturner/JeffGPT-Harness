@@ -1,32 +1,3 @@
-"""
-Load-aware model resolver for background + tool paths.
-
-Design:
-- Every candidate role has its own semaphore bounded to MODEL_PARALLEL_SLOTS,
-  matching llama.cpp --parallel N for that container.
-- `acquire_model(pool)` atomically picks the least-loaded healthy role in a
-  named pool and acquires its slot, yielding (url, model_id). Callers must
-  use the yielded url — never read the URL separately and then acquire a
-  slot, because the resolver may select a different role on each call.
-- The "fast" pool picks whichever has the most free slots at call time, so
-  work drifts across available roles as load shifts.
-- The "tool" pool is t3_tool → t2_coder. t3_tool is preferred for short
-  classifier/JSON calls; if it's saturated or down, fall back load-aware
-  across the rest.
-- Neither pool includes the reasoner (no model registers under that role in
-  the current deployment, but _assert_not_reasoner() is still used by
-  callers as belt-and-braces).
-
-Backward-compat:
-- `_fast_model()` / `_tool_model()` still exist for callers that only need
-  a URL without holding a slot (e.g. history summariser, query generator).
-  They return the least-loaded healthy role in the pool at snapshot time.
-- `fast_slot()` / `tool_slot()` are thin wrappers over `acquire_model` that
-  discard the yielded url/model_id, for callers that only want concurrency
-  bounding. New code should prefer `acquire_model` because the shim can't
-  tell the caller which role was picked.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -39,15 +10,8 @@ from infra.config import MODEL_PARALLEL_SLOTS, MODELS, REASONER_ROLE
 _log = logging.getLogger("web_search.models")
 
 
-# ---------- Pools ----------
-
-# Role names match the MODEL_<NAME>_URL env var convention, lowercased and
-# with the leading MODEL_ stripped (see config._collect_role_env_vars).
-# Fast pool: used for summarisation and relationship extraction.
-# Only non-thinking models — Gemma 4 thinking can't be disabled per-request.
+# pools exclude gemma 4 — thinking can't be disabled per-request
 _FAST_POOL: tuple[str, ...] = ("t3_tool", "t2_coder")
-# Tool pool: used for planner, classifiers, web search summariser.
-# t3_tool preferred (fast 4B), t2_coder fallback (no thinking).
 _TOOL_POOL: tuple[str, ...] = ("t3_tool", "t2_coder")
 
 _POOLS: dict[str, tuple[str, ...]] = {
@@ -55,18 +19,13 @@ _POOLS: dict[str, tuple[str, ...]] = {
     "tool": _TOOL_POOL,
 }
 
-# Safe background roles — used for a startup-time assertion and for the
-# _assert_not_reasoner guard in workers.models.
 _SAFE_ROLES: tuple[str, ...] = tuple(sorted(set(_FAST_POOL + _TOOL_POOL)))
 
-
-# ---------- Per-role slots ----------
 
 _role_semaphores: dict[str, threading.Semaphore] = {}
 _role_sem_lock = threading.Lock()
 
-# Priority: user-facing requests set this flag. Background tasks
-# check it and yield if a user request is waiting.
+# background tasks watch this and back off when user requests are waiting
 _user_requests_waiting = threading.Event()
 
 
@@ -82,8 +41,7 @@ def _sem_for(role: str) -> threading.Semaphore:
 
 
 def _free_slots(sem: threading.Semaphore) -> int:
-    # threading.Semaphore._value is private but stable across CPython
-    # versions; it represents the remaining permits before blocking.
+    # _value is private but stable across CPython versions
     return int(getattr(sem, "_value", 0))
 
 
@@ -96,22 +54,9 @@ def _present_candidates(pool: tuple[str, ...]) -> list[tuple[str, dict, threadin
     return out
 
 
-# ---------- Atomic pick + acquire ----------
-
 @contextmanager
 def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str | None, str | None]]:
-    """
-    Atomically pick the least-loaded healthy model in the named pool and
-    acquire its slot. Yields (url, model_id). Callers MUST post to the
-    yielded url; never mix with a separately-resolved URL.
-
-    priority=True marks this as a user-facing request. Background tasks
-    should pass priority=False (default) and will back off briefly when
-    a user request is waiting.
-
-    If no model in the pool is in the catalog, yields (None, None) and
-    does NOT acquire a slot — callers should short-circuit.
-    """
+    # caller MUST post to yielded url — resolver may pick a different role than a separate URL lookup
     if priority:
         _user_requests_waiting.set()
 
@@ -135,7 +80,7 @@ def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str 
         yield None, None
         return
 
-    # Rank by most free slots first; ties broken by pool order (earlier = preferred).
+    # ties broken by pool order — earlier entries are preferred
     ranked = sorted(
         enumerate(present),
         key=lambda it: (-_free_slots(it[1][2]), it[0]),
@@ -176,8 +121,6 @@ def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str 
         acquired_sem.release()
 
 
-# ---------- Read-only discovery (for URL-only callers) ----------
-
 def _best_in_pool(pool: tuple[str, ...]) -> tuple[str | None, str | None]:
     present = _present_candidates(pool)
     if not present:
@@ -188,55 +131,29 @@ def _best_in_pool(pool: tuple[str, ...]) -> tuple[str | None, str | None]:
 
 
 def _fast_model() -> tuple[str | None, str | None]:
-    """
-    Return (url, model_id) for the least-loaded healthy fast-pool model.
-    Best-effort snapshot — callers that ALSO need concurrency bounding
-    should use `acquire_model("fast")` instead.
-    """
+    # best-effort snapshot — doesn't bound concurrency, prefer acquire_model("fast") for that
     return _best_in_pool(_FAST_POOL)
 
 
 def _tool_model() -> tuple[str | None, str | None]:
-    """Read-only discovery for the tool pool. See `_fast_model`."""
     return _best_in_pool(_TOOL_POOL)
 
 
-# ---------- Back-compat slot shims ----------
-
 @contextmanager
 def fast_slot() -> Iterator[None]:
-    """
-    Deprecated — prefer `acquire_model("fast")` so pick and slot are atomic.
-    This shim acquires a slot in the least-loaded fast-pool role but throws
-    away which role it picked, so the caller's separate `_fast_model()` URL
-    may belong to a different role. That's acceptable only for callers that
-    treat slot acquisition as pure concurrency bounding.
-    """
+    # deprecated shim — pick and slot aren't atomic, caller's separate url may be for a different role
     with acquire_model("fast"):
         yield
 
 
 @contextmanager
 def tool_slot() -> Iterator[None]:
-    """Deprecated — prefer `acquire_model("tool")`."""
     with acquire_model("tool"):
         yield
 
 
-# ---------- Config-driven role acquisition ----------
-
 @contextmanager
 def acquire_role(role: str, priority: bool = False) -> Iterator[tuple[str | None, str | None]]:
-    """
-    Acquire a slot for a specific model role (from config.json).
-
-    Unlike acquire_model(pool), this targets a single named role directly
-    rather than picking from a pool. Used by the config-driven model_call()
-    dispatch.
-
-    Yields (url, model_id). If the role isn't in the model catalog,
-    yields (None, None) without acquiring a slot.
-    """
     entry = MODELS.get(role)
     if not isinstance(entry, dict) or not entry.get("url"):
         _log.error(

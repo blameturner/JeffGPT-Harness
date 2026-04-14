@@ -37,9 +37,7 @@ def schedule_user_message_write(
     model: str,
     style_key: str,
 ) -> threading.Event:
-    # Caller must wait on the returned Event before POSTing the assistant
-    # message — NocoDB server-stamps created_at per POST arrival, so reversed
-    # arrival order would invert list_messages on the next turn.
+    # nocodb server-stamps created_at on POST arrival — caller must wait before posting assistant msg or ordering flips
     written = threading.Event()
 
     def _bg():
@@ -78,8 +76,7 @@ def persist_assistant_message(
 ) -> bool:
     intent_meta: dict = {}
     if intent_dict:
-        # classification is a nested JSON column the frontend reads as
-        # msg.classification.intent; flat intent/intent_entities are kept for legacy consumers
+        # dual-write: nested classification.* for frontend, flat intent/intent_entities for legacy consumers
         classification = {
             "route": intent_dict.get("route"),
             "intent": intent_dict.get("intent"),

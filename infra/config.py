@@ -13,14 +13,7 @@ _log = logging.getLogger("config")
 load_dotenv()
 
 
-# ---------------------------------------------------------------------------
-# Platform config (config.json)
-# ---------------------------------------------------------------------------
-
-
 def load_platform_config() -> dict:
-    """Load config.json from project root. This is the single source of truth
-    for all model function configs and feature toggles."""
     config_path = Path(__file__).parent.parent / "config.json"
     try:
         with open(config_path) as f:
@@ -47,11 +40,6 @@ PLATFORM: dict = load_platform_config()
 
 
 def get_function_config(function_name: str) -> dict:
-    """Return model config for a named function from config.json.
-
-    Raises KeyError if the function is not defined — every model call
-    must have an explicit entry in config.json.
-    """
     cfg = PLATFORM.get("models", {}).get(function_name)
     if cfg:
         return cfg
@@ -62,7 +50,6 @@ def get_function_config(function_name: str) -> dict:
 
 
 def is_feature_enabled(name: str) -> bool:
-    """Check if a feature toggle is enabled. Must be defined in config.json."""
     features = PLATFORM.get("features", {})
     if name not in features:
         _log.warning("feature %r not in config.json, defaulting to True", name)
@@ -176,7 +163,7 @@ def discover_models() -> dict:
     host = _get_host()
     port_start = int(os.getenv("MODEL_PORT_START", "8080"))
     port_end = int(os.getenv("MODEL_PORT_END", "8090"))
-    # Exclude ports used by non-model SVC_ services so they aren't registered as models
+    # port-scan must skip non-model SVC_* ports or they'll register as models
     exclude_ports: set[int] = set()
     for _svc_var in ("SVC_EMBEDDER_URL", "SVC_RERANKER_URL", "SVC_WHISPER_URL", "SVC_SEARXNG_URL"):
         _svc_url = os.getenv(_svc_var, "")
@@ -266,20 +253,16 @@ ENRICHMENT_LOG_RETENTION_DAYS = int(os.getenv("ENRICHMENT_LOG_RETENTION_DAYS", "
 MAX_SUMMARY_INPUT_CHARS = 6000  # tool model has 8k context
 PROACTIVE_BUDGET_THRESHOLD = 5000
 
-# Reasoner role is reserved for interactive chat; background/tool paths
-# must never resolve to it — see workers.models._assert_not_reasoner.
+# reasoner reserved for interactive chat — background/tool paths must never resolve to it
 REASONER_ROLE = "reasoner"
 
-# Bounds concurrent in-flight model calls to match llama.cpp's --parallel N.
+# must match llama.cpp --parallel N
 MODEL_PARALLEL_SLOTS = int(os.getenv("MODEL_PARALLEL_SLOTS", "2"))
 
-# Per-role overrides for MODEL_PARALLEL_SLOTS.  Roles not listed here fall
-# back to the global MODEL_PARALLEL_SLOTS value.
 ROLE_PARALLEL_SLOTS: dict[str, int] = {
     "t3_tool": int(os.getenv("MODEL_PARALLEL_SLOTS_T3_TOOL", "1")),
 }
 
-# Tool job queue defaults
 JOB_QUEUE_POLL_INTERVAL = float(os.getenv("JOB_QUEUE_POLL_INTERVAL", "300"))
 JOB_QUEUE_STALE_TIMEOUT = int(os.getenv("JOB_QUEUE_STALE_TIMEOUT", "300"))
 CATEGORY_COLLECTIONS = {
@@ -302,15 +285,7 @@ def scoped_graph(org_id: int) -> str:
 
 
 def no_think_params(model_id: str | None = None) -> dict:
-    """Extra params to disable thinking on tool/classifier model calls.
-
-    llama.cpp passes chat_template_kwargs through the Jinja chat template.
-    Setting enable_thinking=false tells the template to skip thinking blocks.
-
-    If a model_id is provided, uses the model's profile-specific disable
-    params (which may differ per model family).  Falls back to the universal
-    default when no profile matches or no model_id is given.
-    """
+    # chat_template_kwargs flows through jinja template to skip thinking blocks
     if model_id:
         from model_profiles import no_think_params_for
         params = no_think_params_for(model_id)

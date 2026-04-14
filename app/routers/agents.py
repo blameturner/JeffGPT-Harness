@@ -65,7 +65,7 @@ def run_agent_stream(request: RunRequest):
 
 @router.get("/stream/{job_id}")
 def stream(job_id: str, cursor: int = 0):
-    # Resumable SSE: clients reconnect with ?cursor=N to replay missed events.
+    # cursor=N replays missed events on reconnect — don't remove without coordinating with client
     return StreamingResponse(stream_events(job_id, cursor), media_type="text/event-stream")
 
 

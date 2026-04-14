@@ -12,7 +12,7 @@ _log = logging.getLogger("workers.models")
 
 FAST_TIMEOUT = 3600
 
-# Roles that must never receive background/tool traffic.
+# chat-only functions bypass the reasoner guard below
 _CHAT_ONLY_FUNCTIONS = frozenset({"chat", "code"})
 
 
@@ -41,7 +41,7 @@ def _raw_model_call(
     temperature: float,
     extra_params: dict | None = None,
 ) -> tuple[str, int]:
-    """Low-level model call. Slot acquisition is the caller's responsibility."""
+    # slot acquisition is caller's responsibility
     started = time.time()
     _log.info(
         "%s start  url=%s model=%s prompt_len=%d max_tokens=%d",
@@ -98,15 +98,6 @@ def model_call(
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> tuple[str, int]:
-    """Config-driven model call.
-
-    Reads role, temperature, max_tokens from config.json for the given
-    function_name. Acquires a slot for that role, calls the model, returns
-    (response_text, tokens_used).
-
-    Caller can override temperature/max_tokens for one-off needs; config
-    values are used when not provided.
-    """
     cfg = get_function_config(function_name)
     role = cfg["role"]
     temp = temperature if temperature is not None else cfg.get("temperature", 0.2)
@@ -123,10 +114,6 @@ def model_call(
         _assert_not_reasoner(url, function_name)
         return _raw_model_call(function_name, url, model_id, prompt, mt, temp, extra or None)
 
-
-# ---------------------------------------------------------------------------
-# Legacy wrappers — kept during migration, will be removed.
-# ---------------------------------------------------------------------------
 
 def _tool_call(prompt: str, max_tokens: int, temperature: float = 0.2) -> tuple[str, int]:
     with acquire_model("tool") as (url, model_id):

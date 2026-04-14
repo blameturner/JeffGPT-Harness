@@ -50,8 +50,7 @@ def _definitely_chitchat(message: str, history: list[dict] | None) -> bool:
         return False
     if _CHITCHAT_WH_QUESTION.search(msg):
         return False
-    # require a positive chitchat opener so we never misroute code or factual
-    # questions that happen not to contain trigger words ("can you explain...")
+    # require a positive opener — otherwise "can you explain..." misroutes as chitchat
     return bool(_CHITCHAT_OPENER.match(msg))
 
 

@@ -1,13 +1,3 @@
-"""Shared post-turn background work for chat and code agents.
-
-Phases:
-  1. RAG embedding (per-conversation collection)
-  2. Knowledge embedding (shared knowledge collection)
-  3. Graph extraction queued to tool_queue (inside knowledge block)
-  4. Conversation summarisation (always runs)
-  5. Optional extra phase (e.g. code checklist extraction)
-"""
-
 from __future__ import annotations
 
 import logging
@@ -27,23 +17,18 @@ class PostTurnConfig:
     output: str
     model: str
     history: list[dict]
-    collection_name: str           # per-conversation RAG collection
-    knowledge_collection: str      # shared knowledge collection name
+    collection_name: str
+    knowledge_collection: str
     rag_enabled: bool
     knowledge_enabled: bool
-    source: str = "chat"           # "chat" or "code" — for graph extraction source tag
-    db: Any = None                 # NocodbClient instance
-    extra_phase: Callable | None = None  # optional phase 5 callback
+    source: str = "chat"
+    db: Any = None
+    extra_phase: Callable | None = None
 
-    # --- summary persistence callbacks ---
-    # list_messages(conversation_id) -> list[dict]
     list_messages_fn: Callable | None = None
-    # patch_summary(existing_id, content) -> None
     patch_summary_fn: Callable | None = None
-    # create_summary(conversation_id, org_id, content) -> None
     create_summary_fn: Callable | None = None
 
-    # Extra metadata merged into the embedding metadata dict
     extra_metadata: dict = field(default_factory=dict)
 
 
@@ -52,14 +37,10 @@ def _phase_count(config: PostTurnConfig) -> int:
 
 
 def run_post_turn_work(config: PostTurnConfig) -> None:
-    """Execute all post-turn background phases sequentially.
-
-    Designed to be called from a daemon thread.
-    """
     from infra.memory import remember
     from workers.chat.history import maybe_summarise
 
-    # Lazy import to avoid circular dependency
+    # lazy import — circular dep with workers.base
     from workers.base import _get_summary_event
 
     cid = config.conversation_id
@@ -76,9 +57,6 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
 
     turn_text = f"USER: {config.user_message}\n\nASSISTANT: {config.output}"
 
-    # ------------------------------------------------------------------
-    # Phase 1: RAG embedding
-    # ------------------------------------------------------------------
     if config.rag_enabled and config.output:
         _t = time.perf_counter()
         try:
@@ -95,9 +73,6 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
         except Exception:
             _log.error("%s conv=%s  [1/%d] RAG embed FAILED", config.source, cid, n, exc_info=True)
 
-    # ------------------------------------------------------------------
-    # Phase 2: Knowledge embedding
-    # ------------------------------------------------------------------
     if config.knowledge_enabled and config.output:
         _t = time.perf_counter()
         try:
@@ -114,9 +89,6 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
         except Exception:
             _log.error("%s conv=%s  [2/%d] knowledge embed FAILED", config.source, cid, n, exc_info=True)
 
-        # --------------------------------------------------------------
-        # Phase 3: Graph extraction (queued, not inline)
-        # --------------------------------------------------------------
         try:
             from workers.tool_queue import get_tool_queue
             tq = get_tool_queue()
@@ -140,11 +112,8 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
         except Exception:
             _log.error("%s conv=%s  [3/%d] graph extraction queue FAILED", config.source, cid, n, exc_info=True)
 
-    # ------------------------------------------------------------------
-    # Phase 4: Background summarisation
-    # ------------------------------------------------------------------
     summary_ev = _get_summary_event(cid)
-    summary_ev.clear()  # mark as running
+    summary_ev.clear()  # mark running — next turn will wait on this
     _t = time.perf_counter()
     try:
         full_history = config.history + [
@@ -182,11 +151,8 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
     except Exception:
         _log.error("%s conv=%s  [4/%d] summary FAILED", config.source, cid, n, exc_info=True)
     finally:
-        summary_ev.set()  # mark as done, unblock any waiting turn
+        summary_ev.set()  # must set even on failure — otherwise next turn blocks forever
 
-    # ------------------------------------------------------------------
-    # Phase 5: extra phase callback (e.g. code checklist extraction)
-    # ------------------------------------------------------------------
     if config.extra_phase:
         try:
             config.extra_phase()
@@ -207,7 +173,6 @@ def _persist_summary(
     phase_start: float,
     n: int,
 ) -> None:
-    """Persist or update the conversation summary via config callbacks."""
     if config.list_messages_fn is None:
         _log.warning("%s conv=%s  [4/%d] no list_messages_fn — cannot persist summary", config.source, cid, n)
         return

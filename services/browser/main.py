@@ -1,15 +1,3 @@
-"""
-Headless browser fetch service for MST-AG.
-
-Exposes POST /fetch which navigates to a URL via Playwright/Chromium and
-returns the fully-rendered HTML. The harness calls this when the plain
-requests-based scraper fails (JS-heavy sites, cookie walls, CF interstitials).
-
-Deliberately minimal — one endpoint, one shared browser instance, resource
-limits are enforced by Docker. No auth is required because the service is
-exposed only on the internal mst-ag-01-network.
-"""
-
 from __future__ import annotations
 
 import asyncio

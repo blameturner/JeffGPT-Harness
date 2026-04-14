@@ -1,13 +1,3 @@
-"""Base agent class — shared infrastructure for chat and code agents.
-
-Provides:
-  - Model URL resolution and validation
-  - Streaming model calls (delegates to streaming.py)
-  - Utility methods (_truthy, _default_collection)
-  - Summary event coordination
-  - Job-based streaming wrappers
-"""
-
 from __future__ import annotations
 
 import logging
@@ -21,21 +11,18 @@ from infra.nocodb_client import NocodbClient
 
 _log = logging.getLogger("agent.base")
 
-# How long to wait for an in-flight background summary before proceeding.
 SUMMARY_WAIT_TIMEOUT = 15
 
-# Per-conversation locks — prevents a new turn from reading stale summary
-# while the previous turn's background summarisation is still running.
+# per-conv summary event — blocks new turn while previous turn's bg summary still running
 _summary_events: dict[int, threading.Event] = {}
 _summary_lock = threading.Lock()
 
 
 def _get_summary_event(conversation_id: int) -> threading.Event:
-    """Get or create a threading.Event for a conversation's background summary."""
     with _summary_lock:
         if conversation_id not in _summary_events:
             ev = threading.Event()
-            ev.set()  # no summary in progress initially
+            ev.set()  # initial state: no summary in progress
             _summary_events[conversation_id] = ev
         return _summary_events[conversation_id]
 
@@ -53,8 +40,6 @@ class ChatResult:
 
 
 class BaseAgent:
-    """Shared base for ChatAgent and CodeAgent."""
-
     def __init__(self, model: str, org_id: int, search_enabled: bool = False):
         url = get_model_url(model)
         if not url:
@@ -100,7 +85,6 @@ class BaseAgent:
         max_tokens: int,
         emit: Callable[[dict], None],
     ) -> tuple[list[str], dict, str]:
-        """Call the model with streaming. Delegates to streaming.py."""
         from workers.streaming import stream_model_response
         return stream_model_response(
             url=self.url,
@@ -122,7 +106,6 @@ class BaseAgent:
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
     ) -> ChatResult:
-        """Non-streaming convenience wrapper — consumes events and returns result."""
         parts: list[str] = []
         final: dict = {}
         conv_id = conversation_id or 0
@@ -158,5 +141,4 @@ class BaseAgent:
         )
 
     def send_streaming(self, **kwargs) -> Iterator[dict]:
-        """Override in subclass — creates a Job and yields events."""
         raise NotImplementedError("subclass must implement send_streaming")

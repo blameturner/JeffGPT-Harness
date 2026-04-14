@@ -239,9 +239,7 @@ def run_web_search(
         _log.warning("unknown search policy %r, defaulting to focused", policy)
         budget = _POLICY_BUDGETS[SEARCH_POLICY_FOCUSED]
 
-    # Contextual enrichment has a hard latency cap; wrap the inner pipeline
-    # in a future and return "deferred" on timeout. The background thread
-    # continues — Python can't cancel blocking httpx cleanly.
+    # contextual: hard latency cap via future; the bg thread keeps running (can't cancel blocking httpx)
     if policy == SEARCH_POLICY_CONTEXTUAL:
         import concurrent.futures as _futures
         ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="contextual-search")

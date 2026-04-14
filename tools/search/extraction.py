@@ -101,7 +101,7 @@ def _extract_one_page(
     if not page_text or not page_text.strip():
         return None
 
-    # deferred import: quality module may pull FalkorDB at import time
+    # deferred import: shared.quality pulls FalkorDB at import time
     try:
         from shared.quality import (
             _classify_content_type,

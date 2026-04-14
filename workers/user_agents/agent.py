@@ -91,8 +91,7 @@ class Agent:
         url: str | None = None,
         model: str | None = None,
     ) -> Iterator[dict]:
-        # Yields {"type": "chunk"|"done"|"error", ...}. Never raises — the
-        # error event is terminal.
+        # never raises — errors surface as {"type": "error"} terminal events
         url = url or self._get_model_url()
         model = model or self.config["model"]
         temperature = temperature if temperature is not None else self.config.get("temperature", 0.7)

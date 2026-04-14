@@ -56,24 +56,13 @@ _DEFINITE_CHITCHAT = re.compile(
 
 
 def _definitely_no_search(message: str) -> bool:
-    """Return True only for messages that DEFINITELY don't need search.
-
-    Intentionally narrow — we'd rather search unnecessarily than miss
-    relevant information.  Only blocks:
-    - Empty messages
-    - Code blocks / snippets
-    - Very short chitchat (greetings, thanks, single-word acks)
-    """
     msg = message.strip()
     if not msg:
         return True
-    # Code blocks should not trigger search.
     if "```" in msg or msg.lstrip().startswith(_CODE_PREFIXES):
         return True
-    # Definite chitchat — single-word/phrase acks, greetings, thanks.
     if len(msg) <= 80 and _DEFINITE_CHITCHAT.search(msg):
         return True
-    # Everything else gets a chance at search.
     return False
 
 

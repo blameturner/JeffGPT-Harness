@@ -5,19 +5,15 @@ import logging
 _log = logging.getLogger("chat.history")
 
 
-# Budget: keep prompt-eval fast on CPU.
-# ~4 chars ≈ 1 token.  8K chars ≈ 2K tokens of history — comfortable headroom
-# for system prompt + search context without blowing past model context or
-# causing multi-minute prompt eval.
-MAX_HISTORY_CHARS = 8_000          # hard cap on total history chars sent to model
-KEEP_RECENT_EXCHANGES = 3          # minimum full exchanges (user+assistant pairs) to preserve
-MAX_SINGLE_MESSAGE_CHARS = 2_000   # truncate any single message longer than this
-SUMMARISE_THRESHOLD_CHARS = 6_000  # trigger RWKV summarisation above this
-SUMMARISE_THRESHOLD_MESSAGES = 8   # or this many messages
+# 8K chars ≈ 2K tokens — keeps CPU prompt-eval under a minute with headroom for system+search
+MAX_HISTORY_CHARS = 8_000
+KEEP_RECENT_EXCHANGES = 3
+MAX_SINGLE_MESSAGE_CHARS = 2_000
+SUMMARISE_THRESHOLD_CHARS = 6_000
+SUMMARISE_THRESHOLD_MESSAGES = 8
 
 
 def _truncate_message(msg: dict) -> dict:
-    """Trim a single message to MAX_SINGLE_MESSAGE_CHARS, keeping head + tail."""
     content = msg.get("content") or ""
     if len(content) <= MAX_SINGLE_MESSAGE_CHARS:
         return msg
@@ -31,7 +27,6 @@ def _total_chars(history: list[dict]) -> int:
 
 
 def extract_conversation_topics(history: list[dict]) -> list[str]:
-    """Extract TOPICS keywords from the conversation summary if present."""
     import re
     for m in history:
         if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
@@ -47,45 +42,28 @@ def extract_conversation_topics(history: list[dict]) -> list[str]:
 
 
 def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[list[dict], dict | None]:
-    """Summarise older history via RWKV when it exceeds thresholds.
-
-    Keeps the most recent KEEP_RECENT_EXCHANGES exchanges verbatim.
-    Everything older gets compressed into a single [Conversation summary]
-    system message via the ``chat_summarise`` model config.
-
-    When ``truncate_only=True``, skips the RWKV call and only truncates.
-    Used on the critical path so the model call runs in background instead.
-
-    Falls back to truncation if the model call fails or is unavailable.
-    """
+    # truncate_only=True keeps this off the hot path — caller runs the model call in bg
     if not history:
         return history, None
 
     total = _total_chars(history)
 
-    # Small enough — just truncate individual long messages, no summary needed.
     if total <= SUMMARISE_THRESHOLD_CHARS and len(history) <= SUMMARISE_THRESHOLD_MESSAGES:
         return [_truncate_message(m) for m in history], None
 
-    # Split: recent messages to keep verbatim, older messages to summarise.
     keep_count = min(len(history), KEEP_RECENT_EXCHANGES * 2)
     older = history[:-keep_count] if keep_count < len(history) else []
     recent = history[-keep_count:]
 
     if not older:
-        # Not enough older messages to warrant summarisation — just truncate.
         return [_truncate_message(m) for m in recent], None
 
-    # Build text block from older messages for summarisation.
-    # Check if there's already a summary message we should preserve/extend.
     existing_summary = ""
     msgs_to_summarise = older
     if older and older[0].get("role") == "system" and "[Conversation summary]" in (older[0].get("content") or ""):
         existing_summary = older[0]["content"]
         msgs_to_summarise = older[1:]
 
-    # Feed full message content to the summariser so it can capture
-    # important context.  The RWKV call itself is bounded by max_input_chars.
     older_text = ""
     for m in msgs_to_summarise:
         role = m.get("role", "user")
@@ -93,14 +71,11 @@ def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[l
         older_text += f"{role}: {content}\n\n"
 
     if not older_text.strip() and existing_summary:
-        # Only the previous summary exists, no new messages to compress.
         result = [{"role": "system", "content": existing_summary}] + [_truncate_message(m) for m in recent]
         return result, None
 
-    # Summarise the older messages (or skip if truncate_only).
     if truncate_only:
-        # Preserve the existing summary if one exists from a previous
-        # background run — don't drop it during truncation.
+        # preserve existing summary from a prior bg run — truncation must not drop it
         if existing_summary:
             result = [{"role": "system", "content": existing_summary}] + [_truncate_message(m) for m in recent]
             return result, None
@@ -123,12 +98,10 @@ def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[l
                    len(older), _total_chars(older), len(summary), topics)
         return result, event
 
-    # Fallback: truncation only (summariser unavailable, failed, or skipped).
     if not truncate_only:
         _log.warning("summariser: model call failed — falling back to truncation")
     recent = [_truncate_message(m) for m in recent]
 
-    # Drop oldest kept pairs if still over budget.
     while len(recent) > 2:
         if _total_chars(recent) <= MAX_HISTORY_CHARS:
             break
@@ -147,7 +120,6 @@ def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[l
 
 
 def _parse_summary_and_topics(raw: str) -> tuple[str, list[str]]:
-    """Split RWKV output into (summary_text, topic_keywords)."""
     import re
     lines = raw.strip().split("\n")
     topics: list[str] = []
@@ -163,7 +135,6 @@ def _parse_summary_and_topics(raw: str) -> tuple[str, list[str]]:
 
 
 def _call_summarise(older_text: str, existing_summary: str) -> tuple[str, list[str]] | tuple[None, list[str]]:
-    """Call the summariser model to compress conversation history."""
     try:
         from infra.config import get_function_config
         from shared.models import model_call

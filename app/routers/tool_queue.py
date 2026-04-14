@@ -45,8 +45,6 @@ def active_jobs(
     conversation_id: int | None = None,
     source: str = "",
 ):
-    """Lightweight endpoint for UI banners — returns counts of queued/running
-    jobs, optionally filtered by conversation_id and source."""
     q = _get_queue(request)
     jobs = q.list_jobs(source=source, limit=200)
     active = [
@@ -108,13 +106,7 @@ def cancel_job(job_id: str, request: Request):
 
 
 def _event_stream(queue, disconnect: threading.Event):
-    """Thread-safe SSE generator with disconnect detection.
-
-    The subscriber buffer is a ``collections.deque`` — ``popleft()`` is
-    atomic and O(1) under CPython's GIL, so no explicit lock is needed
-    between the producer (``_emit_event``, which holds ``_sub_lock`` when
-    appending) and this single consumer.
-    """
+    # deque.popleft is atomic under the GIL — producer/consumer need no shared lock here
     buf = queue.subscribe()
     try:
         while not disconnect.is_set():

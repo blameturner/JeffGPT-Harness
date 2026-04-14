@@ -66,7 +66,7 @@ def _run_agent_job(agent_name: str, org_id: int, task: str, product: str) -> Non
 
 
 def _register_agent_schedules(sched: BackgroundScheduler) -> int:
-    # Drop previously-registered agent jobs so reload is idempotent.
+    # clear existing agent jobs so reload is idempotent
     for job in list(sched.get_jobs()):
         if job.id.startswith(AGENT_JOB_PREFIX):
             sched.remove_job(job.id)

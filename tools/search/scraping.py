@@ -126,10 +126,7 @@ def _looks_like_antibot(text: str) -> bool:
     return any(m in lower for m in markers)
 
 
-# sync_playwright() is pinned to the thread that called .start(). All playwright
-# calls run on ONE dedicated worker thread owned by this module; callers submit
-# (url, Future) pairs. Any other arrangement violates the thread-affinity
-# contract and crashes worker threads.
+# thread-affinity: sync_playwright() is pinned to its starting thread; all pw calls MUST run on this worker
 _PW_QUEUE_SENTINEL = object()
 _pw_queue: queue.Queue | None = None
 _pw_worker: threading.Thread | None = None
@@ -225,7 +222,6 @@ def _playwright_worker_main() -> None:
                     page.wait_for_load_state("networkidle", timeout=30_000)
                 except Exception:
                     pass
-                # SPA lazy-render: wait for body to accumulate real text.
                 try:
                     page.wait_for_function(
                         "() => document.body && document.body.innerText.length > 200",
@@ -240,13 +236,11 @@ def _playwright_worker_main() -> None:
                     fut.set_result("")
                     continue
 
-                # Remove cookie/consent/GDPR overlays before extraction.
                 try:
                     page.evaluate(_COOKIE_BANNER_NUKE)
                 except Exception:
                     pass
 
-                # Prefer main/article content over full body (strips nav/footer).
                 try:
                     text = page.evaluate(_MAIN_CONTENT_EXTRACT) or ""
                 except Exception:
@@ -436,7 +430,6 @@ def scrape_page(
         _set_meta("scraper", len(text))
         return text
 
-    # Playwright fallback for JS-heavy sites.
     pw_text = playwright_fetch(url)
     if pw_text:
         _log.info("path=playwright_auto  url=%s chars=%d", url[:120], len(pw_text))

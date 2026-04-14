@@ -1,12 +1,9 @@
-"""graph_extract tool handler — extracts knowledge graph relationships from a chat turn."""
-
 import logging
 
 _log = logging.getLogger("tools.graph_extract")
 
 
 def _handle_graph_extract(payload: dict) -> dict:
-    """Extract knowledge graph relationships from a chat turn."""
     from workers.chat.graph import extract_and_write_graph
 
     user_text = payload.get("user_text") or ""

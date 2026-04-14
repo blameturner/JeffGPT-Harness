@@ -1,17 +1,3 @@
-"""
-Tool dispatcher — routes ToolPlan actions to registered executors and runs
-them concurrently with asyncio.gather.
-
-Extensibility — to add a new tool:
-  1. Add an enum value to tools.contract.ToolName.
-  2. Create tools/<name>.py (or tools/search/<name>.py for search tools) with an
-     async `execute(params, emit)` decorated with @register_executor(ToolName.<NAME>).
-  3. Import the new module in the "trigger executor registration" block at the
-     bottom of this file.
-
-The dispatcher itself never changes.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -36,8 +22,6 @@ EXECUTORS: dict[ToolName, Executor] = {}
 
 
 def register_executor(tool: ToolName):
-    """Decorator — registers an async executor for a ToolName."""
-
     def decorator(fn: Executor) -> Executor:
         EXECUTORS[tool] = fn
         return fn
@@ -49,12 +33,7 @@ async def execute_plan(
     plan: ToolPlan,
     emit: Emit | None = None,
 ) -> ToolContext:
-    """
-    Execute every action in the plan concurrently.
-
-    Individual executor failures do not fail the whole plan — they return a
-    non-OK ToolResult and the main model sees the failure in its context.
-    """
+    # per-action failures return a non-OK ToolResult; the whole plan never fails
     _emit: Emit = emit or (lambda _e: None)
 
     if not plan.actions:
@@ -80,7 +59,7 @@ async def execute_plan(
         t0 = time.time()
         try:
             result = await executor(action.params, _emit)
-            # Override whatever the executor set — dispatcher owns these.
+            # dispatcher owns index/elapsed; overwrite whatever the executor set
             result.action_index = index
             result.elapsed_s = round(time.time() - t0, 2)
         except Exception as e:
@@ -106,7 +85,6 @@ async def execute_plan(
     return ToolContext(plan_summary=plan.summary, results=list(results))
 
 
-# --- Trigger executor registration (import side-effect) ---
-# Adding a new tool? Add one more import on the line below and you're done.
+# import for @register_executor side-effects — do not remove
 from tools import rag_lookup  # noqa: E402, F401
 from tools.search import web_search  # noqa: E402, F401

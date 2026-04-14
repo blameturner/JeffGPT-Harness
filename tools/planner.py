@@ -1,15 +1,3 @@
-"""
-Tool planner — calls the shared tool model to generate a ToolPlan.
-
-Only invoked when the heuristic gate (tools.gate) flags at least
-one possible tool. Uses strict few-shot prompting + temperature=0.1 for
-structured JSON output.
-
-The planner is model-agnostic: URL + model id come from config.get_model_url("tool")
-via shared.model_pool._tool_model(). Swapping Qwen 3B for a more capable
-planner later requires zero code changes — just flip the env var.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -47,12 +35,7 @@ async def generate_plan(
     hints: set[str],
     conversation_summary: str = "",
 ) -> ToolPlan | None:
-    """
-    Call the tool model to produce a ToolPlan.
-
-    Returns None if the planner fails, times out, or decides no tools are needed.
-    Fail-open — never raises. Caller proceeds without tools on None.
-    """
+    # fail-open: never raises; caller proceeds toolless on None
     cfg = get_function_config("tool_planner")
 
     user_prompt_parts: list[str] = []

@@ -1,13 +1,3 @@
-"""
-RAG lookup executor — wraps existing rag.retrieve (which handles query
-chunking + ChromaDB lookup + BGE reranking) across a set of likely collections.
-
-If the planner didn't specify a collection, we search the conversation-scoped
-collection and the web_search collection in parallel, then merge + dedupe.
-Results are formatted with the source metadata the existing retrieve() helper
-provides.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -28,15 +18,6 @@ DEFAULT_COLLECTIONS = ("chat_knowledge", "web_search")
 
 @register_executor(ToolName.RAG_LOOKUP)
 async def execute(params: dict, emit) -> ToolResult:
-    """
-    Query one or more ChromaDB collections with the given semantic query.
-
-    params:
-      query: str          — semantic search string
-      _org_id: int        — injected
-      _collection: str    — injected conversation-default collection
-      collections: list   — optional override; search these collections instead
-    """
     query = str(params.get("query") or "").strip()
     if not query:
         return ToolResult(

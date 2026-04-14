@@ -39,7 +39,7 @@ def remember(text: str, metadata: dict, org_id: int, collection_name: str = "age
             continue
         chunk_id = str(uuid.uuid4())
         try:
-            # ChromaDB metadata values must be str, int, float, or bool — filter out None
+            # chroma metadata must be str/int/float/bool — None values crash add()
             clean_meta = {k: v for k, v in {**metadata, "chunk_index": i, "org_id": org_id}.items() if v is not None}
             collection.add(
                 ids=[chunk_id],

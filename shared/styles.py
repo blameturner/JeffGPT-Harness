@@ -169,8 +169,6 @@ def list_code_styles() -> list[dict]:
     return [{"key": k, "prompt": v} for k, v in CODE_STYLES.items()]
 
 
-# Templates never instruct the model to emit numbered citations; the UI
-# renders source attribution separately from the prose.
 _NO_INLINE_CITATIONS = (
     "Do NOT include numbered citations like [1] or [2] in your response. "
     "Do NOT list sources at the end of your reply. The UI renders source "
@@ -269,8 +267,7 @@ SEARCH_CONTEXT_TEMPLATES: dict[str, str] = {
         "did in one sentence. No preamble."
     ),
 
-    # Empty bodies for intents that never fire search — kept so
-    # search_context_for() never raises KeyError.
+    # empty bodies for no-search intents — keeps search_context_for() from raising KeyError
     "chitchat_casual": "",
     "code_explain": "",
     "code_review": "",

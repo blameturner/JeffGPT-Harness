@@ -1,9 +1,3 @@
-"""ChatAgent — orchestrates chat conversation turns.
-
-Inherits from BaseAgent for model calling, streaming, and utilities.
-Uses extracted modules for approval handling, background work, and streaming.
-"""
-
 import asyncio
 import logging
 import time
@@ -34,9 +28,6 @@ _log = logging.getLogger("chat")
 
 
 class ChatAgent(BaseAgent):
-    # __init__, _truthy, _default_collection, _tool_model_url, _call_model,
-    # send, _search_mode all inherited from BaseAgent.
-
     def run_job(
         self,
         job,
@@ -59,7 +50,7 @@ class ChatAgent(BaseAgent):
                 _log.info("emit  type=%s %s", etype, event.get("phase") or event.get("summary", "")[:60] or "")
             STORE.append(job, event)
 
-        # Signal active session so queue workers back off.
+        # signal active session so queue workers back off
         from workers.tool_queue import touch_chat_activity
         touch_chat_activity()
 
@@ -86,8 +77,7 @@ class ChatAgent(BaseAgent):
             if not convo:
                 emit({"type": "error", "message": f"Conversation {conversation_id} not found"})
                 return
-            # Wait for any in-flight background summary to finish so we
-            # pick up the latest summary + topics from the DB.
+            # must wait on prev turn's bg summary — else we'd read stale summary/topics from DB
             summary_ev = _get_summary_event(conversation_id)
             if not summary_ev.is_set():
                 emit({"type": "status", "phase": "summarising_previous", "message": "Updating conversation context..."})
@@ -129,12 +119,9 @@ class ChatAgent(BaseAgent):
         web_search_enabled = is_feature_enabled("web_search")
 
         if TOOLS_FRAMEWORK_ENABLED:
-            # New path: heuristic gate → planner → parallel tool dispatch.
-            # search_result stays empty-default; legacy consent flow is skipped.
             search_result = SearchPhaseResult()
 
-            # Use the last assistant turn (if any) as context so follow-up
-            # questions like "and what about Melbourne?" reopen web_search.
+            # feeding last assistant turn as gate context lets follow-ups ("and melbourne?") re-trigger web_search
             last_assistant = ""
             for turn in reversed(history):
                 if turn.get("role") == "assistant":
@@ -161,9 +148,7 @@ class ChatAgent(BaseAgent):
                     "tools": sorted(hints),
                 })
 
-                # Tools that can be dispatched directly without the planner.
-                # web_search: heuristic queries (zero model calls).
-                # rag_lookup: just a ChromaDB similarity search.
+                # tools dispatchable without the planner (no model-generated params needed)
                 _DIRECT_TOOLS = {"web_search", "rag_lookup"}
 
                 if hints <= _DIRECT_TOOLS and hints:
@@ -174,8 +159,7 @@ class ChatAgent(BaseAgent):
                         convo_topics = extract_conversation_topics(history)
                         if convo_topics:
                             _log.info("chat conv=%s  topics from summary: %s", conversation_id, convo_topics)
-                        # If RAG is running, collect it early to extract
-                        # context keywords for search query enrichment.
+                        # peek rag early (2s budget) to mine keywords for query enrichment
                         if rag_future and not convo_topics:
                             try:
                                 early_rag = rag_future.result(timeout=2)
@@ -223,7 +207,6 @@ class ChatAgent(BaseAgent):
                             _log.error("chat conv=%s  search failed", conversation_id, exc_info=True)
                             tool_context = ToolContext()
                 else:
-                    # Full planner path — for tools that need model-generated params.
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:
@@ -255,8 +238,7 @@ class ChatAgent(BaseAgent):
                         _log.error("tools framework failed  conv=%s", conversation_id, exc_info=True)
                         tool_context = ToolContext()
 
-            # Map tool results back onto search_result so the downstream
-            # payload build and persistence code paths stay unchanged.
+            # map tool results onto search_result to reuse the existing payload/persistence path
             for r in tool_context.results:
                 if r.tool.value == "web_search" and r.ok:
                     search_result.search_context = r.data
@@ -315,10 +297,7 @@ class ChatAgent(BaseAgent):
         search_note = search_result.search_note
         intent_dict = search_result.intent_dict
 
-        # Prepend tool-framework results (rag_lookup, etc.) onto
-        # search_context so they ride the same system-prompt injection path.
-        # web_search results are already mapped onto
-        # search_result.search_context — don't duplicate them.
+        # non-web tool results piggyback on search_context injection; skip web_search (already mapped)
         _ALREADY_MAPPED = {"web_search"}
         if tool_context.results:
             non_web = [r for r in tool_context.results if r.tool.value not in _ALREADY_MAPPED]
@@ -392,8 +371,7 @@ class ChatAgent(BaseAgent):
         tokens_output = int(final_usage.get("completion_tokens") or 0)
         _log.info("chat conv=%s  model response complete  model=%s tokens_in=%d tokens_out=%d duration=%.1fs chars=%d", conversation_id, final_model, tokens_input, tokens_output, duration, len(output))
 
-        # Persist to NocoDB BEFORE emitting done — this is the critical write
-        # that must not be lost. If this fails, the user still has streamed chunks.
+        # must persist BEFORE emitting done — if this drops, user has chunks but no DB record
         if output:
             if not _user_msg_written.wait(timeout=10.0):
                 _log.warning("user message write still pending after 10s  conv=%s", conversation_id)
@@ -438,13 +416,10 @@ class ChatAgent(BaseAgent):
             "search_source_count": len(search_sources),
         })
 
-        # Only memory/graph work in background — these are non-critical.
-
         def _post_turn_work():
             _t_bg = time.perf_counter()
             _log.info("chat conv=%s  post-turn background starting", conversation_id)
 
-            # 1. RAG embedding
             if convo_rag_enabled and output:
                 _t = time.perf_counter()
                 try:
@@ -458,7 +433,6 @@ class ChatAgent(BaseAgent):
                 except Exception:
                     _log.error("chat conv=%s  [1/4] RAG embed FAILED", conversation_id, exc_info=True)
 
-            # 2. Knowledge embedding
             if convo_knowledge and output:
                 _t = time.perf_counter()
                 try:
@@ -472,7 +446,6 @@ class ChatAgent(BaseAgent):
                 except Exception:
                     _log.error("chat conv=%s  [2/4] knowledge embed FAILED", conversation_id, exc_info=True)
 
-                # 3. Graph extraction (queued, not inline)
                 try:
                     from workers.tool_queue import get_tool_queue
                     tq = get_tool_queue()
@@ -493,9 +466,9 @@ class ChatAgent(BaseAgent):
                 except Exception:
                     _log.error("chat conv=%s  [3/4] graph extraction queue FAILED", conversation_id, exc_info=True)
 
-            # 4. Background summarisation — produces summary + topics for next turn
+            # bg summarisation produces summary+topics consumed by the NEXT turn's gate
             summary_ev = _get_summary_event(conversation_id)
-            summary_ev.clear()  # mark as running
+            summary_ev.clear()  # blocks next turn until set()
             _t = time.perf_counter()
             try:
                 full_history = history + [
@@ -544,7 +517,7 @@ class ChatAgent(BaseAgent):
             except Exception:
                 _log.error("chat conv=%s  [4/4] summary FAILED", conversation_id, exc_info=True)
             finally:
-                summary_ev.set()  # mark as done, unblock any waiting turn
+                summary_ev.set()  # must set even on failure or next turn blocks forever
 
             _log.info("chat conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
@@ -579,5 +552,3 @@ class ChatAgent(BaseAgent):
             response_style=response_style,
         )
         yield from job.events
-
-    # _call_model, send inherited from BaseAgent

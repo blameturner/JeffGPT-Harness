@@ -26,9 +26,7 @@ _log = logging.getLogger("web_search.queries")
 
 
 def _quote_entity(entity: str) -> str:
-    # Multi-word entities need phrase quoting so SearxNG doesn't tokenise them
-    # into independent words (that's how "Western Sydney Wanderers" lost to
-    # "2 on the go" pre-fix).
+    # must phrase-quote multi-word entities or searxng tokenises them into independent words
     e = entity.strip().strip('"\'')
     if not e:
         return ""
@@ -241,7 +239,7 @@ def rerank_candidates(
     tail = candidates[max_candidates:]
     ranked = list(zip(head, normalised)) + [(c, 3) for c in tail]
 
-    # Stable sort by score desc preserves original SearxNG order for ties.
+    # stable sort preserves searxng order on score ties
     ranked.sort(key=lambda pair: -pair[1])
 
     _log.info(
@@ -271,9 +269,7 @@ _STOPWORDS: frozenset[str] = frozenset(
     "you're you've your yours yourself yourselves".split()
 )
 
-# Words that are part of question/instruction framing, not the topic itself.
-# Separated from stopwords so topic-extraction can strip these without
-# losing genuinely meaningful words like "compare" in a comparison query.
+# kept separate from stopwords so comparison queries can still use "compare"
 _FRAMING_WORDS: frozenset[str] = frozenset(
     "tell explain describe discuss define help show give list name "
     "know want need like think say said going go make made "
@@ -285,17 +281,12 @@ _FRAMING_WORDS: frozenset[str] = frozenset(
 
 
 def _extract_keywords(message: str) -> list[str]:
-    """Extract meaningful keywords by removing stopwords and framing. Pure Python, sub-ms."""
     words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
     noise = _STOPWORDS | _FRAMING_WORDS
     return [w for w in words if w.lower() not in noise and len(w) > 1]
 
 
 def _extract_phrases(message: str) -> list[str]:
-    """Extract contiguous runs of non-stopword tokens as phrases.
-
-    "tell me about the Linux kernel architecture" → ["Linux kernel architecture"]
-    """
     words = re.findall(r"[a-zA-Z0-9][\w\-.']*[a-zA-Z0-9]|[a-zA-Z0-9]", message)
     noise = _STOPWORDS | _FRAMING_WORDS
     phrases: list[str] = []
@@ -312,22 +303,16 @@ def _extract_phrases(message: str) -> list[str]:
     return phrases
 
 
-# ---- Core topic extraction ----
-
-# Regex patterns stripped from the START of the message to isolate the actual
-# topic.  Order matters — longer/more specific patterns first.  Each pattern
-# should consume the framing prefix so we're left with the user's real subject.
+# order matters: longer/more-specific patterns first so they eat the full preamble
 _QUESTION_PREAMBLES: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        # Instruction preambles
         r"^(?:can|could|would) you (?:please |kindly )?(?:tell|show|explain|describe|find|look up|search|help(?: me)?(?: with)?|give me(?: info(?:rmation)? (?:on|about))?)\s*(?:me )?\s*",
         r"^(?:please |kindly )?(?:tell|show|explain|describe|find|look up|search|help(?: me)?(?: with)?|give me(?: info(?:rmation)? (?:on|about))?)\s*(?:me )?\s*",
         r"^i(?:'m| am) (?:looking for|curious about|wondering about|interested in|trying to (?:find|understand|learn(?: about)?))\s*",
         r"^i (?:want|need|would like) to (?:know|learn|understand|find out)(?: (?:more )?about)?\s*",
         r"^(?:do you know|have you heard)(?: anything)? about\s*",
         r"^(?:what do you know about|what can you tell me about)\s*",
-        # Question words — only strip the framing, keep the topic
         r"^what (?:is|are|was|were|does|do|did|would|could|should)(?: (?:a|an|the))?\s*",
         r"^who (?:is|are|was|were)\s*",
         r"^where (?:is|are|was|were|can|do|does)\s*",
@@ -338,13 +323,11 @@ _QUESTION_PREAMBLES: list[re.Pattern] = [
     ]
 ]
 
-# Leftover determiners / prepositions after stripping preambles.
 _LEADING_FLUFF = re.compile(
     r"^(?:the |a |an |about |for |in |on |of |to |with |by |from |regarding |concerning |re: )+",
     re.IGNORECASE,
 )
 
-# Trailing punctuation / filler that adds no search value.
 _TRAILING_FLUFF = re.compile(r"[?.!,;:]+$")
 
 
@@ -364,16 +347,13 @@ _TRAILING_FILLER = re.compile(
 
 
 def _strip_preamble(text: str) -> str:
-    """Remove question/instruction framing from the start of a message."""
     result = text
-    # Strip leading filler sentences ("Okay cool.", "Sure thing.", etc.)
     for _ in range(3):
         m = _FILLER_SENTENCE.match(result)
         if m:
             result = result[m.end():]
         else:
             break
-    # Strip trailing encouragement ("Surely there are more you can find?")
     result = _TRAILING_FILLER.sub("", result).strip()
     for pat in _QUESTION_PREAMBLES:
         prev = result
@@ -386,14 +366,7 @@ def _strip_preamble(text: str) -> str:
 
 
 def _detect_entities(text: str) -> list[str]:
-    """Detect likely proper nouns / named entities from capitalisation patterns.
-
-    Returns multi-word entities first (more specific), then single-word ones.
-    Skips sentence-initial capitalisation by checking position context.
-    """
-    # Find capitalised word sequences (2+ words starting with uppercase)
     multi = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text)
-    # Single capitalised words — but not sentence-initial ones
     words = text.split()
     singles: list[str] = []
     for i, w in enumerate(words):
@@ -401,7 +374,7 @@ def _detect_entities(text: str) -> list[str]:
         if not clean or len(clean) < 2:
             continue
         if clean[0].isupper() and clean[1:].islower():
-            # Skip if first word of message or after sentence-ending punctuation
+            # skip sentence-initial capitalisation — not a proper noun signal
             if i == 0:
                 continue
             prev = words[i - 1] if i > 0 else ""
@@ -410,15 +383,13 @@ def _detect_entities(text: str) -> list[str]:
             if clean.lower() not in _STOPWORDS and clean.lower() not in _FRAMING_WORDS:
                 singles.append(clean)
 
-    # Also detect ALL-CAPS acronyms (2-6 chars)
     acronyms = re.findall(r"\b([A-Z]{2,6})\b", text)
     acronyms = [a for a in acronyms if a not in ("I", "A")]
 
-    # Quoted terms the user explicitly marked as entities
     quoted = re.findall(r'"([^"]{2,60})"', text)
     quoted += re.findall(r"'([^']{2,60})'", text)
 
-    # Combine: quoted first (user intent), then multi-word, then acronyms, then singles
+    # order matters: user-quoted first, then multi-word, acronyms, singles
     all_entities: list[str] = []
     seen: set[str] = set()
     for e in quoted + multi + acronyms + singles:
@@ -430,7 +401,6 @@ def _detect_entities(text: str) -> list[str]:
 
 
 def _detect_question_type(lower: str) -> str | None:
-    """Classify the question type to tailor query shape."""
     if re.match(r"^(how (to|do|does|can|could|should))\b", lower):
         return "howto"
     if re.match(r"^(what (is|are|was|were))\b", lower):
@@ -453,7 +423,6 @@ def _detect_question_type(lower: str) -> str | None:
 
 
 def _is_time_sensitive(lower: str) -> bool:
-    """Check if the query is about current/recent information."""
     return bool(re.search(
         r"\b(latest|recent|current|today|now|this year|this month|this week|"
         r"right now|currently|2025|2026|new|upcoming|just released|breaking)\b",
@@ -462,19 +431,6 @@ def _is_time_sensitive(lower: str) -> bool:
 
 
 def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_topics: list[str] | None = None) -> list[str]:
-    """Generate on-topic search queries from a user message.
-
-    Zero model calls — heuristic extraction with focused strategies.
-    Every query stays tightly anchored to the user's actual topic.
-
-    Design principles:
-      - Core topic is king: strip question framing aggressively, keep subject.
-      - Entities get quoted: multi-word proper nouns stay together in SearXNG.
-      - No drift strategies: never generate queries from isolated keyword
-        pairs or generic reformulations ("what is X", "X explained") that
-        can match unrelated domains.
-      - Fewer, better queries beat many scattered ones.
-    """
     cleaned = re.sub(r"\s+", " ", message.strip())
     if not cleaned:
         return []
@@ -483,32 +439,23 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     year = _current_year()
     time_sensitive = _is_time_sensitive(lower)
 
-    # ---- Phase 1: Extract the core topic ----
     core = _strip_preamble(cleaned)
     if not core:
-        core = cleaned  # preamble stripping ate everything — use raw
+        core = cleaned
 
-    # ---- Phase 2: Structural analysis ----
     entities = _detect_entities(cleaned)
     keywords = _extract_keywords(cleaned)
     phrases = _extract_phrases(cleaned)
     qtype = _detect_question_type(lower)
 
-    # For long messages (conversational paragraphs, not concise questions),
-    # the raw core is too noisy for SearXNG.  Switch to entity/keyword
-    # queries only — skip the raw core entirely.
+    # paragraph-length cores are too noisy for searxng; fall back to entity/keyword queries
     long_message = len(core) > 150
 
-    # ---- Phase 3: Build queries, most specific first ----
     queries: list[str] = []
 
-    # --- Q1: Core topic (cleaned of framing) ---
-    # Skip for long messages — the raw text is too noisy for SearXNG.
     if not long_message:
         queries.append(core)
 
-    # --- Q2: Core topic with entities quoted ---
-    # Keeps multi-word names together so SearXNG treats them as phrases.
     if entities and not long_message:
         quoted_core = core
         for entity in entities:
@@ -517,15 +464,11 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
         if quoted_core != core:
             queries.append(quoted_core)
 
-    # --- Q3: Entity-focused query ---
-    # When entities are detected, a query built around just the entities
-    # is often the most precise.
     if entities:
         entity_q = " ".join(
             f'"{e}"' if " " in e else e
             for e in entities[:3]
         )
-        # Add topic keywords that aren't part of any entity
         entity_lower_set = {e.lower() for e in entities}
         extra_kw = [
             k for k in keywords
@@ -536,16 +479,12 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
             entity_q += " " + " ".join(extra_kw[:3])
         queries.append(entity_q.strip())
 
-    # --- Q4: Longest content phrase quoted ---
-    # The longest non-stopword run is likely the most specific topic chunk.
     if phrases:
         longest = max(phrases, key=len)
         if len(longest.split()) >= 2:
             queries.append(f'"{longest}"')
 
-    # --- Q5: Question-type specific reformulation ---
-    # Skip for long messages — question-type detection on paragraphs
-    # produces nonsense ("Hetzner Server vs Intel Xeon" from "better").
+    # skip qtype reformulation on long messages — it emits nonsense like "Hetzner vs Intel Xeon"
     topic_str = " ".join(keywords[:5]) if keywords else core
     if long_message:
         pass
@@ -564,25 +503,17 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     elif qtype == "definition":
         queries.append(f"{topic_str} definition meaning")
 
-    # --- Q6: Time-sensitive variant ---
     if time_sensitive:
         queries.append(f"{core} {year}")
 
-    # --- Q7: Keywords-only (concise, no filler) ---
-    # Useful when the natural-language query has noise SearXNG can't handle.
     if keywords and len(keywords) >= 2:
         kw_q = " ".join(keywords[:6])
         queries.append(kw_q)
 
-    # --- Q8: Additional entity phrases quoted individually ---
-    # Each distinct phrase becomes its own query for coverage.
     for p in phrases:
         if len(p.split()) >= 2:
             queries.append(f'"{p}"')
 
-    # --- Q9: Core with domain/context qualifier ---
-    # If we detected a question about something that commonly has
-    # ambiguous names, add a domain hint derived from the message.
     _DOMAIN_SIGNALS = {
         "health": r"\b(symptom|treatment|disease|diagnosis|medical|health|doctor|patient|medication|dose|side effect)\b",
         "programming": r"\b(code|programming|function|library|framework|api|debug|compile|syntax|runtime|package|npm|pip)\b",
@@ -594,29 +525,20 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     }
     for domain, pattern in _DOMAIN_SIGNALS.items():
         if re.search(pattern, lower):
-            # Only add if domain word not already in core
             if domain not in core.lower():
                 queries.append(f"{core} {domain}")
-            break  # one domain hint is enough
+            break
 
-    # --- Q10: Conversation-context enriched queries ---
-    # When conversation topics are available from the summariser, use them
-    # to disambiguate vague queries (e.g. "transformers" → "javascript
-    # transformers array methods").
     if conversation_topics:
-        # Filter out topics already present in the core query
         core_lower = core.lower()
         new_topics = [t for t in conversation_topics if t not in core_lower]
         if new_topics:
-            # Add top topic keywords to the core query
             topic_suffix = " ".join(new_topics[:3])
             queries.append(f"{core} {topic_suffix}")
-            # Also a keywords + topics query
             if keywords:
                 kw_topic = " ".join(keywords[:4]) + " " + " ".join(new_topics[:2])
                 queries.append(kw_topic)
 
-    # ---- Phase 4: Deduplicate and rank ----
     seen: set[str] = set()
     unique: list[str] = []
     for q in queries:
@@ -624,10 +546,8 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
         if not q:
             continue
         key = q.lower()
-        # Skip if it's a pure subset of an already-added query
         if key in seen:
             continue
-        # Skip very short queries (likely just a single common word)
         if len(q) < 3:
             continue
         seen.add(key)
