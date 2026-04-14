@@ -17,6 +17,8 @@
     "tools_framework": true,
     "search_extraction": true,
     "intent_classifier": true,
-    "scraper": true
+    "scraper": true,
+    "research_planner": true,
+    "research_max_queries": 20
   }
 }
