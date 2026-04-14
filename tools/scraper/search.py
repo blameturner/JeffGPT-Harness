@@ -1,25 +1,35 @@
+from __future__ import annotations
+
 import logging
+
 from tools.scraper.base import BaseScraper
 
 _log = logging.getLogger("scraper.search")
 
 
 class SearchScraper(BaseScraper):
-    def __init__(self, timeout: int = 30):
-        super().__init__(timeout)
-
     def scrape(self, url: str) -> dict:
-        result = {"url": url, "text": "", "links": [], "domain": "", "status": "failed"}
+        result = {
+            "url": url,
+            "final_url": url,
+            "text": "",
+            "links": [],
+            "domain": "",
+            "canonical": url,
+            "status": "failed",
+        }
+
+        html, final_url = self.fetch_html(url)
+        if not html:
+            result["error"] = "empty_response"
+            return result
 
         try:
-            html = self.fetch(url)
-            if not html:
-                result["error"] = "empty_response"
-                return result
-
+            result["final_url"] = final_url
+            result["canonical"] = self.canonical_url(html, final_url)
             result["text"] = self.extract_text(html)
-            result["links"] = self.extract_links(html, url)
-            result["domain"] = self.get_domain(url)
+            result["links"] = self.extract_links(html, final_url)
+            result["domain"] = self.get_domain(final_url)
             result["status"] = "ok"
         except Exception as e:
             result["error"] = str(e)[:200]

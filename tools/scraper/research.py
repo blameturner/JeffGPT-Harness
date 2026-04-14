@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import re
 from typing import Any
@@ -8,30 +10,29 @@ _log = logging.getLogger("scraper.research")
 
 
 class ResearchScraper(BaseScraper):
-    def __init__(self, timeout: int = 30):
-        super().__init__(timeout)
-
     def scrape(self, url: str, schema: dict[str, str] | None = None) -> dict:
-        result = {
+        result: dict[str, Any] = {
             "url": url,
             "data": {},
-            "status": "failed"
+            "text": "",
+            "status": "failed",
         }
 
-        try:
-            html = self.fetch(url)
-            if not html:
-                result["error"] = "empty_response"
-                return result
-
+        text = self.fetch_text(url)
+        if not text:
+            html, _ = self.fetch_html(url)
             text = self.extract_text(html)
-            result["text"] = text[:5000]
 
+        if not text:
+            result["error"] = "empty_response"
+            return result
+
+        try:
+            result["text"] = text[:5000]
             if schema:
                 result["data"] = self._extract_schema_data(text, schema)
             else:
                 result["data"] = {"raw": text[:2000]}
-
             result["status"] = "ok"
         except Exception as e:
             result["error"] = str(e)[:200]
@@ -40,39 +41,43 @@ class ResearchScraper(BaseScraper):
         return result
 
     def _extract_schema_data(self, text: str, schema: dict[str, str]) -> dict[str, Any]:
-        data = {}
+        data: dict[str, Any] = {}
         for field, field_type in schema.items():
-            patterns = self._get_patterns(field, field_type)
-            for pattern in patterns:
+            for pattern in self._patterns_for(field, field_type):
                 matches = re.findall(pattern, text, re.IGNORECASE)
-                if matches:
-                    if field_type == "numeric":
-                        try:
-                            data[field] = float(matches[0].replace(",", ""))
-                        except ValueError:
-                            data[field] = matches[0]
-                    else:
-                        data[field] = matches[0]
-                    break
+                if not matches:
+                    continue
+                raw = matches[0]
+                if field_type == "numeric":
+                    try:
+                        data[field] = float(str(raw).replace(",", ""))
+                    except (ValueError, TypeError):
+                        data[field] = raw
+                elif field_type == "percent":
+                    try:
+                        data[field] = float(str(raw))
+                    except (ValueError, TypeError):
+                        data[field] = raw
+                else:
+                    data[field] = raw
+                break
         return data
 
-    def _get_patterns(self, field: str, field_type: str) -> list[str]:
-        field_lower = field.lower().replace(" ", "_")
+    @staticmethod
+    def _patterns_for(field: str, field_type: str) -> list[str]:
+        escaped = re.escape(field)
         if field_type == "numeric":
             return [
-                rf"{field}[\s:]+(\d+(?:,\d+)*(?:\.\d+)?)",
-                rf"(\d+(?:,\d+)*)\s*{field}",
+                rf"{escaped}[\s:]+(\d+(?:,\d+)*(?:\.\d+)?)",
+                rf"(\d+(?:,\d+)*)\s*{escaped}",
             ]
         if field_type == "date":
             return [
-                rf"{field}[\s:]+(\d{{4}}-\d{{2}}-\d{{2}})",
-                rf"(\d{{1,2}}/\d{{1,2}}/\d{{4}})",
+                rf"{escaped}[\s:]+(\d{{4}}-\d{{2}}-\d{{2}})",
+                rf"{escaped}[\s:]+(\d{{1,2}}/\d{{1,2}}/\d{{4}})",
             ]
         if field_type == "percent":
             return [
-                rf"{field}[\s:]+(\d+(?:\.\d+)?)%",
-                rf"(\d+(?:\.\d+)?)\s*%",
+                rf"{escaped}[\s:]+(\d+(?:\.\d+)?)\s*%",
             ]
-        return [
-            rf"{field}[\s:]+([^\.\n]+)",
-        ]
+        return [rf"{escaped}[\s:]+([^\.\n]+)"]

@@ -1,9 +1,10 @@
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
 from infra.nocodb_client import NocodbClient
+from workers.tool_queue import get_tool_queue
 
 _log = logging.getLogger("main.enrichment")
 
@@ -14,6 +15,8 @@ class PathfinderRequest(BaseModel):
     seed_url: str
     org_id: int
     max_depth: int = 3
+    max_pages: int = 200
+    same_host_only: bool = True
 
 
 class ScraperRequest(BaseModel):
@@ -30,31 +33,17 @@ class ResearchAgentRequest(BaseModel):
     plan_id: int
 
 
-def _research_agent_handler(payload: dict) -> dict:
-    from tools.research.agent import run_research_agent
-    return run_research_agent(payload["plan_id"])
-
-
-def _register_research_handlers():
-    tq = get_tool_queue()
-    if tq:
-        tq.register("research_agent", HandlerConfig(
-            handler=_research_agent_handler,
-            max_workers=1,
-            priority_default=3,
-            source="research_agent"
-        ))
-        _log.info("registered research_agent handler")
-
-
-_register_research_handlers()
-
-
 @router.post("/pathfinder/discover")
 def pathfinder_discover(req: PathfinderRequest):
     from tools.enrichment.pathfinder import discover
-    
-    result = discover(req.seed_url, req.org_id, req.max_depth)
+
+    result = discover(
+        req.seed_url,
+        req.org_id,
+        max_depth=req.max_depth,
+        max_pages=req.max_pages,
+        same_host_only=req.same_host_only,
+    )
     return {"status": "ok", **result}
 
 

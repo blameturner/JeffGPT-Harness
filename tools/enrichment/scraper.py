@@ -1,20 +1,22 @@
+from __future__ import annotations
+
 import logging
-from urllib.parse import urlparse
 
 from infra.config import is_feature_enabled
 from infra.memory import remember
 from infra.nocodb_client import NocodbClient
-from tools.search.scraping import scrape_page
+from tools.scraper.search import SearchScraper
 
 _log = logging.getLogger("scraper")
+
 
 def scrape_next() -> dict | None:
     client = NocodbClient()
     try:
         data = client._get("discovery", params={
             "where": "(status,eq,discovered)",
+            "sort": "-score,depth",
             "limit": 1,
-            "sort": "depth"
         })
         rows = data.get("list", [])
         return rows[0] if rows else None
@@ -23,7 +25,7 @@ def scrape_next() -> dict | None:
         return None
 
 
-def mark_complete(url_id: int, chunk_count: int) -> None:
+def mark_complete(url_id: int) -> None:
     client = NocodbClient()
     try:
         client._patch("discovery", url_id, {"status": "scraped"})
@@ -45,6 +47,7 @@ def run_scraper(batch_size: int = 10) -> dict:
         return {"processed": 0, "chunks": 0, "failed": 0}
 
     client = NocodbClient()
+    scraper = SearchScraper(timeout=30)
     processed = 0
     chunks_total = 0
     failed = 0
@@ -66,21 +69,23 @@ def run_scraper(batch_size: int = 10) -> dict:
             pass
 
         try:
-            text = scrape_page(url)
-            if not text:
-                mark_failed(url_id, "empty_response")
+            result = scraper.scrape(url)
+            if result.get("status") != "ok" or not result.get("text"):
+                mark_failed(url_id, result.get("error") or "empty_response")
                 failed += 1
+                processed += 1
                 continue
 
             metadata: dict = {
-                "url": url,
+                "url": result.get("final_url") or url,
+                "canonical": result.get("canonical") or url,
                 "source": "pathfinder",
-                "domain": urlparse(url).netloc.lower(),
+                "domain": result.get("domain") or "",
             }
-            chunk_ids: list = remember(text, metadata, org_id, collection_name="discovery")
+            chunk_ids = remember(result["text"], metadata, org_id, collection_name="discovery")
 
             if chunk_ids:
-                mark_complete(url_id, len(chunk_ids))
+                mark_complete(url_id)
                 chunks_total += len(chunk_ids)
             else:
                 mark_failed(url_id, "no_chunks")

@@ -10,7 +10,9 @@
     "chat_summarise":             { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000, "frequency_penalty": 0.2 },
     "content_quality":            { "role": "t3_tool",    "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500 },
     "relationships":              { "role": "t1_secondary", "temperature": 0.1, "max_tokens": 800,  "max_input_chars": 8000, "frequency_penalty": 0.3 },
-    "research_agent":            { "role": "t2_secondary", "temperature": 0.3, "max_tokens": 4000, "max_input_chars": 30000 }
+    "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 },
+    "planned_search":            { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
+    "planned_search_answer":     { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 }
   },
   "features": {
     "web_search": true,
@@ -23,6 +25,8 @@
     "research_max_queries": 20,
     "research_agent": true,
     "research_max_iterations": 3,
-    "research_confidence_threshold": 80
+    "research_confidence_threshold": 80,
+    "planned_search": true,
+    "planned_search_successful_scrapes_needed": 10
   }
 }
