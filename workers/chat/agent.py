@@ -13,7 +13,7 @@ from tools.gate import gate_check
 from tools.planner import generate_plan
 from workers.base import BaseAgent, ChatResult, _get_summary_event, SUMMARY_WAIT_TIMEOUT
 from tools.search.queries import generate_broad_queries
-from shared.styles import chat_style_prompt
+from workers.chat.config import chat_style_prompt, chat_max_tokens, chat_temperature
 from workers.chat.history import maybe_summarise, extract_conversation_topics
 from workers.chat.payload import build_chat_payload
 from workers.chat.search_phase import SearchPhaseResult, run_search_phase
@@ -26,7 +26,7 @@ from workers.chat.persistence import (
 
 _log = logging.getLogger("chat")
 
-
+# the configs pass temp and max tokens. These can be overridden in the HTTP call
 class ChatAgent(BaseAgent):
     def run_job(
         self,
@@ -34,8 +34,8 @@ class ChatAgent(BaseAgent):
         user_message: str,
         conversation_id: int | None = None,
         system: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         rag_enabled: bool | None = None,
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
@@ -43,6 +43,11 @@ class ChatAgent(BaseAgent):
         response_style: str | None = None,
     ) -> None:
         from shared.jobs import STORE
+
+        if temperature is None:
+            temperature = chat_temperature(response_style)
+        if max_tokens is None:
+            max_tokens = chat_max_tokens(response_style)
 
         def emit(event: dict):
             etype = event.get("type", "")
@@ -120,8 +125,6 @@ class ChatAgent(BaseAgent):
 
         if TOOLS_FRAMEWORK_ENABLED:
             search_result = SearchPhaseResult()
-
-            # feeding last assistant turn as gate context lets follow-ups ("and melbourne?") re-trigger web_search
             last_assistant = ""
             for turn in reversed(history):
                 if turn.get("role") == "assistant":

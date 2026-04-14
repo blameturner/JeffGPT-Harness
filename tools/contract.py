@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class ToolName(str, Enum):
     WEB_SEARCH = "web_search"
     RAG_LOOKUP = "rag_lookup"
+    PLANNED_SEARCH = "planned_search"
 
 
 class ToolAction(BaseModel):

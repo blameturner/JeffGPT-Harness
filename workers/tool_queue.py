@@ -48,6 +48,7 @@ class HandlerConfig:
     max_workers: int = 1
     priority_default: int = 3
     dedup_key: str | None = None
+    source: str = ""
 
 
 @dataclass

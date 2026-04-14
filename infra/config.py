@@ -1,11 +1,13 @@
 import json
+import logging
 import os
 import re
-import time
 import subprocess
-import requests
-import logging
+import time
 from pathlib import Path
+from typing import Any
+
+import requests
 from dotenv import load_dotenv
 
 _log = logging.getLogger("config")
@@ -54,6 +56,10 @@ def is_feature_enabled(name: str) -> bool:
     if name not in features:
         _log.warning("feature %r not in config.json, defaulting to True", name)
     return features.get(name, True)
+
+
+def get_feature_value(name: str, default: Any = None) -> Any:
+    return PLATFORM.get("features", {}).get(name, default)
 
 MODEL_DISCOVERY_TIMEOUT_S = int(os.getenv("MODEL_DISCOVERY_TIMEOUT_S", "60"))
 MODEL_DISCOVERY_INTERVAL_S = 2

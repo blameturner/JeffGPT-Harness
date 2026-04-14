@@ -88,3 +88,4 @@ async def execute_plan(
 # import for @register_executor side-effects — do not remove
 from tools import rag_lookup  # noqa: E402, F401
 from tools.search import web_search  # noqa: E402, F401
+from tools.planned_search import agent as _planned_search_agent  # noqa: E402, F401

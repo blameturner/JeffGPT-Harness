@@ -55,7 +55,7 @@ def _run_search_inner(
     intent_dict: dict,
     budget: dict,
 ) -> tuple[str, list[dict], str]:
-    from shared.styles import search_context_for
+    from tools.search.config import search_context_for
 
     queries_tried: list[str] = []
     queries = generate_search_queries(intent_dict, message=query)
