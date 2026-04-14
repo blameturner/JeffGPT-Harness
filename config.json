@@ -16,6 +16,7 @@
     "rag_lookup": true,
     "tools_framework": true,
     "search_extraction": true,
-    "intent_classifier": true
+    "intent_classifier": true,
+    "scraper": true
   }
 }

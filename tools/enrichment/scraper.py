@@ -1,40 +1,12 @@
 import logging
 from urllib.parse import urlparse
 
+from infra.config import is_feature_enabled
 from infra.memory import remember
 from infra.nocodb_client import NocodbClient
 from tools.search.scraping import scrape_page
 
 _log = logging.getLogger("scraper")
-
-DEFAULT_RATE_LIMIT_MINUTES = 10
-
-
-def _scrape_and_index(url: str, org_id: int = 0) -> dict:
-    result = {"url": url, "chunks": 0, "status": "failed", "error": None}
-
-    try:
-        text = scrape_page(url)
-        if not text:
-            result["error"] = "empty_response"
-            return result
-
-        metadata = {
-            "url": url,
-            "source": "pathfinder",
-            "domain": urlparse(url).netloc.lower(),
-        }
-        chunk_ids = remember(text, metadata, org_id, collection_name="discovery")
-
-        if chunk_ids:
-            result["chunks"] = len(chunk_ids)
-            result["status"] = "scrape_success"
-    except Exception as e:
-        result["error"] = str(e)[:200]
-        _log.warning("scrape failed  url=%s  error=%s", url[:80], e)
-
-    return result
-
 
 def scrape_next() -> dict | None:
     client = NocodbClient()
@@ -68,6 +40,10 @@ def mark_failed(url_id: int, error: str) -> None:
 
 
 def run_scraper(batch_size: int = 10) -> dict:
+    if not is_feature_enabled("scraper"):
+        _log.info("scraper feature disabled, skipping")
+        return {"processed": 0, "chunks": 0, "failed": 0}
+
     client = NocodbClient()
     processed = 0
     chunks_total = 0
@@ -78,21 +54,41 @@ def run_scraper(batch_size: int = 10) -> dict:
         if not row:
             break
 
-        url_id = row.get("Id")
-        url = row.get("url")
-        org_id = row.get("org_id", 0)
+        url_id: int = row.get("Id", 0)
+        url: str = row.get("url", "")
+        org_id: int = row.get("org_id", 0)
         if not url or not url_id:
             continue
 
-        client._patch("discovery", url_id, {"status": "scraping"})
+        try:
+            client._patch("discovery", url_id, {"status": "scraping"})
+        except Exception:
+            pass
 
-        result = _scrape_and_index(url, org_id)
-        if result["status"] == "scrape_success":
-            mark_complete(url_id, result["chunks"])
-            chunks_total += result["chunks"]
-        else:
-            mark_failed(url_id, result.get("error", "unknown"))
+        try:
+            text = scrape_page(url)
+            if not text:
+                mark_failed(url_id, "empty_response")
+                failed += 1
+                continue
+
+            metadata: dict = {
+                "url": url,
+                "source": "pathfinder",
+                "domain": urlparse(url).netloc.lower(),
+            }
+            chunk_ids: list = remember(text, metadata, org_id, collection_name="discovery")
+
+            if chunk_ids:
+                mark_complete(url_id, len(chunk_ids))
+                chunks_total += len(chunk_ids)
+            else:
+                mark_failed(url_id, "no_chunks")
+                failed += 1
+        except Exception as e:
+            mark_failed(url_id, str(e)[:200])
             failed += 1
+
         processed += 1
 
     return {"processed": processed, "chunks": chunks_total, "failed": failed}

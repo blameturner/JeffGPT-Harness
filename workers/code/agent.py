@@ -19,7 +19,7 @@ from tools.gate import gate_check
 from tools.planner import generate_plan
 from workers.base import BaseAgent, _get_summary_event, SUMMARY_WAIT_TIMEOUT
 from workers.chat.history import maybe_summarise, extract_conversation_topics
-from shared.styles import code_style_prompt
+from workers.code.config import code_style_prompt, code_max_tokens, code_temperature
 
 _log = logging.getLogger("code")
 
@@ -41,21 +41,28 @@ EXECUTE_SYSTEM = (
     "user must do manually."
 )
 
-DEBUG_SYSTEM = (
-    "You are a senior software engineer in DEBUG mode. "
-    "Diagnose the root cause of the reported issue using the attached files "
-    "and the user's description. Output sections: Symptom, Root cause, Fix "
-    "(with code), Verification. Do not speculate — if evidence is missing, "
-    "ask for it."
+REVIEW_SYSTEM = (
+    "You are a senior software engineer in REVIEW mode. "
+    "Provide detailed code review feedback on the attached files. "
+    "Output sections: Summary, Issues (with severity), Recommendations, "
+    "Code snippets where helpful."
+)
+
+EXPLAIN_SYSTEM = (
+    "You are a senior software engineer in EXPLAIN mode. "
+    "Explain how the code works in clear, simple terms. "
+    "Output sections: Overview, Key concepts, Flow, Examples. "
+    "Use analogies where helpful."
 )
 
 _SYSTEMS: dict[str, str] = {
     "plan": PLAN_SYSTEM,
     "execute": EXECUTE_SYSTEM,
-    "debug": DEBUG_SYSTEM,
+    "review": REVIEW_SYSTEM,
+    "explain": EXPLAIN_SYSTEM,
 }
 
-Mode = Literal["plan", "execute", "debug"]
+Mode = Literal["plan", "execute", "review", "explain"]
 
 
 def _decode_file_content(b64: str) -> str:
@@ -162,14 +169,19 @@ class CodeAgent(BaseAgent):
         job,
         user_message: str,
         conversation_id: int | None = None,
-        temperature: float = 0.2,
-        max_tokens: int = 8192,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         title: str | None = None,
         codebase_collection: str | None = None,
         response_style: str | None = None,
         knowledge_enabled: bool | None = None,
     ) -> None:
         from shared.jobs import STORE
+
+        if temperature is None:
+            temperature = code_temperature(response_style)
+        if max_tokens is None:
+            max_tokens = code_max_tokens(response_style)
 
         def emit(event: dict):
             STORE.append(job, event)

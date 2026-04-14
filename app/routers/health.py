@@ -3,12 +3,8 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from infra.config import MODELS, refresh_models
-from shared.styles import (
-    CHAT_DEFAULT_STYLE,
-    CODE_DEFAULT_STYLE,
-    list_chat_styles,
-    list_code_styles,
-)
+from workers.chat.config import CHAT_DEFAULT_STYLE, list_chat_styles
+from workers.code.config import CODE_DEFAULT_STYLE, list_code_styles
 
 _log = logging.getLogger("main.health")
 
