@@ -4,9 +4,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.schemas import ConversationUpdate
-from nocodb_client import NocodbClient
-from workers.agents.chat import ChatAgent
-from workers.jobs import STORE, run_in_background
+from infra.nocodb_client import NocodbClient
+from workers.chat.agent import ChatAgent
+from shared.jobs import STORE, run_in_background
 
 _log = logging.getLogger("main.chat")
 
@@ -75,32 +75,9 @@ def chat(request: ChatRequest):
     return {"job_id": job.id}
 
 
-class ResearchRequest(BaseModel):
-    org_id: int
-    question: str
-    conversation_id: int | None = None
-
-
-@router.post("/research")
-def research(request: ResearchRequest):
-    """Submit a research job directly to the tool queue."""
-    from workers.tool_queue import get_tool_queue
-    _log.info("POST /research  org=%d question=%s", request.org_id, request.question[:80])
-    tq = get_tool_queue()
-    if not tq:
-        raise HTTPException(status_code=503, detail="Tool queue not available")
-    plan = {"question": request.question, "queries": [request.question], "objective": "", "lookout": [], "completion_criteria": []}
-    job_id = tq.submit(
-        job_type="research",
-        payload={"plan": plan, "org_id": request.org_id, "conversation_id": request.conversation_id},
-        source="api", org_id=request.org_id, priority=1,
-    )
-    return {"job_id": job_id}
-
-
 @router.get("/collections")
 def list_collections(org_id: int | None = None):
-    from memory import client
+    from infra.memory import client
     try:
         cols = client.list_collections()
         result = []

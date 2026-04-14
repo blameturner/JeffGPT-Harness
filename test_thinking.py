@@ -1,4 +1,3 @@
-"""Test what llama.cpp returns with and without thinking params."""
 import httpx, time, json
 
 URL = "http://mst-ag-t3-tool:8085/v1/chat/completions"

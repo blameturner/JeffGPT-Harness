@@ -2,8 +2,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from config import MODELS, refresh_models
-from workers.styles import (
+from infra.config import MODELS, refresh_models
+from shared.styles import (
     CHAT_DEFAULT_STYLE,
     CODE_DEFAULT_STYLE,
     list_chat_styles,
@@ -21,7 +21,6 @@ WORKER_TYPES = [
     {"id": "evaluator", "name": "Evaluator", "description": "Scores or critiques outputs against criteria."},
     {"id": "researcher", "name": "Researcher", "description": "Performs multi-source web research."},
     {"id": "memory", "name": "Memory", "description": "Writes and retrieves knowledge from ChromaDB / FalkorDB."},
-    {"id": "enrichment", "name": "Enrichment", "description": "Scrapes whitelisted sources and enriches the knowledge base."},
     {"id": "code", "name": "Code", "description": "Plans, writes, and debugs code."},
 ]
 

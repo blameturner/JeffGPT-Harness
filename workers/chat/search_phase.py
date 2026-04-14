@@ -5,13 +5,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from workers.search.intent import (
+from tools.search.intent import (
     CHAT_INTENT_CHITCHAT,
     CHAT_INTENT_CONTEXTUAL,
     SEARCH_POLICY_NONE,
     classify_message_intent,
 )
-from workers.search.orchestrator import run_web_search
+from tools.search.orchestrator import run_web_search
 
 _log = logging.getLogger("chat.search_phase")
 

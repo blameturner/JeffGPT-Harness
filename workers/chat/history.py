@@ -165,8 +165,8 @@ def _parse_summary_and_topics(raw: str) -> tuple[str, list[str]]:
 def _call_summarise(older_text: str, existing_summary: str) -> tuple[str, list[str]] | tuple[None, list[str]]:
     """Call the summariser model to compress conversation history."""
     try:
-        from config import get_function_config
-        from workers.enrichment.models import model_call
+        from infra.config import get_function_config
+        from shared.models import model_call
 
         cfg = get_function_config("chat_summarise")
         max_input = cfg.get("max_input_chars", 16000)

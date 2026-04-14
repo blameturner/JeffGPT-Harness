@@ -4,9 +4,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.schemas import ConversationUpdate
-from nocodb_client import NocodbClient
-from workers.agents.code import CodeAgent
-from workers.jobs import STORE, run_in_background
+from infra.nocodb_client import NocodbClient
+from workers.code.agent import CodeAgent
+from shared.jobs import STORE, run_in_background
 
 _log = logging.getLogger("main.code")
 
@@ -71,7 +71,7 @@ def code(request: CodeRequest):
 
 @router.get("/codebases")
 def list_codebases(org_id: int):
-    from memory import client
+    from infra.memory import client
     try:
         db = NocodbClient()
         prefix = f"org_{org_id}_codebase_"
@@ -106,7 +106,7 @@ def list_codebases(org_id: int):
 
 @router.post("/codebases")
 def create_codebase(body: CodebaseCreate):
-    from config import scoped_collection
+    from infra.config import scoped_collection
     try:
         db = NocodbClient()
         collection_name = scoped_collection(body.org_id, f"codebase_{body.name.lower().replace(' ', '_')}")
@@ -128,7 +128,7 @@ def create_codebase(body: CodebaseCreate):
 @router.post("/codebases/{codebase_id}/index")
 def index_codebase_files(codebase_id: int, body: CodebaseFileUpload):
     import base64
-    from memory import remember
+    from infra.memory import remember
     try:
         db = NocodbClient()
         if "knowledge_sources" not in db.tables:

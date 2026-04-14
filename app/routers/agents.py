@@ -4,9 +4,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from nocodb_client import NocodbClient
-from workers.generator_agent import GeneratorAgent
-from workers.jobs import STORE, run_in_background, stream_events
+from infra.nocodb_client import NocodbClient
+from workers.user_agents.generator_agent import GeneratorAgent
+from shared.jobs import STORE, run_in_background, stream_events
 
 _log = logging.getLogger("main.agents")
 
@@ -96,57 +96,27 @@ def scheduler_reload():
     return reload_agent_schedules()
 
 
-@router.post("/scheduler/trigger")
-def scheduler_trigger():
-    """Trigger all active enrichment agents to seed jobs into the tool queue."""
-    from workers.enrichment.cycle import seed_enrichment_jobs
-    from workers.enrichment.db import EnrichmentDB
-    import threading
-
-    try:
-        db = EnrichmentDB()
-        agents = db.list_enrichment_agents()
-        triggered = 0
-        for agent in agents:
-            if not agent.get("active", True):
-                continue
-            agent_id = agent.get("Id")
-            if agent_id:
-                threading.Thread(
-                    target=seed_enrichment_jobs, args=[agent_id], daemon=True,
-                ).start()
-                triggered += 1
-        return {"status": "triggered", "agents_seeded": triggered}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/scheduler/status")
 def scheduler_status(request: Request):
-    from workers.enrichment.cycle import get_last_run, sources_due_count
     sched = getattr(request.app.state, "scheduler", None)
     running = bool(sched and sched.running)
 
-    # Collect next_run from all enrichment agent jobs.
-    enrichment_jobs: list[dict] = []
+    agent_jobs: list[dict] = []
     if sched:
         for job in sched.get_jobs():
-            if job.id.startswith("enrichment_agent_"):
-                enrichment_jobs.append({
+            if job.id.startswith("agent_schedule_"):
+                agent_jobs.append({
                     "id": job.id,
                     "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
                 })
 
-    # Earliest next run across all enrichment agents.
     next_run = None
-    for ej in enrichment_jobs:
+    for ej in agent_jobs:
         if ej["next_run"] and (next_run is None or ej["next_run"] < next_run):
             next_run = ej["next_run"]
 
     return {
         "running": running,
         "next_run": next_run,
-        "enrichment_agents": enrichment_jobs,
-        "last_run": get_last_run(),
-        "sources_due": sources_due_count(),
+        "agent_schedules": agent_jobs,
     }

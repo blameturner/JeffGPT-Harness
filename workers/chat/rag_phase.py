@@ -3,7 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 
-from rag import retrieve
+from infra.rag import retrieve
 
 _log = logging.getLogger("chat.rag_phase")
 

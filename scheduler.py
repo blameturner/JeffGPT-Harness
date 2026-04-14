@@ -10,9 +10,7 @@ _log = logging.getLogger("scheduler")
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
-from workers.enrichment.cycle import run_log_cleanup, seed_enrichment_jobs
-from workers.enrichment.db import EnrichmentDB
+from infra.config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
 
 _scheduler: BackgroundScheduler | None = None
 AGENT_JOB_PREFIX = "agent_schedule_"
@@ -103,75 +101,12 @@ def _register_agent_schedules(sched: BackgroundScheduler) -> int:
     return count
 
 
-ENRICHMENT_JOB_PREFIX = "enrichment_agent_"
-
-
-def _register_enrichment_agents(sched: BackgroundScheduler) -> int:
-    """Register enrichment agents as queue seeders.
-
-    Each enrichment agent's cron fires ``seed_enrichment_jobs(agent_id)``
-    which creates individual scrape→summarise jobs in the tool_jobs queue.
-    The queue's backoff system ensures no model contention with active
-    chat/code sessions.
-    """
-    for job in list(sched.get_jobs()):
-        if job.id.startswith(ENRICHMENT_JOB_PREFIX):
-            sched.remove_job(job.id)
-    count = 0
-    try:
-        db = EnrichmentDB()
-        agents = db.list_enrichment_agents()
-    except Exception:
-        _log.warning("could not load enrichment_agents table, skipping")
-        return 0
-    for agent in agents:
-        try:
-            cron = (agent.get("cron_expression") or "").strip()
-            agent_id = agent["Id"]
-            if not cron:
-                continue
-            tz = agent.get("timezone") or "Australia/Sydney"
-            trigger = CronTrigger.from_crontab(cron, timezone=tz)
-            sched.add_job(
-                seed_enrichment_jobs,
-                trigger,
-                id=f"{ENRICHMENT_JOB_PREFIX}{agent_id}",
-                args=[agent_id],
-                max_instances=1,
-                coalesce=True,
-                replace_existing=True,
-            )
-            count += 1
-        except Exception:
-            _log.warning("enrichment_agent row %s invalid", agent.get("Id"), exc_info=True)
-    return count
-
-
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
     sched = BackgroundScheduler(timezone="UTC")
-
-    # Log cleanup is pure DB maintenance — no model calls, safe to keep.
-    sched.add_job(
-        run_log_cleanup,
-        CronTrigger(hour=2, minute=0),
-        id="enrichment_log_cleanup",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-
-    # NOTE: No general enrichment cycle.  Only agent-specific cycles are
-    # registered below.  Each fires seed_enrichment_jobs() which creates
-    # tool_jobs entries — the queue handles the actual work.
-    #
-    # NOTE: batch_summarise is retired.  Per-turn RWKV summarisation in
-    # workers/chat/history.py handles conversation compression inline.
-
     sched.start()
     registered = _register_agent_schedules(sched)
-    enrichment_registered = _register_enrichment_agents(sched)
-    _log.info("registered %d agent schedules, %d enrichment agents", registered, enrichment_registered)
+    _log.info("registered %d agent schedules", registered)
     _scheduler = sched
     return sched
 
@@ -182,6 +117,5 @@ def reload_agent_schedules() -> dict[str, Any]:
         _log.warning("reload requested but scheduler not running")
         return {"ok": False, "error": "scheduler not running"}
     agent_count = _register_agent_schedules(_scheduler)
-    enrichment_count = _register_enrichment_agents(_scheduler)
-    _log.info("reload complete  agents=%d enrichment=%d", agent_count, enrichment_count)
-    return {"ok": True, "agent_schedules": agent_count, "enrichment_agents": enrichment_count}
+    _log.info("reload complete  agents=%d", agent_count)
+    return {"ok": True, "agent_schedules": agent_count}

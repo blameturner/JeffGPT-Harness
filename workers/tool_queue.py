@@ -2,17 +2,11 @@
 General-purpose tool job queue backed by NocoDB.
 
 Manages typed jobs with per-type handler functions and configurable worker
-pools.  Scraping runs in parallel (I/O bound), summarisation runs one at a
-time (model bound), and future tool types plug in via `register()`.
+pools. Tool types plug in via `register()`.
 
 Jobs are persisted to the ``tool_jobs`` NocoDB table so they survive harness
-restarts.  Priority ordering (1 = highest) lets user-facing work jump ahead
-of background enrichment.
-
-Job chaining:
-  submit_pipeline() creates a scrape job and a dependent summarise job.
-  When the scrape job completes the summarise worker merges its result
-  into the dependent job's payload and processes it.
+restarts. Priority ordering (1 = highest) lets user-facing work jump ahead
+of background work.
 """
 
 from __future__ import annotations
@@ -27,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from config import JOB_QUEUE_POLL_INTERVAL, JOB_QUEUE_STALE_TIMEOUT
+from infra.config import JOB_QUEUE_POLL_INTERVAL, JOB_QUEUE_STALE_TIMEOUT
 
 _log = logging.getLogger("tool_queue")
 
@@ -38,10 +32,10 @@ NOCODB_TABLE = "tool_jobs"
 # ---------------------------------------------------------------------------
 # Priority thresholds: a job only runs if enough seconds have elapsed since
 # the last chat/code activity for its priority tier.
-#   priority 1 (research):     30s  (user-requested, wait for stream to finish)
-#   priority 2 (deep search):  120s (user-requested, 2 min backoff for resources)
-#   priority 3  (normal):      120s (2 min)
-#   priority 4+ (enrichment):  600s (10 min, true background work)
+#   priority 1: 30s  (user-requested, wait for stream to finish)
+#   priority 2: 120s (user-requested, 2 min backoff for resources)
+#   priority 3: 120s (normal)
+#   priority 4+: 600s (10 min, true background work)
 _PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 120, 3: 120}
 _DEFAULT_BACKOFF = 600.0  # priority 4-5
 
@@ -287,58 +281,6 @@ class ToolJobQueue:
             ids.append(jid)
         return ids
 
-    def submit_pipeline(
-        self,
-        url: str,
-        org_id: int,
-        collection: str,
-        source: str = "",
-        priority: int = 3,
-        metadata: dict | None = None,
-        summarise_function: str = "deep_search_summarise",
-    ) -> list[str]:
-        """Submit a scrape→summarise pipeline.  Returns [scrape_id, summarise_id]."""
-        meta = metadata or {}
-        scrape_id = self.submit(
-            job_type="scrape",
-            payload={
-                "url": url,
-                "snippet": meta.get("snippet", ""),
-                "title": meta.get("title", ""),
-            },
-            source=source,
-            org_id=org_id,
-            priority=priority,
-        )
-        # Build summarise metadata — pass through ALL upstream metadata
-        # so handlers can access scrape_target_id, category, cycle_id, etc.
-        summarise_meta = {
-            "url": url,
-            "name": meta.get("title") or url,
-            "source": source or "web_search",
-            "queries": ", ".join(meta.get("queries", []))[:500],
-            "conversation_id": meta.get("conversation_id"),
-            "scrape_target_id": meta.get("scrape_target_id"),
-            "category": meta.get("category"),
-            "cycle_id": meta.get("cycle_id"),
-        }
-        summarise_id = self.submit(
-            job_type="summarise",
-            payload={
-                "url": url,
-                "query": " ".join(meta.get("queries", [])) if meta.get("queries") else url,
-                "org_id": org_id,
-                "collection": collection,
-                "function_name": summarise_function,
-                "metadata": summarise_meta,
-            },
-            source=source,
-            org_id=org_id,
-            priority=priority,
-            depends_on=scrape_id,
-        )
-        return [scrape_id, summarise_id]
-
     # ---- Status API ----
 
     def status(self) -> dict:
@@ -379,8 +321,8 @@ class ToolJobQueue:
                 "state": backoff_state,
                 "idle_seconds": round(idle, 0),
                 "thresholds": {
-                    "research": _PRIORITY_BACKOFF.get(1, 120),
-                    "deep_search": _PRIORITY_BACKOFF.get(2, 300),
+                    "priority_1": _PRIORITY_BACKOFF.get(1, 120),
+                    "priority_2": _PRIORITY_BACKOFF.get(2, 300),
                     "background": _DEFAULT_BACKOFF,
                 },
             },
@@ -503,8 +445,7 @@ class ToolJobQueue:
                 continue
 
             # Per-job backoff: enforce the actual threshold for this job's
-            # priority.  Priority 1 (research) = 120s, 2 (deep search) =
-            # 300s, 3+ (enrichment) = 600s.
+            # priority (see _PRIORITY_BACKOFF at top of file).
             if job_type != "scrape":
                 idle = seconds_since_chat()
                 required = _backoff_for_priority(job.priority)
@@ -604,9 +545,8 @@ class ToolJobQueue:
                     continue
                 # Long-running jobs need extended stale timeouts.
                 # graph_extract: 7-16 min (LLM inference) → 4x
-                # research: up to 60 min (iterative multi-source) → 12x
                 job_type = row.get("type") or ""
-                _STALE_MULTIPLIERS = {"graph_extract": 4, "deep_search": 8, "research": 20}
+                _STALE_MULTIPLIERS = {"graph_extract": 4}
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
                     noco_id = row.get("Id")
@@ -626,7 +566,7 @@ class ToolJobQueue:
 
     @staticmethod
     def _db():
-        from nocodb_client import NocodbClient
+        from infra.nocodb_client import NocodbClient
         return NocodbClient()
 
     def _persist_new(self, job: ToolJob):
@@ -796,238 +736,6 @@ class ToolJobQueue:
 # Built-in handlers
 # ---------------------------------------------------------------------------
 
-def _handle_scrape(payload: dict) -> dict:
-    """Scrape a URL using the shared scraping pipeline."""
-    from workers.search.scraping import scrape_page
-
-    url = payload.get("url", "")
-    snippet = payload.get("snippet", "")
-
-    if not url:
-        _log.warning("queue scrape: empty URL — skipped")
-        return {"url": url, "text": snippet, "path": "empty_url"}
-
-    _log.info("queue scrape: starting  url=%s", url[:80])
-    meta: dict = {}
-    try:
-        text = scrape_page(url, snippet, None, meta)
-    except Exception as e:
-        _log.warning("queue scrape: FAILED  url=%s  error=%s", url[:80], e)
-        text = snippet
-        meta["path"] = "error"
-
-    path = meta.get("path", "unknown")
-    text_len = len(text or "")
-    _log.info("queue scrape: complete  url=%s  path=%s  chars=%d", url[:80], path, text_len)
-
-    return {
-        "url": url,
-        "text": (text or "")[:20000],
-        "path": path,
-    }
-
-
-def _update_enrichment_target_on_error(metadata: dict, error_msg: str):
-    """Mark an enrichment scrape target as errored with exponential backoff."""
-    target_id = metadata.get("scrape_target_id")
-    source_type = metadata.get("source", "")
-    if not target_id or source_type != "enrichment":
-        return
-    try:
-        from datetime import datetime, timedelta, timezone
-        from workers.enrichment.db import EnrichmentDB
-        db = EnrichmentDB()
-        rows = db._get("scrape_targets", params={
-            "where": f"(Id,eq,{target_id})", "limit": 1,
-        }).get("list", [])
-        source_row = rows[0] if rows else {}
-        consecutive = int(source_row.get("consecutive_failures") or 0) + 1
-        freq_hours = float(source_row.get("frequency_hours") or 24)
-        # Exponential backoff: double the wait each failure, cap at 16x
-        backoff_mult = min(2 ** consecutive, 16)
-        now_utc = datetime.now(timezone.utc)
-        retry_at = now_utc + timedelta(hours=freq_hours * backoff_mult)
-        db.update_scrape_target(
-            int(target_id),
-            status="error",
-            next_crawl_at=retry_at.isoformat(),
-            consecutive_failures=consecutive,
-            last_scrape_error=error_msg[:500],
-        )
-        _log.info("enrichment target error  id=%s consecutive=%d retry=%s", target_id, consecutive, retry_at.isoformat())
-    except Exception:
-        _log.warning("failed to update scrape target %s on error", target_id, exc_info=True)
-
-
-def _handle_summarise(payload: dict) -> dict:
-    """Summarise text and store in ChromaDB.  Uses the function_name from
-    payload to select the right model config (deep_search_summarise,
-    enrichment_summarise, research_summarise, etc.)."""
-    from config import get_function_config
-    from workers.enrichment.models import model_call
-
-    text = payload.get("text", "")
-    query = payload.get("query", "")
-    url = payload.get("url", "")
-    org_id = int(payload.get("org_id") or 0)
-    collection = payload.get("collection", "web_search")
-    metadata = payload.get("metadata") or {}
-    function_name = payload.get("function_name", "deep_search_summarise")
-
-    source_type = metadata.get("source", "")
-    scrape_target_id = metadata.get("scrape_target_id", "")
-    _log.info("queue summarise: starting  url=%s  source=%s  target=%s  func=%s  text_chars=%d",
-              url[:80], source_type, scrape_target_id or "-", function_name, len(text))
-
-    if not text or len(text) < 50:
-        _log.info("queue summarise: skipped — text too short (%d chars)  url=%s", len(text), url[:80])
-        _update_enrichment_target_on_error(metadata, "scrape returned no usable text")
-        return {"summary": text, "chunks": 0}
-
-    cfg = get_function_config(function_name)
-    max_input = cfg.get("max_input_chars", 12000)
-    max_tokens = cfg.get("max_tokens", 300)
-
-    # Deep/research summarise gets a more thorough prompt
-    if "deep" in function_name or "research" in function_name:
-        prompt = (
-            f"Provide a comprehensive analysis of the following web page. "
-            f"Focus on information relevant to: {query}\n\n"
-            f"Include:\n"
-            f"- Key facts, data points, statistics, dates\n"
-            f"- Main arguments or conclusions\n"
-            f"- Notable quotes or claims with attribution\n"
-            f"- Methodology or evidence quality where applicable\n"
-            f"- Any caveats, limitations, or biases\n\n"
-            f"URL: {url}\n\n"
-            f"Content:\n{text[:max_input]}"
-        )
-    else:
-        prompt = (
-            "Summarise the following web page content. Focus ONLY on information "
-            f"relevant to: {query}\n\n"
-            "Rules:\n"
-            "- Keep under 300 words.\n"
-            "- Include specific facts, numbers, dates, names.\n"
-            "- Skip navigation, boilerplate, cookie notices, unrelated content.\n\n"
-            f"URL: {url}\n\n"
-            f"Content:\n{text[:max_input]}"
-        )
-
-    summary, _tokens = model_call(function_name, prompt)
-    if not summary:
-        _log.warning("queue summarise: model returned empty — using raw text fallback  url=%s", url[:80])
-        summary = text[:2000]
-
-    _log.info("queue summarise: model complete  url=%s  tokens=%d  summary_chars=%d", url[:80], _tokens, len(summary))
-
-    chunks = 0
-    if org_id and summary:
-        try:
-            from memory import remember
-            ids = remember(
-                text=summary,
-                metadata=metadata,
-                org_id=org_id,
-                collection_name=collection,
-            )
-            chunks = len(ids or [])
-        except Exception as e:
-            _log.warning("ChromaDB store failed for %s: %s", url[:80], e)
-
-    _log.info("queue summarise: stored to ChromaDB  url=%s  collection=%s  chunks=%d", url[:80], collection, chunks)
-
-    # Deliver result back to the originating conversation as a message.
-    conversation_id = metadata.get("conversation_id")
-    if conversation_id and source_type in ("deep_search", "research"):
-        _deliver_to_conversation(conversation_id, org_id, url, summary)
-        _log.info("queue summarise: delivered to conversation  conv=%s  url=%s", conversation_id, url[:60])
-
-    # Queue graph extraction so relationships land in FalkorDB.
-    # Runs at lowest priority (5) when models are idle.
-    _graph_sources = ("enrichment", "deep_search", "research")
-    if source_type in _graph_sources and summary and org_id:
-        try:
-            tq = get_tool_queue()
-            if tq:
-                graph_job_id = tq.submit(
-                    job_type="graph_extract",
-                    payload={
-                        "user_text": f"Source: {url}",
-                        "assistant_text": summary,
-                        "conversation_id": 0,
-                        "org_id": org_id,
-                    },
-                    source=source_type,
-                    org_id=org_id,
-                    priority=5,
-                )
-                _log.info("queue summarise: graph extraction queued  source=%s  job=%s  url=%s", source_type, graph_job_id, url[:60])
-        except Exception:
-            _log.error("queue summarise: graph extraction queue FAILED  source=%s  url=%s", source_type, url[:60], exc_info=True)
-
-    # Update the scrape target so it's not re-scraped until next_crawl_at.
-    if scrape_target_id and source_type == "enrichment":
-        try:
-            from datetime import datetime, timedelta, timezone
-            from workers.enrichment.db import EnrichmentDB
-            db = EnrichmentDB()
-            source_row = None
-            try:
-                rows = db._get("scrape_targets", params={
-                    "where": f"(Id,eq,{scrape_target_id})", "limit": 1,
-                }).get("list", [])
-                source_row = rows[0] if rows else None
-            except Exception:
-                pass
-            freq_hours = float((source_row or {}).get("frequency_hours") or 24)
-            now_utc = datetime.now(timezone.utc)
-            next_at = now_utc + timedelta(hours=freq_hours)
-            db.update_scrape_target(
-                int(scrape_target_id),
-                last_scraped_at=now_utc.isoformat(),
-                status="ok",
-                next_crawl_at=next_at.isoformat(),
-                consecutive_failures=0,
-            )
-            _log.info("queue summarise: target complete  id=%s  status=ok  next_crawl=%s", scrape_target_id, next_at.isoformat())
-        except Exception:
-            _log.error("queue summarise: target update FAILED  id=%s", scrape_target_id, exc_info=True)
-
-    return {"summary": summary[:3000], "chunks": chunks}
-
-
-def _deliver_to_conversation(conversation_id: int, org_id: int, url: str, summary: str):
-    """Post a completed deep search result back to the conversation.
-
-    Uses role="assistant" with model="deep_search" so the frontend renders
-    it as a visible message (system messages are typically hidden).
-    """
-    try:
-        from nocodb_client import NocodbClient
-        db = NocodbClient()
-        content = (
-            f"[Deep search result]\n"
-            f"Source: {url}\n\n"
-            f"{summary[:2000]}"
-        )
-        db.add_message(
-            conversation_id=conversation_id,
-            org_id=org_id,
-            role="assistant",
-            content=content,
-            model="deep_search",
-            tokens_input=0,
-            tokens_output=0,
-            search_used=True,
-            search_status="completed",
-            search_confidence="high",
-            search_source_count=1,
-        )
-        _log.info("delivered result to conversation=%s url=%s", conversation_id, url[:60])
-    except Exception:
-        _log.warning("failed to deliver result to conversation=%s", conversation_id, exc_info=True)
-
 
 # ---------------------------------------------------------------------------
 # Module-level singleton
@@ -1038,242 +746,6 @@ _instance: ToolJobQueue | None = None
 
 def get_tool_queue() -> ToolJobQueue | None:
     return _instance
-
-
-def _handle_graph_extract(payload: dict) -> dict:
-    """Extract knowledge graph relationships from a chat/enrichment turn."""
-    from workers.chat.graph import extract_and_write_graph
-
-    user_text = payload.get("user_text") or ""
-    assistant_text = payload.get("assistant_text") or ""
-    conversation_id = payload.get("conversation_id") or 0
-    org_id = int(payload.get("org_id") or 0)
-
-    if not user_text and not assistant_text:
-        _log.info("queue graph_extract: skipped — empty input  org=%d", org_id)
-        return {"written": 0, "error": "empty input"}
-
-    _log.info("queue graph_extract: starting  org=%d  text_chars=%d",
-              org_id, len(user_text) + len(assistant_text))
-    extract_and_write_graph(user_text, assistant_text, conversation_id, org_id)
-    _log.info("queue graph_extract: complete  org=%d", org_id)
-    return {"status": "ok"}
-
-
-def _handle_deep_search(payload: dict) -> dict:
-    """Deep search: scrape plan URLs → summarise → synthesise → deliver."""
-    import asyncio as _aio
-    from workers.enrichment.models import model_call
-    from tools.framework.executors.search.pipeline import (
-        scrape_sources, summarise_sources, store_summaries, store_report,
-        build_evidence_block, deliver_to_conversation,
-    )
-
-    plan = payload.get("plan") or {}
-    org_id = int(payload.get("org_id") or 0)
-    conversation_id = payload.get("conversation_id")
-
-    queries = plan.get("queries", [])
-    plan_urls = plan.get("urls", [])
-    question = plan.get("question", "") or " ".join(queries[:3])
-
-    if not plan_urls or not org_id:
-        return {"status": "skipped", "error": "no urls or org"}
-
-    _log.info("queue deep_search: starting  org=%d  urls=%d", org_id, len(plan_urls))
-
-    loop = _aio.new_event_loop()
-    _aio.set_event_loop(loop)
-    try:
-        with_text = loop.run_until_complete(scrape_sources(plan_urls))
-        _log.info("queue deep_search: scraped  usable=%d/%d", len(with_text), len(plan_urls))
-
-        if not with_text:
-            if conversation_id:
-                deliver_to_conversation(conversation_id, org_id,
-                    "[Deep search failed]\n\nCould not extract usable content from any source.",
-                    "deep_search", search_status="failed", search_confidence="none")
-            return {"status": "no_sources"}
-
-        all_summaries = loop.run_until_complete(
-            summarise_sources(with_text, question, "deep_search_summarise")
-        )
-    finally:
-        loop.close()
-
-    if not all_summaries:
-        if conversation_id:
-            deliver_to_conversation(conversation_id, org_id,
-                "[Deep search failed]\n\nSources found but none could be summarised.",
-                "deep_search", search_status="failed", search_confidence="none")
-        return {"status": "no_summaries"}
-
-    _log.info("queue deep_search: summarised %d sources", len(all_summaries))
-
-    store_summaries(all_summaries, "deep_search", "web_search", question, conversation_id, org_id)
-
-    evidence = build_evidence_block(all_summaries)
-    synth_prompt = (
-        f"You are synthesising web research into a clear, well-structured answer.\n\n"
-        f"USER QUESTION: {question}\n\n"
-        f"SEARCH QUERIES USED: {', '.join(queries[:5])}\n\n"
-        f"You have {len(all_summaries)} sources below. Write a comprehensive response.\n\n"
-        f"STRUCTURE YOUR RESPONSE AS:\n\n"
-        f"## Summary\n"
-        f"2-3 sentences answering the question directly.\n\n"
-        f"## Key Findings\n"
-        f"Numbered list. Each finding MUST cite a source: [1], [2] etc.\n"
-        f"Include specific data: numbers, dates, prices, names. No vague statements.\n\n"
-        f"## Sources\n"
-        f"Numbered list of URLs matching your citations.\n\n"
-        f"RULES:\n"
-        f"- Every factual claim needs a citation [N].\n"
-        f"- If sources disagree, present both sides with citations.\n"
-        f"- Distinguish facts (from official sources) from opinions (from blogs/forums).\n"
-        f"- Use specific numbers and dates, never 'some sources say' or 'it appears'.\n\n"
-        f"SOURCES:\n{evidence[:18000]}"
-    )
-
-    report, synth_tokens = model_call("deep_search_synthesise", synth_prompt)
-    if not report:
-        report = "Deep search synthesis failed. Individual source summaries were stored."
-
-    store_report(report, "deep_search", "web_search", question, conversation_id, org_id, len(all_summaries))
-
-    if conversation_id:
-        source_urls = "\n".join(f"[{i+1}] {s['url']}" for i, s in enumerate(all_summaries))
-        deliver_to_conversation(conversation_id, org_id,
-            f"[Deep search complete]\nSources analysed: {len(all_summaries)}\n\n"
-            f"Sources:\n{source_urls}\n\n{report}",
-            "deep_search", source_count=len(all_summaries), tokens_output=synth_tokens)
-        _log.info("queue deep_search: delivered  conv=%s  sources=%d", conversation_id, len(all_summaries))
-
-    return {"status": "ok", "sources": len(all_summaries), "report_chars": len(report)}
-
-
-def _handle_research(payload: dict) -> dict:
-    """Iterative research: search → scrape → summarise → assess → refine → repeat."""
-    import asyncio as _aio
-    from workers.enrichment.models import model_call
-    from tools.framework.executors.search.pipeline import (
-        search_and_dedup, scrape_sources, summarise_sources,
-        store_summaries, store_report, build_evidence_block,
-        deliver_to_conversation,
-    )
-    from tools.framework.executors.search.research import (
-        assess_progress, MAX_ITERATIONS, MAX_SOURCES_PER_ITERATION,
-        MAX_TOTAL_SOURCES, _SYNTHESISE_PROMPT,
-    )
-
-    plan = payload.get("plan") or {}
-    org_id = int(payload.get("org_id") or 0)
-    conversation_id = payload.get("conversation_id")
-
-    question = plan.get("question", "")
-    objective = plan.get("objective", "")
-    queries = list(plan.get("queries", []))
-    lookout = plan.get("lookout", [])
-    criteria = plan.get("completion_criteria", [])
-
-    if not queries or not org_id:
-        return {"status": "skipped", "error": "no queries or org"}
-
-    _log.info("queue research: starting  org=%d  question=%s  queries=%d",
-              org_id, question[:60], len(queries))
-
-    loop = _aio.new_event_loop()
-    _aio.set_event_loop(loop)
-
-    all_summaries: list[dict] = []
-    iteration = 0
-
-    try:
-        while iteration < MAX_ITERATIONS and queries:
-            iteration += 1
-            _log.info("queue research: iteration %d/%d  queries=%d  sources=%d",
-                      iteration, MAX_ITERATIONS, len(queries), len(all_summaries))
-
-            existing_urls = {s["url"] for s in all_summaries}
-            results = loop.run_until_complete(
-                search_and_dedup(queries, max_results=MAX_SOURCES_PER_ITERATION, existing_urls=existing_urls)
-            )
-
-            if not results:
-                _log.info("queue research: no new URLs in iteration %d", iteration)
-                break
-
-            with_text = loop.run_until_complete(scrape_sources(results))
-
-            if not with_text:
-                _log.info("queue research: all sources empty in iteration %d", iteration)
-                if iteration < MAX_ITERATIONS:
-                    queries = queries[len(queries)//2:]
-                    continue
-                break
-
-            remaining = MAX_TOTAL_SOURCES - len(all_summaries)
-            new_summaries = loop.run_until_complete(
-                summarise_sources(with_text, question, "research_summarise", max_sources=remaining)
-            )
-            all_summaries.extend(new_summaries)
-            _log.info("queue research: iteration %d  new=%d  total=%d",
-                      iteration, len(new_summaries), len(all_summaries))
-
-            store_summaries(new_summaries, "research", "research", question, conversation_id, org_id)
-
-            if iteration < MAX_ITERATIONS and all_summaries:
-                try:
-                    assessment = assess_progress(objective, lookout, criteria, all_summaries)
-                    _log.info("queue research: assessment  complete=%s  gaps=%s",
-                              assessment.get("complete"), assessment.get("gaps", []))
-
-                    if assessment.get("complete") is True:
-                        _log.info("queue research: criteria met — stopping")
-                        break
-
-                    new_queries = assessment.get("new_queries", [])
-                    queries = [q.strip() for q in new_queries if isinstance(q, str) and q.strip()][:6]
-                    if not queries:
-                        _log.info("queue research: no valid new queries — stopping")
-                        break
-                except Exception:
-                    _log.warning("queue research: assessment failed — continuing", exc_info=True)
-    finally:
-        loop.close()
-
-    if not all_summaries:
-        _log.warning("queue research: no summaries — cannot synthesise")
-        if conversation_id:
-            deliver_to_conversation(conversation_id, org_id,
-                f"[Research failed]\nQuestion: {question}\n\n"
-                f"Could not find sufficient sources after {iteration} round(s).",
-                "research", search_status="failed", search_confidence="none")
-        return {"status": "no_sources", "iterations": iteration}
-
-    evidence = build_evidence_block(all_summaries)
-    synth_prompt = _SYNTHESISE_PROMPT.format(
-        question=question, objective=objective,
-        source_count=len(all_summaries), iterations=iteration,
-        evidence_block=evidence[:21000],
-    )
-
-    report, synth_tokens = model_call("research_synthesise", synth_prompt)
-    if not report:
-        report = "Research synthesis failed. Raw evidence was gathered but could not be compiled."
-
-    store_report(report, "research", "research", question, conversation_id, org_id,
-                 len(all_summaries), iterations=iteration)
-
-    if conversation_id:
-        source_urls = "\n".join(f"[{i+1}] {s['url']}" for i, s in enumerate(all_summaries))
-        deliver_to_conversation(conversation_id, org_id,
-            f"[Research complete]\nQuestion: {question}\n"
-            f"Sources analysed: {len(all_summaries)} across {iteration} round(s)\n\n"
-            f"Sources:\n{source_urls}\n\n{report}",
-            "research", source_count=len(all_summaries), tokens_output=synth_tokens)
-        _log.info("queue research: delivered  conv=%s  sources=%d", conversation_id, len(all_summaries))
-
-    return {"status": "ok", "sources": len(all_summaries), "iterations": iteration, "report_chars": len(report)}
 
 
 def _set_instance(q: ToolJobQueue):

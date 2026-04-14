@@ -13,7 +13,7 @@ def extract_and_write_graph(
 ) -> None:
     _log.info("graph extraction starting  conv=%d", conversation_id)
     try:
-        from workers.enrichment.relationships import _extract_relationships
+        from shared.relationships import _extract_relationships
     except Exception as e:
         _log.warning("graph extraction skipped — import failed: %s", e)
         return

@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from nocodb_client import NocodbClient
+from infra.nocodb_client import NocodbClient
 
 _log = logging.getLogger("main.stats")
 
@@ -191,23 +191,6 @@ def stats_usage(org_id: int, period: str = "30d"):
         ],
     }
 
-    enrichment_stats = {
-        "total_cycles": 0, "total_sources_scraped": 0, "total_tokens_used": 0,
-        "suggestions_generated": 0, "suggestions_approved": 0,
-    }
-    try:
-        from workers.enrichment.db import EnrichmentDB
-        edb = EnrichmentDB()
-        logs = edb.list_log(org_id=org_id, limit=5000)
-        enrichment_stats["total_cycles"] = sum(1 for l in logs if l.get("event_type") == "cycle_start")
-        enrichment_stats["total_sources_scraped"] = sum(1 for l in logs if l.get("event_type") == "source_scraped")
-        enrichment_stats["total_tokens_used"] = sum(int(l.get("tokens_used") or 0) for l in logs)
-        suggestions = edb.list_suggestions(org_id)
-        enrichment_stats["suggestions_generated"] = len(suggestions)
-        enrichment_stats["suggestions_approved"] = sum(1 for s in suggestions if s.get("status") == "approved")
-    except Exception:
-        _log.debug("enrichment stats failed", exc_info=True)
-
     return {
         "total_requests": total_requests,
         "total_tokens_input": total_tokens_in,
@@ -222,13 +205,12 @@ def stats_usage(org_id: int, period: str = "30d"):
         "by_style": by_style_list,
         "top_conversations": top_conversations,
         "agent_runs": agent_runs_section,
-        "enrichment": enrichment_stats,
     }
 
 
 @router.get("/graph/snapshot")
 def graph_snapshot(org_id: int, limit: int = 20):
-    from graph import get_graph
+    from infra.graph import get_graph
     try:
         g = get_graph(org_id)
     except Exception as e:
@@ -291,7 +273,7 @@ def graph_snapshot(org_id: int, limit: int = 20):
 
 @router.get("/chroma/snapshot")
 def chroma_snapshot(org_id: int):
-    from memory import client
+    from infra.memory import client
     try:
         cols = client.list_collections()
         prefix = f"org_{org_id}_"
