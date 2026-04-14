@@ -197,6 +197,30 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
     except Exception:
         _log.warning("planned_search patch message failed", exc_info=True)
 
+    if answer_text:
+        convo_row = _load_conversation(client, conversation_id)
+        rag_enabled = _truthy(convo_row.get("rag_enabled"))
+        knowledge_enabled = _truthy(convo_row.get("knowledge_enabled"))
+        rag_collection = (convo_row.get("rag_collection") or "agent_outputs").strip() or "agent_outputs"
+
+        from workers.post_turn import ingest_output
+        await asyncio.to_thread(
+            ingest_output,
+            output=answer_text,
+            user_text=user_question,
+            org_id=org_id,
+            conversation_id=conversation_id,
+            model="planned_search_answer",
+            rag_collection=rag_collection if rag_enabled else "",
+            knowledge_collection="chat_knowledge" if knowledge_enabled else "",
+            source="planned_search",
+            extra_metadata={
+                "message_id": answer_msg_id,
+                "proposal_message_id": message_id,
+                "source_urls": [s.get("url") for s in scraped_results],
+            },
+        )
+
     return {
         "status": "ok",
         "message_id": message_id,
@@ -206,6 +230,29 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
         "successful_scrapes": len(scraped_results),
         "answer_chars": len(answer_text),
     }
+
+
+def _load_conversation(client: NocodbClient, conversation_id: int) -> dict:
+    if not conversation_id:
+        return {}
+    try:
+        rows = client._get("conversations", params={
+            "where": f"(Id,eq,{conversation_id})",
+            "limit": 1,
+        }).get("list", [])
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
 
 
 def _find_original_question(client: NocodbClient, conversation_id: int, before_message_id: int) -> str:

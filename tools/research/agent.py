@@ -95,13 +95,37 @@ def run_research_agent(plan_id: int) -> dict:
     updated_queries = json.dumps(new_queries_list)
 
     if ready or confidence >= confidence_threshold or iterations >= max_iterations:
+        paper_content = synthesis.get("content", "")
         client._patch("research_plans", plan_id, {
             "status": "completed",
-            "paper_content": synthesis.get("content", ""),
+            "paper_content": paper_content,
             "gap_report": gap_report,
             "confidence_score": confidence,
             "iterations": iterations + 1
         })
+
+        if paper_content:
+            try:
+                from workers.post_turn import ingest_output
+                ingest_output(
+                    output=paper_content,
+                    user_text=topic,
+                    org_id=org_id,
+                    conversation_id=0,
+                    model="research_agent",
+                    rag_collection="research",
+                    knowledge_collection="research_knowledge",
+                    source="research",
+                    extra_metadata={
+                        "plan_id": plan_id,
+                        "topic": topic,
+                        "confidence_score": confidence,
+                        "iteration": iterations + 1,
+                    },
+                )
+            except Exception:
+                _log.warning("research ingest_output failed  plan_id=%d", plan_id, exc_info=True)
+
         return {"status": "completed", "confidence": confidence, "plan_id": plan_id}
     elif new_queries:
         client._patch("research_plans", plan_id, {

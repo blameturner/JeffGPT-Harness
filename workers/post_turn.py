@@ -1,12 +1,92 @@
 from __future__ import annotations
 
 import logging
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
+
+
+def ingest_output(
+    *,
+    output: str,
+    user_text: str = "",
+    org_id: int,
+    conversation_id: int = 0,
+    model: str = "",
+    rag_collection: str = "",
+    knowledge_collection: str = "",
+    source: str = "",
+    extra_metadata: dict | None = None,
+    queue_graph_extract: bool = True,
+) -> None:
+    """Embed an output and queue graph extraction. Safe to call from any background context.
+
+    Mirrors the embed/graph phases of `run_post_turn_work` without the summary machinery,
+    so one-shot producers (planned_search, research) can feed RAG + FalkorDB the same way
+    chat/code conversations do.
+    """
+    if not output:
+        return
+
+    from infra.memory import remember
+
+    metadata: dict = {
+        "conversation_id": conversation_id,
+        "model": model,
+        "turn_time": time.time(),
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    turn_text = f"USER: {user_text}\n\nASSISTANT: {output}" if user_text else output
+
+    if rag_collection:
+        try:
+            remember(
+                text=turn_text,
+                metadata=metadata,
+                org_id=org_id,
+                collection_name=rag_collection,
+            )
+            _log.info("%s conv=%s  ingest RAG embedded to %s", source, conversation_id, rag_collection)
+        except Exception:
+            _log.error("%s conv=%s  ingest RAG FAILED coll=%s", source, conversation_id, rag_collection, exc_info=True)
+
+    if knowledge_collection:
+        try:
+            remember(
+                text=turn_text,
+                metadata=metadata,
+                org_id=org_id,
+                collection_name=knowledge_collection,
+            )
+            _log.info("%s conv=%s  ingest knowledge embedded to %s", source, conversation_id, knowledge_collection)
+        except Exception:
+            _log.error("%s conv=%s  ingest knowledge FAILED coll=%s", source, conversation_id, knowledge_collection, exc_info=True)
+
+    if queue_graph_extract and (user_text or output):
+        try:
+            from workers.tool_queue import get_tool_queue
+            tq = get_tool_queue()
+            if tq:
+                job_id = tq.submit(
+                    job_type="graph_extract",
+                    payload={
+                        "user_text": user_text,
+                        "assistant_text": output,
+                        "conversation_id": conversation_id,
+                        "org_id": org_id,
+                    },
+                    source=source,
+                    org_id=org_id,
+                    priority=5,
+                )
+                _log.info("%s conv=%s  ingest graph_extract queued  job=%s", source, conversation_id, job_id)
+        except Exception:
+            _log.error("%s conv=%s  ingest graph_extract queue FAILED", source, conversation_id, exc_info=True)
 
 
 @dataclass
