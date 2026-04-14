@@ -26,6 +26,30 @@ class ResearchRequest(BaseModel):
     org_id: int
 
 
+class ResearchAgentRequest(BaseModel):
+    plan_id: int
+
+
+def _research_agent_handler(payload: dict) -> dict:
+    from tools.research.agent import run_research_agent
+    return run_research_agent(payload["plan_id"])
+
+
+def _register_research_handlers():
+    tq = get_tool_queue()
+    if tq:
+        tq.register("research_agent", HandlerConfig(
+            handler=_research_agent_handler,
+            max_workers=1,
+            priority_default=3,
+            source="research_agent"
+        ))
+        _log.info("registered research_agent handler")
+
+
+_register_research_handlers()
+
+
 @router.post("/pathfinder/discover")
 def pathfinder_discover(req: PathfinderRequest):
     from tools.enrichment.pathfinder import discover
@@ -94,6 +118,33 @@ def research_complete(plan_id: int):
     
     complete_plan(plan_id)
     return {"status": "ok", "plan_id": plan_id}
+
+
+@router.post("/research/agent/run")
+def research_agent_run(req: ResearchAgentRequest):
+    tq = get_tool_queue()
+    if not tq:
+        from tools.research.agent import run_research_agent
+        result = run_research_agent(req.plan_id)
+        return {"status": result.get("status"), **result}
+    
+    job_id = tq.submit(
+        "research_agent",
+        {"plan_id": req.plan_id},
+        source="enrichment_api",
+        priority=3
+    )
+    return {"status": "queued", "job_id": job_id}
+
+
+@router.post("/research/agent/next")
+def research_agent_next():
+    from tools.research.agent import get_next_research
+    
+    row = get_next_research()
+    if not row:
+        return {"status": "empty", "row": None}
+    return {"status": "ok", "row": row}
 
 
 @router.get("/discovery/list")
