@@ -39,10 +39,10 @@ def _extract_links(url: str, html: str) -> list[str]:
         return []
 
 
-def _url_exists(client: NocodbClient, url_hash: str) -> bool:
+def _url_exists(client: NocodbClient, url_hash: str, org_id: int) -> bool:
     try:
         data = client._get("discovery", params={
-            "where": f"(url_hash,eq,{url_hash})",
+            "where": f"(url_hash,eq,{url_hash})~and(org_id,eq,{org_id})",
             "limit": 1
         })
         return bool(data.get("list"))
@@ -50,12 +50,13 @@ def _url_exists(client: NocodbClient, url_hash: str) -> bool:
         return False
 
 
-def _add_url(client: NocodbClient, url: str, source_url: str, depth: int) -> bool:
+def _add_url(client: NocodbClient, url: str, source_url: str, depth: int, org_id: int) -> bool:
     url_hash = _url_hash(url)
-    if _url_exists(client, url_hash):
+    if _url_exists(client, url_hash, org_id):
         return False
     try:
         client._post("discovery", {
+            "org_id": org_id,
             "url": url,
             "url_hash": url_hash,
             "source_url": source_url,
@@ -69,7 +70,7 @@ def _add_url(client: NocodbClient, url: str, source_url: str, depth: int) -> boo
         return False
 
 
-def discover(url: str, max_depth: int = DEFAULT_MAX_DEPTH) -> dict:
+def discover(url: str, org_id: int, max_depth: int = DEFAULT_MAX_DEPTH) -> dict:
     client = NocodbClient()
     to_process = [url]
     processed = 0
@@ -94,7 +95,7 @@ def discover(url: str, max_depth: int = DEFAULT_MAX_DEPTH) -> dict:
         for link in _extract_links(current, html):
             if link in to_process:
                 continue
-            if _add_url(client, link, current, current_depth + 1):
+            if _add_url(client, link, current, current_depth + 1, org_id):
                 to_process.append(link)
                 added += 1
 

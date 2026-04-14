@@ -67,7 +67,7 @@ def mark_failed(url_id: int, error: str) -> None:
         _log.warning("mark_failed failed  id=%d", url_id)
 
 
-def run_scraper(batch_size: int = 10, org_id: int = 0) -> dict:
+def run_scraper(batch_size: int = 10) -> dict:
     client = NocodbClient()
     processed = 0
     chunks_total = 0
@@ -80,6 +80,7 @@ def run_scraper(batch_size: int = 10, org_id: int = 0) -> dict:
 
         url_id = row.get("Id")
         url = row.get("url")
+        org_id = row.get("org_id", 0)
         if not url or not url_id:
             continue
 
