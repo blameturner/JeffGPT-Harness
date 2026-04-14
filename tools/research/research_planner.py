@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 from infra.config import is_feature_enabled
 from shared.models import model_call
@@ -7,6 +8,55 @@ from shared.models import model_call
 _log = logging.getLogger("research_planner")
 
 DEFAULT_MAX_QUERIES = 20
+
+
+def _strip_fence(raw: str) -> str:
+    s = raw.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = s.rstrip("`").strip()
+    return s
+
+
+def _extract_json_object(raw: str) -> str:
+    s = _strip_fence(raw)
+    start = s.find("{")
+    if start < 0:
+        return ""
+    obj_depth = 0
+    arr_depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            obj_depth += 1
+        elif ch == "}":
+            obj_depth -= 1
+            if obj_depth == 0 and arr_depth == 0:
+                return s[start:i + 1]
+        elif ch == "[":
+            arr_depth += 1
+        elif ch == "]":
+            arr_depth -= 1
+    # truncated — best-effort close
+    tail = s[start:]
+    if in_str:
+        tail += '"'
+    tail = re.sub(r",\s*$", "", tail)
+    tail += "]" * arr_depth
+    tail += "}" * obj_depth
+    return tail
 
 
 def _generate_plan(topic: str, max_queries: int = DEFAULT_MAX_QUERIES) -> dict:
@@ -18,18 +68,30 @@ Generate a JSON research plan with:
 3. "queries": {max_queries} specific, search-engine-friendly queries (max {max_queries})
 4. "schema": JSON schema defining what data to extract (field name + type: numeric, text, date, percent)
 
-Respond with ONLY valid JSON, no explanation."""
+Respond with ONLY valid JSON, no explanation, no markdown."""
 
     try:
-        result, _ = model_call("tool_planner", prompt, max_tokens=800, temperature=0.3)
-        plan = json.loads(result)
-        return plan
-    except json.JSONDecodeError as e:
-        _log.warning("plan parse failed  topic=%s  error=%s", topic[:40], e)
-        return {"error": str(e)[:200]}
+        result, _ = model_call("research_planner", prompt)
     except Exception as e:
         _log.warning("plan generation failed  topic=%s  error=%s", topic[:40], e)
         return {"error": str(e)[:200]}
+
+    if not result:
+        return {"error": "empty model response"}
+
+    candidate = _extract_json_object(result)
+    if not candidate:
+        _log.warning("plan parse failed  topic=%s  no JSON object", topic[:40])
+        return {"error": "no JSON object in response", "raw": result[:500]}
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        _log.warning(
+            "plan parse failed  topic=%s  error=%s  chars=%d",
+            topic[:40], e, len(result),
+        )
+        return {"error": str(e)[:200], "raw": result[:500]}
 
 
 def create_research_plan(topic: str, org_id: int = 0) -> dict:

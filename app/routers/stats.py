@@ -28,16 +28,21 @@ def stats_usage(org_id: int, period: str = "30d"):
     period_start = start.strftime("%Y-%m-%d")
     period_end = now.strftime("%Y-%m-%d")
 
+    # nocodb rejects ISO strings with microseconds / tz suffix — `YYYY-MM-DD HH:MM:SS` is the accepted form
+    start_nocodb = start.strftime("%Y-%m-%d %H:%M:%S")
+
     try:
-        msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start.isoformat()})"
+        msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start_nocodb})"
         messages = db._get("messages", params={"where": msg_where, "limit": 5000}).get("list", [])
     except Exception:
+        _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
         messages = []
 
     try:
-        run_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start.isoformat()})"
+        run_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start_nocodb})"
         runs = db._get("agent_runs", params={"where": run_where, "limit": 5000}).get("list", [])
     except Exception:
+        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
         runs = []
 
     total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
