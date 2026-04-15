@@ -56,7 +56,10 @@ async def generate_plan(
                 _log.warning("no tool model available — skipping plan")
                 return None
             _log.info("planner call  model=%s url=%s", tool_model_id, tool_url)
-            async with httpx.AsyncClient(timeout=3600.0) as client:
+            # 3600s was leftover and could hang the chat turn on a stalled LLM.
+            # 300s lets a slow local tool-planner model complete while still
+            # being an order of magnitude tighter than the old 1-hour wait.
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 resp = await client.post(
                     f"{tool_url}/v1/chat/completions",
                     json={

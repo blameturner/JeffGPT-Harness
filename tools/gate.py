@@ -65,6 +65,14 @@ _PLANNED_SEARCH = re.compile(
     r"landscape|survey of)\b",
     re.I,
 )
+# NOTE: an earlier version of this regex also matched "analysis of", "compare",
+# "vs", "best resources/tools/...", "how do i learn|use|choose|pick|evaluate",
+# "guide to", "tutorial on", etc. That was far too broad — common chat
+# questions routed to planned_search, and combined with the `hints.discard(
+# "web_search")` below caused normal chat turns to silently short-circuit into
+# a pending-approval flow. Planned_search is now reserved for EXPLICIT research
+# intent or the UI's explicit `search_mode="planned"` signal handled in
+# workers/chat/agent.py.
 
 
 def gate_check(

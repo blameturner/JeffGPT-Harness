@@ -10,7 +10,14 @@ from shared.model_pool import acquire_model, acquire_role
 
 _log = logging.getLogger("workers.models")
 
-FAST_TIMEOUT = 3600
+# 3600s (1 hour) was the prior value and caused every LLM call in the system —
+# research synthesis, critic, planner, summariser, classifier, intent, chat
+# summariser, tool_planner, etc. — to potentially sit for 60 minutes on a
+# stalled model. 900s (15 min) is long enough for a slow CPU-bound synthesis
+# on a busy local model but fast enough to bail out while the user still cares.
+# Higher-level callers (research, planned_search) apply tighter per-call caps
+# on top of this floor.
+FAST_TIMEOUT = 900
 
 # chat-only functions bypass the reasoner guard below
 _CHAT_ONLY_FUNCTIONS = frozenset({"chat", "code"})

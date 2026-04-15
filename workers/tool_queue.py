@@ -393,6 +393,32 @@ class ToolJobQueue:
             for sub in self._subscribers:
                 sub.append(event)
 
+    def _higher_priority_queued(self, my_priority: int) -> bool:
+        """True if any queued job across ALL types has priority strictly higher
+        (lower number) than `my_priority`. Used so low-priority workers pause
+        while a high-priority job is waiting — the per-type worker model
+        otherwise lets a p5 pathfinder_crawl run in parallel with a p3
+        research_agent, which is what the user saw as "chaos".
+
+        We fetch the single lowest-priority-number queued row (sort asc, limit 1)
+        and compare in Python rather than relying on the `lt` NocoDB operator,
+        which isn't used anywhere else in this codebase and is unverified."""
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return False
+            rows = db._get(NOCODB_TABLE, params={
+                "where": "(status,eq,queued)",
+                "sort": "priority",
+                "limit": 1,
+            }).get("list", [])
+            if not rows:
+                return False
+            top = int(rows[0].get("priority") or 5)
+            return top < my_priority
+        except Exception:
+            return False
+
     def _worker_loop(self, job_type: str):
         config = self._handlers[job_type]
         wake = self._wake_events[job_type]
@@ -417,6 +443,30 @@ class ToolJobQueue:
                         _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
                                    worker_id, idle, min_gate)
                     continue
+
+            # Cross-type priority yield: before claiming MY job, check if anything
+            # higher-priority is waiting anywhere in the queue. If so, back off so
+            # the high-priority worker gets its turn. Without this, each job_type
+            # has its own thread and p5 runs in parallel with a queued p3.
+            #
+            # Polls in a loop so we pick up quickly once the higher-priority job
+            # claims. A single sleep-then-continue would dump us back into
+            # wake.wait(timeout=POLL_INTERVAL) and potentially idle 300s even
+            # though the higher-priority job already claimed.
+            my_priority = config.priority_default
+            if my_priority > 1:
+                yielded = False
+                while self._higher_priority_queued(my_priority):
+                    if not yielded:
+                        _log.info(
+                            "queue %s: yielding — higher-priority job queued (my p=%d)",
+                            worker_id, my_priority,
+                        )
+                        yielded = True
+                    if self._stop.wait(timeout=10):
+                        return
+                if yielded:
+                    _log.info("queue %s: resuming — higher-priority queue drained", worker_id)
 
             job = self._claim_next(job_type, worker_id)
             if not job:

@@ -18,9 +18,24 @@ _log = logging.getLogger("planned_search.agent")
 # does NOT call tools.search.web_search (the LLM-orchestrated web_search tool) —
 # planned_search is an explicit, user-approved query path and must not trigger
 # the implicit web_search pipeline.
-_PLANNED_MAX_URLS = 5
+#
+# `_PLANNED_MAX_URLS` sets how many candidate URLs survive the pre-scrape cap.
+# It must be larger than `successful_scrapes_needed` because block pages and
+# scrape failures eat into this budget — if they're equal, one block page
+# means one fewer source reaches synthesis. We keep 3× the needed count so
+# we have headroom after block-page/stub drops.
 _PLANNED_SEARXNG_PER_QUERY = 10
 _PLANNED_RELEVANCE_THRESHOLD = 0.25
+# Hard ceiling for synthesis — matches research agent's timeout policy.
+_PLANNED_SYNTHESIS_TIMEOUT_S = 300
+_PLANNED_PLANNER_TIMEOUT_S = 60
+
+
+def _planned_max_urls() -> int:
+    """Candidate-URL cap derived from the successful_scrapes_needed feature
+    flag. See comment above for why we oversample by 3×."""
+    needed = int(get_feature("planned_search", "successful_scrapes_needed", 10) or 10)
+    return max(needed * 3, needed + 5)
 
 
 async def _planned_search_all(queries: list[str]) -> list[dict]:
@@ -41,7 +56,48 @@ async def _planned_search_all(queries: list[str]) -> list[dict]:
                 continue
             seen.add(url)
             deduped.append(r)
-    return deduped[:_PLANNED_MAX_URLS]
+    return deduped[:_planned_max_urls()]
+
+
+# Signatures of pages that returned HTTP 200 + HTML but carry no usable content:
+# CDN/WAF challenges, captchas, security blocks, stubs, generic error pages.
+# These otherwise sneak through the keyword relevance filter when the block page
+# happens to contain the query terms (e.g. "Access to Rust was denied").
+#
+# Kept narrow: phrases here must appear in actual block interstitials and be
+# unlikely in prose about those same topics. Words like "cloudflare",
+# "captcha", "forbidden", "rate limited" appear in normal articles, so they
+# are NOT listed — otherwise we'd drop legitimate content about those topics.
+_BLOCK_PAGE_SIGNATURES = (
+    "attention required! | cloudflare",
+    "are you a human?",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "enable javascript to continue",
+    "enable cookies to continue",
+    "just a moment...",
+    "please verify you are human",
+    "please stand by, while we are checking",
+    "this website is using a security service to protect itself",
+    "you have been blocked",
+    "your request has been blocked",
+    "request unsuccessful. incapsula incident",
+    "ray id:",
+    "you don't have permission to access",
+)
+_MIN_USEFUL_SCRAPE_CHARS = 500
+
+
+def _looks_like_block_page(text: str) -> bool:
+    """True when the scraped 'text' is a WAF/captcha/block page or a useless stub.
+    These pages commonly pass keyword relevance by accident and poison synthesis."""
+    if not text:
+        return True
+    stripped = text.strip()
+    if len(stripped) < _MIN_USEFUL_SCRAPE_CHARS:
+        return True
+    head = stripped[:1500].lower()
+    return any(sig in head for sig in _BLOCK_PAGE_SIGNATURES)
 
 
 def _planned_filter_by_relevance(results: list[dict], queries: list[str]) -> list[dict]:
@@ -256,8 +312,13 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
             continue
         scraped = await asyncio.to_thread(_scrape, url)
         if scraped.get("status") == "ok" and scraped.get("text"):
+            text = scraped.get("text", "")
+            if _looks_like_block_page(text):
+                _log.info("planned_search drop  reason=block_page  url=%s chars=%d",
+                          url[:100], len(text))
+                continue
             title = r.get("title", "")
-            snippet = scraped.get("text", "")[:1000]
+            snippet = text[:1000]
             ratio, label = _score_against_keywords(f"{title} {snippet}", query_keywords)
             scraped_results.append({
                 "url": scraped.get("canonical") or url,
@@ -436,9 +497,17 @@ async def _synthesize_answer(question: str, sources: list[dict]) -> tuple[str, i
         "Sources:\n" + "\n\n".join(context_parts)
     )
 
+    # model_call has no internal timeout; wrap in asyncio.wait_for so the whole
+    # planned_search job can't hang on a stalled LLM. Same policy as research.
     try:
-        raw, tokens = await asyncio.to_thread(model_call, "planned_search_answer", prompt, True)
+        raw, tokens = await asyncio.wait_for(
+            asyncio.to_thread(model_call, "planned_search_answer", prompt, True),
+            timeout=_PLANNED_SYNTHESIS_TIMEOUT_S,
+        )
         return (raw or "").strip(), tokens or 0
+    except asyncio.TimeoutError:
+        _log.warning("planned_search synthesis timeout after %ds", _PLANNED_SYNTHESIS_TIMEOUT_S)
+        return "", 0
     except Exception:
         _log.warning("planned_search synthesis failed", exc_info=True)
         return "", 0

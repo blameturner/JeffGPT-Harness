@@ -1,3 +1,4 @@
+import concurrent.futures as _futures
 import json
 import logging
 
@@ -17,6 +18,17 @@ from shared.models import model_call
 _log = logging.getLogger("research.agent")
 
 DEFAULT_MAX_ITERATIONS = 3
+# Per-query ceiling for run_web_search. SEARCH_POLICY_FULL's internal budget is
+# 60s but the orchestrator only enforces that cap for CONTEXTUAL; FULL runs
+# uncapped. Without this outer timeout, one slow LLM call inside web_search
+# hangs the whole research iteration and the plan sits stuck on "synthesizing".
+_WEB_SEARCH_PER_QUERY_TIMEOUT_S = 90
+# Ceiling for the synthesis LLM call. model_call has no internal timeout.
+_SYNTHESIS_TIMEOUT_S = 300
+# Ceiling for the critic (analyze_gaps) LLM call. Same rationale as synthesis
+# — critic runs another model_call after synthesis and could hang just the
+# same. Shorter cap because the critic prompt is smaller.
+_CRITIC_TIMEOUT_S = 120
 
 
 def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict:
@@ -34,17 +46,44 @@ def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict
     }
 
 
+def _run_web_search_with_timeout(query: str, org_id: int, intent: dict) -> tuple[str, list[dict], str] | None:
+    """Wrap run_web_search in a thread + hard timeout. Returns None on timeout
+    or exception so the caller can skip this query instead of hanging forever.
+    The orchestrator only enforces hard_cap_s for SEARCH_POLICY_CONTEXTUAL;
+    research uses SEARCH_POLICY_FULL which otherwise has no outer cap.
+
+    Important: we do NOT use `with ThreadPoolExecutor(...)` because its
+    __exit__ calls shutdown(wait=True), which would block waiting for the
+    timed-out thread to finish — defeating the timeout. Python threads
+    cannot be force-killed, so we let the hung thread leak in the
+    background (shutdown wait=False) and return control to the handler."""
+    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-ws")
+    try:
+        fut = ex.submit(run_web_search, query, org_id=org_id, intent_dict=intent)
+        try:
+            return fut.result(timeout=_WEB_SEARCH_PER_QUERY_TIMEOUT_S)
+        except _futures.TimeoutError:
+            _log.warning("web search timeout after %ds  query=%s", _WEB_SEARCH_PER_QUERY_TIMEOUT_S, query[:60])
+            return None
+        except Exception as e:
+            _log.warning("web search failed for query: %s  error=%s", query[:40], e)
+            return None
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _fetch_fresh_context(topic: str, queries: list, org_id: int) -> tuple[str, list[dict]]:
-    """Run web_search for each query; return aggregated context block and collected sources."""
+    """Run web_search for each query with a per-query hard timeout; return
+    aggregated context block and collected sources. A hanging query is skipped
+    rather than blocking the whole research iteration."""
     context_parts: list[str] = []
     all_sources: list[dict] = []
     intent = _research_intent_dict(topic)
     for q in queries:
-        try:
-            context_block, sources, confidence = run_web_search(q, org_id=org_id, intent_dict=intent)
-        except Exception as e:
-            _log.warning("web search failed for query: %s  error=%s", q[:40], e)
+        res = _run_web_search_with_timeout(q, org_id, intent)
+        if res is None:
             continue
+        context_block, sources, confidence = res
         if context_block:
             context_parts.append(f"\n--- Query: {q} (confidence={confidence}) ---")
             context_parts.append(context_block)
@@ -106,12 +145,63 @@ INSTRUCTIONS:
 4. If information is missing or insufficient, note it as "INCOMPLETE".
 5. Output ONLY valid JSON matching the schema structure."""
 
+    def _run():
+        return model_call("research_agent", prompt, max_tokens=4000, temperature=0.3)
+
+    # Same rationale as _run_web_search_with_timeout: avoid `with` so the
+    # executor doesn't block on shutdown when the LLM call hangs.
+    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-syn")
     try:
-        result, _ = model_call("research_agent", prompt, max_tokens=4000, temperature=0.3)
-        return {"status": "ok", "content": result}
-    except Exception as e:
-        _log.warning("synthesis failed  topic=%s  error=%s", topic[:40], e)
-        return {"status": "failed", "error": str(e)[:200]}
+        fut = ex.submit(_run)
+        try:
+            result, _ = fut.result(timeout=_SYNTHESIS_TIMEOUT_S)
+            return {"status": "ok", "content": result}
+        except _futures.TimeoutError:
+            _log.warning("synthesis timeout after %ds  topic=%s", _SYNTHESIS_TIMEOUT_S, topic[:40])
+            return {"status": "failed", "error": f"synthesis timeout after {_SYNTHESIS_TIMEOUT_S}s"}
+        except Exception as e:
+            _log.warning("synthesis failed  topic=%s  error=%s", topic[:40], e)
+            return {"status": "failed", "error": str(e)[:200]}
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _call_with_timeout(fn, args: tuple, timeout_s: float, label: str):
+    """Generic thread+timeout wrapper. Returns the function result, or None if
+    it timed out or raised. Uses shutdown(wait=False) so a hung thread doesn't
+    block the calling handler."""
+    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"research-{label}")
+    try:
+        fut = ex.submit(fn, *args)
+        try:
+            return fut.result(timeout=timeout_s)
+        except _futures.TimeoutError:
+            _log.warning("%s timeout after %ds", label, timeout_s)
+            return None
+        except Exception as e:
+            _log.warning("%s failed  error=%s", label, e)
+            return None
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _safe_json_loads(raw, fallback):
+    """json.loads that never raises — returns `fallback` on any parse error.
+    Corrupt queries/schema JSON in the DB row should NOT crash the handler."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
+def _patch_or_log(client, plan_id: int, patch: dict, label: str) -> None:
+    """Best-effort row update. If the DB blips mid-run we still want the
+    handler to continue and return cleanly — the final except-path will
+    retry the terminal patch."""
+    try:
+        client._patch("research_plans", plan_id, patch)
+    except Exception:
+        _log.debug("research_plans patch failed  plan_id=%d  label=%s", plan_id, label, exc_info=True)
 
 
 def run_research_agent(plan_id: int) -> dict:
@@ -119,40 +209,44 @@ def run_research_agent(plan_id: int) -> dict:
         return {"status": "disabled", "error": "research_agent feature disabled"}
 
     client = NocodbClient()
-    plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
-    plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
 
-    if not plan:
-        return {"status": "not_found", "plan_id": plan_id}
-
-    topic = plan.get("topic", "")
-    queries = json.loads(plan.get("queries", "[]"))
-    schema = json.loads(plan.get("schema", "{}"))
-    iterations = plan.get("iterations", 0)
-    org_id = plan.get("org_id", 0)
-
-    max_iterations = plan.get("max_iterations") or get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
-    confidence_threshold = plan.get("confidence_threshold") or get_confidence_threshold()
-
-    client._patch("research_plans", plan_id, {"status": "synthesizing"})
-
-    # Guard every path after the status flip: if ANY exception escapes, flip the
-    # row to "failed" so it doesn't sit stuck on "synthesizing" until the stale
-    # checker resets it (40 min on this job type).
+    # Whole-handler guard: ANY exception — including DB errors before the status
+    # flip or bad JSON in plan fields — lands in the except path and flips the
+    # row to "failed". The plan can never be left stuck in a non-terminal state.
     try:
+        plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+        plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
+
+        if not plan:
+            return {"status": "not_found", "plan_id": plan_id}
+
+        topic = plan.get("topic", "")
+        queries = _safe_json_loads(plan.get("queries", "[]"), [])
+        schema = _safe_json_loads(plan.get("schema", "{}"), {})
+        iterations = plan.get("iterations", 0)
+        org_id = plan.get("org_id", 0)
+
+        max_iterations = plan.get("max_iterations") or get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
+        confidence_threshold = plan.get("confidence_threshold") or get_confidence_threshold()
+
+        # Status lifecycle (so the UI can see WHERE a run is stuck):
+        #   searching     -> inside _fetch_fresh_context (web_search per query)
+        #   synthesizing  -> inside _synthesize (LLM synthesis)
+        #   completed/failed/generating -> terminal or next-iteration state
+        # Previously this code flipped to "synthesizing" at entry, so every hang —
+        # even in web_search — presented as "stuck on synthesizing".
+        _patch_or_log(client, plan_id, {"status": "searching"}, "searching")
+
         return _run_research_agent_inner(
             client, plan_id, topic, queries, schema, iterations,
             org_id, max_iterations, confidence_threshold, plan,
         )
     except Exception as e:
         _log.error("research_agent uncaught error  plan_id=%d", plan_id, exc_info=True)
-        try:
-            client._patch("research_plans", plan_id, {
-                "status": "failed",
-                "error_message": f"uncaught: {str(e)[:300]}",
-            })
-        except Exception:
-            _log.warning("research_agent failure patch also failed  plan_id=%d", plan_id, exc_info=True)
+        _patch_or_log(client, plan_id, {
+            "status": "failed",
+            "error_message": f"uncaught: {str(e)[:300]}",
+        }, "failed-uncaught")
         return {"status": "failed", "plan_id": plan_id, "error": str(e)[:300]}
 
 
@@ -189,18 +283,41 @@ def _run_research_agent_inner(
 
     context = _build_context(topic, fresh_queries, prior_queries, org_id)
 
+    # We're done searching — flip to "synthesizing" right before the LLM call so
+    # the UI status accurately reflects which phase is running.
+    _patch_or_log(client, plan_id, {"status": "synthesizing"}, "synthesizing")
+
     synthesis = _synthesize(topic, context, schema, iterations)
 
     if synthesis.get("status") == "failed":
         client._patch("research_plans", plan_id, {"status": "failed", "error_message": synthesis.get("error")})
         return {"status": "failed", **synthesis}
 
-    gap_analysis = analyze_gaps(topic, synthesis.get("content", ""), schema, context)
+    # Bound the critic call the same way — without a timeout wrapper a hung
+    # model_call inside analyze_gaps would stall the handler AFTER synthesis
+    # already succeeded, wasting the synthesis and sitting the row on
+    # "synthesizing" indefinitely.
+    gap_analysis = _call_with_timeout(
+        analyze_gaps,
+        (topic, synthesis.get("content", ""), schema, context),
+        _CRITIC_TIMEOUT_S,
+        "critic",
+    )
+    if gap_analysis is None:
+        # Timed out or raised. Bail with a failure marker rather than retrying
+        # — if the model is stuck, another call won't help this iteration.
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": f"critic timeout/error after {_CRITIC_TIMEOUT_S}s",
+        })
+        return {"status": "failed", "plan_id": plan_id, "error": "critic timeout"}
 
     gap_report = json.dumps(gap_analysis)
     confidence = gap_analysis.get("confidence_score", 0)
     ready = gap_analysis.get("ready_for_completion", False)
-    new_queries = gap_analysis.get("new_search_requirements", [])
+    # `or []` guards against the model returning null for this key — `None + list`
+    # would raise TypeError on line `new_queries_list = queries + new_queries`.
+    new_queries = gap_analysis.get("new_search_requirements") or []
 
     new_queries_list = queries + new_queries
     updated_queries = json.dumps(new_queries_list)

@@ -73,9 +73,10 @@ async def lifespan(app: FastAPI):
     tool_queue.start()
     _log.info("tool job queue running")
 
-    # periodic dispatchers: jumpstart each chain if it has fully drained.
-    # scrape_target_job and pathfinder_crawl_job both self-chain, so we only need a
-    # heartbeat to restart them when they go idle.
+    # periodic dispatchers: submit one scrape_target and one pathfinder_crawl
+    # per interval if none are inflight. Self-chaining has been removed from
+    # both handlers (it caused the runaway-every-1.5s bug); these APScheduler
+    # IntervalTriggers are now the sole drivers.
     try:
         from datetime import datetime, timedelta, timezone
         from infra.config import get_feature

@@ -245,27 +245,36 @@ def _scrape_one_target(target_id: int) -> dict:
 
 
 def _seconds_since_last_scrape_target_completion(client: NocodbClient) -> float:
-    """Newest completed scrape_target batch's age in seconds. inf if none yet."""
+    """Newest REAL completed scrape_target batch's age in seconds. Skips past
+    rows whose result carries "skipped_cooldown" — those are themselves the
+    cooldown gate firing and counting them would let a flood of queued jobs
+    reset the timer every iteration, blocking real runs indefinitely.
+
+    Returns inf if no real completion is found in the recent window.
+    """
     try:
         rows = client._get("tool_jobs", params={
             "where": "(type,eq,scrape_target)~and(status,eq,completed)",
             "sort": "-completed_at",
-            "limit": 1,
+            "limit": 20,
         }).get("list", [])
     except Exception:
         return float("inf")
-    if not rows:
-        return float("inf")
-    ts_str = rows[0].get("completed_at") or ""
-    if not ts_str:
-        return float("inf")
-    try:
-        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-    except Exception:
-        return float("inf")
-    return (datetime.now(timezone.utc) - ts).total_seconds()
+    for row in rows:
+        result_str = row.get("result") or ""
+        if "skipped_cooldown" in result_str:
+            continue
+        ts_str = row.get("completed_at") or ""
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    return float("inf")
 
 
 def scrape_target_job(payload: dict | int | None = None) -> dict:

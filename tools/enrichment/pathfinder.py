@@ -602,38 +602,13 @@ def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
         return None
 
 
-def _count_queued_pathfinder() -> int:
-    """Count ONLY queued pathfinder_crawl jobs. Running ones are excluded — when the
-    handler calls _chain_next_pathfinder() from inside its own run, the current job
-    is still status='running' and would self-dedup the chain, breaking it. We only
-    care about whether there's a pending job to pick up after this one finishes."""
-    try:
-        client = NocodbClient()
-        data = client._get("tool_jobs", params={
-            "where": "(type,eq,pathfinder_crawl)~and(status,eq,queued)",
-            "limit": 5,
-        })
-        return len(data.get("list", []))
-    except Exception:
-        return 0
-
-
-def _chain_next_pathfinder(org_id: int = 1) -> None:
-    """Submit the next pathfinder_crawl job, but only if none is already QUEUED.
-    We intentionally don't count 'running' here — this function runs from inside
-    the currently-running handler, which would otherwise self-dedup itself and
-    break the chain. Guarantees at most one queued pathfinder_crawl waiting to run.
-    Defaults org_id to 1 (the default tenant) so chained rows don't sit at org_id=0."""
-    try:
-        if _count_queued_pathfinder() > 0:
-            return
-        from workers.tool_queue import get_tool_queue
-        tq = get_tool_queue()
-        if tq:
-            effective_org = org_id if org_id else 1
-            tq.submit("pathfinder_crawl", {}, source="pathfinder_chain", priority=5, org_id=effective_org)
-    except Exception:
-        _log.warning("pathfinder chain submit failed", exc_info=True)
+# NOTE: `_chain_next_pathfinder` and `_count_queued_pathfinder` previously lived
+# here and self-submitted the next pathfinder_crawl at the end of every handler
+# invocation. With no per-type throttle and chat idle for long periods, that
+# produced one job every ~1.5 s (the runaway the user reported). Both have been
+# removed rather than left as dead code, so they can't be accidentally re-wired.
+# The sole driver now is `jumpstart_pathfinder` in dispatcher.py (10-minute
+# IntervalTrigger) backed by the handler-level cooldown gate above.
 
 
 def _queue_classifier(target_id: int | None, url: str, text: str, org_id: int) -> None:
@@ -704,31 +679,38 @@ def _process_one_seed(
 
 
 def _seconds_since_last_pathfinder_completion(client: NocodbClient) -> float:
-    """How long since the newest completed pathfinder_crawl finished. Returns
-    inf if none has ever completed. Used by the cooldown guard below so an
-    aggressive submitter (cron misfire, UI loop, leftover chain) can't spin
-    this handler faster than `pathfinder.min_run_interval_seconds`."""
+    """How long since the newest REAL completed pathfinder_crawl finished. We
+    skip past rows whose result carries "skipped_cooldown" because those are
+    themselves products of this gate — counting them would let a flood of
+    queued jobs reset the timer to "now" every time one of them skips, which
+    would block real runs indefinitely as long as the flood lasts.
+
+    Returns inf if no real completion is found in the recent window.
+    """
     from datetime import datetime, timezone
     try:
         rows = client._get("tool_jobs", params={
             "where": "(type,eq,pathfinder_crawl)~and(status,eq,completed)",
             "sort": "-completed_at",
-            "limit": 1,
+            "limit": 20,
         }).get("list", [])
     except Exception:
         return float("inf")
-    if not rows:
-        return float("inf")
-    ts_str = rows[0].get("completed_at") or ""
-    if not ts_str:
-        return float("inf")
-    try:
-        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-    except Exception:
-        return float("inf")
-    return (datetime.now(timezone.utc) - ts).total_seconds()
+    for row in rows:
+        result_str = row.get("result") or ""
+        if "skipped_cooldown" in result_str:
+            continue
+        ts_str = row.get("completed_at") or ""
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    return float("inf")
 
 
 def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:

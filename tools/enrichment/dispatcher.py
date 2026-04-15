@@ -74,9 +74,10 @@ def jumpstart_scraper() -> dict:
 
 def jumpstart_pathfinder() -> dict:
     """Scheduler hook: every `pathfinder.recrawl_interval_minutes`, ensure there is
-    exactly ONE pathfinder_crawl in the queue. Skip if one is already inflight
-    (the handler self-chains, so normally there's always one queued — this cron is
-    the safety net if the chain breaks)."""
+    exactly ONE pathfinder_crawl in the queue. Skip if one is already inflight.
+    This cron is now the SOLE driver of pathfinder_crawl — self-chaining was
+    removed from the handler because it produced a runaway loop when chat was
+    idle (no backoff gate tripped and jobs ran back-to-back every ~1.5 s)."""
     if not get_feature("pathfinder", "enabled", True):
         return {"status": "disabled"}
 
