@@ -1,7 +1,7 @@
 import json
 import logging
 from typing import Any
-from infra.config import is_feature_enabled
+from infra.config import get_feature
 from shared.models import model_call
 
 _log = logging.getLogger("research.critic")
@@ -56,4 +56,4 @@ Respond with ONLY valid JSON (no explanation):
 
 
 def get_confidence_threshold() -> int:
-    return is_feature_enabled("research_confidence_threshold") or DEFAULT_CONFIDENCE_THRESHOLD
+    return get_feature("research", "confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD)

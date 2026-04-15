@@ -188,7 +188,11 @@ def _playwright_worker_main() -> None:
         if item is _PW_QUEUE_SENTINEL:
             _teardown_browser()
             return
-        url, fut = item
+        if len(item) == 3:
+            url, fut, mode = item
+        else:
+            url, fut = item
+            mode = "text"
         if fut.cancelled():
             continue
         started = time.time()
@@ -241,6 +245,26 @@ def _playwright_worker_main() -> None:
                 except Exception:
                     pass
 
+                if mode == "html":
+                    try:
+                        html = page.content() or ""
+                    except Exception:
+                        html = ""
+                    text_probe = ""
+                    try:
+                        text_probe = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                    except Exception:
+                        pass
+                    if text_probe and _looks_like_antibot(text_probe):
+                        elapsed = round(time.time() - started, 2)
+                        _log.warning("playwright_fetch_html anti-bot wall  url=%s final=%s %.2fs", url[:120], final_url[:120], elapsed)
+                        fut.set_result({"html": "", "final_url": final_url})
+                        continue
+                    elapsed = round(time.time() - started, 2)
+                    _log.info("playwright_fetch_html ok  url=%s html_chars=%d %.2fs", url[:120], len(html), elapsed)
+                    fut.set_result({"html": html, "final_url": final_url})
+                    continue
+
                 try:
                     text = page.evaluate(_MAIN_CONTENT_EXTRACT) or ""
                 except Exception:
@@ -268,7 +292,10 @@ def _playwright_worker_main() -> None:
             if not _browser_alive():
                 _log.warning("playwright browser appears dead, resetting")
                 _teardown_browser()
-            fut.set_result("")
+            if mode == "html":
+                fut.set_result({"html": "", "final_url": url})
+            else:
+                fut.set_result("")
 
 
 def _ensure_playwright_worker() -> None:
@@ -302,6 +329,26 @@ def playwright_fetch(url: str) -> str:
     except Exception as e:
         _log.warning("playwright_fetch wait failed  url=%s error=%s", url[:120], e)
         return ""
+
+
+def playwright_fetch_html(url: str) -> tuple[str, str]:
+    """Render the page in Chromium and return (html, final_url). Empty html on failure."""
+    if not _is_safe_url(url):
+        _log.warning("playwright_fetch_html blocked unsafe url %s", url[:120])
+        return "", url
+    url = _sanitise_url(url)
+    _ensure_playwright_worker()
+    assert _pw_queue is not None
+    fut: Future = Future()
+    _pw_queue.put((url, fut, "html"))
+    try:
+        out = fut.result(timeout=PLAYWRIGHT_FETCH_TIMEOUT)
+    except Exception as e:
+        _log.warning("playwright_fetch_html wait failed  url=%s error=%s", url[:120], e)
+        return "", url
+    if isinstance(out, dict):
+        return out.get("html", "") or "", out.get("final_url", url) or url
+    return "", url
 
 
 def _scrape_with_httpx(url: str) -> str:

@@ -58,6 +58,14 @@ _CODE_ERROR_SIGNALS = re.compile(
     re.I,
 )
 
+_PLANNED_SEARCH = re.compile(
+    r"\b(research|investigate|investigation|deep[\s-]?dive|comprehensive(?:ly)?|thorough(?:ly)?|"
+    r"in[\s-]?depth|plan (?:a|the|my) search|propose (?:searches|queries)|"
+    r"multi[\s-]?(?:angle|aspect|faceted)|literature review|state of the art|"
+    r"landscape|survey of)\b",
+    re.I,
+)
+
 
 def gate_check(
     message: str,
@@ -93,6 +101,8 @@ def gate_check(
         hints.add("web_search")
     if _RAG_LOOKUP.search(msg):
         hints.add("rag_lookup")
+    if _PLANNED_SEARCH.search(msg):
+        hints.add("planned_search")
 
     if is_code:
         if _CODE_API_LOOKUP.search(msg):
@@ -105,7 +115,7 @@ def gate_check(
         if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
             hints.add("web_search")
 
-    if "web_search" not in hints and len(msg) > 30:
+    if "web_search" not in hints and "planned_search" not in hints and len(msg) > 30:
         hints.add("web_search")
 
     hints = {h for h in hints if is_feature_enabled(h)}

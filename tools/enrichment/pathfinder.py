@@ -12,16 +12,26 @@ from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlparse, url
 
 import httpx
 
+from infra.config import get_feature
 from infra.nocodb_client import NocodbClient
-from tools.scraper.search import SearchScraper
+from tools.scraper.pathfinder import PathfinderScraper
 
 _log = logging.getLogger("pathfinder")
 
 DEFAULT_MAX_DEPTH = 3
-DEFAULT_MAX_PAGES = 200
-DEFAULT_CONCURRENCY = 4
-DEFAULT_PER_HOST_DELAY_S = 1.0
-ROBOTS_CACHE_TTL_S = 3600
+DEFAULT_MAX_PAGES = 500
+DEFAULT_CONCURRENCY = 8
+DEFAULT_PER_HOST_DELAY_S = 0.5
+DEFAULT_ROBOTS_CACHE_TTL_S = 3600
+DEFAULT_SITEMAP_LIMIT = 500
+SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap.xml.gz")
+
+
+def _cfg(key: str, default):
+    return get_feature("pathfinder", key, default)
+
+
+ROBOTS_CACHE_TTL_S = _cfg("robots_cache_ttl_s", DEFAULT_ROBOTS_CACHE_TTL_S)
 
 _BINARY_EXT = re.compile(
     r"\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tif|tiff|"
@@ -240,11 +250,19 @@ def _add_url(
 def discover(
     seed_url: str,
     org_id: int,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    max_pages: int = DEFAULT_MAX_PAGES,
+    max_depth: int | None = None,
+    max_pages: int | None = None,
     same_host_only: bool = True,
-    concurrency: int = DEFAULT_CONCURRENCY,
+    concurrency: int | None = None,
 ) -> dict:
+    if not _cfg("enabled", True):
+        return {"processed": 0, "added": 0, "error": "pathfinder_disabled"}
+
+    max_depth = max_depth if max_depth is not None else _cfg("max_depth", DEFAULT_MAX_DEPTH)
+    max_pages = max_pages if max_pages is not None else _cfg("max_pages", DEFAULT_MAX_PAGES)
+    concurrency = concurrency if concurrency is not None else _cfg("concurrency", DEFAULT_CONCURRENCY)
+    sitemap_limit = _cfg("sitemap_limit", DEFAULT_SITEMAP_LIMIT)
+
     seed = _normalize(seed_url)
     if not seed:
         return {"processed": 0, "added": 0, "error": "invalid_seed"}
@@ -252,45 +270,58 @@ def discover(
     seed_host = _host(seed)
     seed_path = urlparse(seed).path or "/"
 
-    scraper = SearchScraper(timeout=30)
+    scraper = PathfinderScraper(timeout=30)
     robots = _RobotsCache()
-    limiter = _HostRateLimiter()
+    limiter = _HostRateLimiter(delay=_cfg("per_host_delay_s", DEFAULT_PER_HOST_DELAY_S))
     client = NocodbClient()
-    ua = "JeffGPT-Pathfinder/1.0"
+    ua = "Mozilla/5.0 (compatible; JeffGPT-Pathfinder/1.0)"
 
     visited: set[str] = set()
     visited_lock = threading.Lock()
     frontier: deque[tuple[str, int, str]] = deque()  # (url, depth, source)
     frontier.append((seed, 0, ""))
 
-    # seed with sitemap hints (robots.txt Sitemap: lines)
+    # seed with sitemap hints (robots.txt Sitemap: lines, then common fallback paths)
+    sitemap_urls_seeded = 0
     if robots.allowed(seed, ua):
-        for sm in robots.sitemaps(seed):
-            for u in _fetch_sitemap_urls(sm, limit=200):
+        sitemaps = list(robots.sitemaps(seed))
+        if not sitemaps:
+            parts = urlparse(seed)
+            base = f"{parts.scheme}://{parts.netloc}"
+            sitemaps = [f"{base}{path}" for path in SITEMAP_CANDIDATES]
+        for sm in sitemaps:
+            for u in _fetch_sitemap_urls(sm, limit=sitemap_limit):
                 n = _normalize(u)
                 if n and (not same_host_only or _host(n) == seed_host):
                     frontier.append((n, 1, sm))
+                    sitemap_urls_seeded += 1
+    _log.info("pathfinder seed=%s  sitemap_urls_seeded=%d", seed[:80], sitemap_urls_seeded)
 
     added = 0
     processed = 0
     errors = 0
     skipped_robots = 0
     skipped_filter = 0
+    scrape_failed = 0
+    seed_ok = False
+    seed_link_count = 0
 
-    def _process(url: str, depth: int, source: str) -> tuple[int, int, int]:
-        """Returns (added, skipped_filter, skipped_robots)."""
+    def _process(url: str, depth: int, source: str) -> tuple[int, int, int, int, bool, int]:
+        """Returns (added, skipped_filter, skipped_robots, scrape_failed, is_seed_ok, link_count)."""
         if depth > max_depth:
-            return 0, 0, 0
+            return 0, 0, 0, 0, False, 0
         if _is_binary(url) or _is_junk(url):
-            return 0, 1, 0
+            return 0, 1, 0, 0, False, 0
         if not robots.allowed(url, ua):
-            return 0, 0, 1
+            return 0, 0, 1, 0, False, 0
 
         limiter.wait(_host(url))
 
         result = scraper.scrape(url)
         if result.get("status") != "ok":
-            return 0, 0, 0
+            err = result.get("error") or "unknown"
+            _log.info("pathfinder scrape failed  depth=%d  url=%s  reason=%s", depth, url[:100], err)
+            return 0, 0, 0, 1, False, 0
 
         final = _normalize(result.get("final_url") or url)
         canon = _normalize(result.get("canonical") or final)
@@ -300,7 +331,9 @@ def discover(
         local_added = 1 if _add_url(client, record_url, source or "", depth, org_id, sc) else 0
 
         local_filtered = 0
-        for link in result.get("links", []):
+        links = result.get("links") or []
+        link_count = len(links)
+        for link in links:
             n = _normalize(link)
             if not n:
                 local_filtered += 1
@@ -317,7 +350,12 @@ def discover(
                 visited.add(n)
             frontier.append((n, depth + 1, record_url))
 
-        return local_added, local_filtered, 0
+        is_seed = (depth == 0)
+        _log.info(
+            "pathfinder scraped  depth=%d  url=%s  links=%d  added=%d  filtered=%d",
+            depth, record_url[:100], link_count, local_added, local_filtered,
+        )
+        return local_added, local_filtered, 0, 0, is_seed, link_count
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         in_flight: set = set()
@@ -337,25 +375,38 @@ def discover(
             for fut in done:
                 processed += 1
                 try:
-                    a, sf, sr = fut.result()
+                    a, sf, sr, sc_fail, is_seed_ok, link_count = fut.result()
                     added += a
                     skipped_filter += sf
                     skipped_robots += sr
+                    scrape_failed += sc_fail
+                    if is_seed_ok:
+                        seed_ok = True
+                        seed_link_count = link_count
                 except Exception as e:
                     errors += 1
                     _log.debug("worker error: %s", e)
 
+    if not seed_ok:
+        _log.warning("pathfinder SEED SCRAPE FAILED  seed=%s — no links discovered from seed", seed[:120])
+    elif seed_link_count == 0:
+        _log.warning("pathfinder seed scraped but ZERO links extracted  seed=%s", seed[:120])
+
     _log.info(
-        "pathfinder done  seed=%s  processed=%d  added=%d  filtered=%d  robots_blocked=%d  errors=%d",
-        seed[:80], processed, added, skipped_filter, skipped_robots, errors,
+        "pathfinder done  seed=%s  processed=%d  added=%d  filtered=%d  scrape_failed=%d  robots_blocked=%d  errors=%d  seed_ok=%s  seed_links=%d",
+        seed[:80], processed, added, skipped_filter, scrape_failed, skipped_robots, errors, seed_ok, seed_link_count,
     )
     return {
         "processed": processed,
         "added": added,
         "skipped_filter": skipped_filter,
         "skipped_robots": skipped_robots,
+        "scrape_failed": scrape_failed,
         "errors": errors,
         "frontier_remaining": len(frontier),
+        "seed_ok": seed_ok,
+        "seed_link_count": seed_link_count,
+        "sitemap_urls_seeded": sitemap_urls_seeded,
     }
 
 

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from infra.config import get_feature_value
+from infra.config import get_feature
 from infra.nocodb_client import NocodbClient
 from tools.contract import ToolName, ToolResult
 from tools.dispatcher import register_executor
@@ -79,7 +79,29 @@ async def execute(params: dict, emit) -> ToolResult:
     )
 
 
+def _relevance_label(ratio: float) -> str:
+    if ratio >= 0.5:
+        return "high"
+    if ratio >= 0.3:
+        return "medium"
+    if ratio > 0:
+        return "low"
+    return "unknown"
+
+
+def _score_against_keywords(text: str, query_keywords: set[str]) -> tuple[float, str]:
+    if not query_keywords or not text:
+        return 0.0, "unknown"
+    haystack = text.lower()
+    hits = sum(1 for kw in query_keywords if kw in haystack)
+    ratio = hits / len(query_keywords)
+    return round(ratio, 3), _relevance_label(ratio)
+
+
 async def approve_searches(message_id: int, org_id: int) -> dict:
+    """Endpoint-facing shell: validates queries, marks the message queued, submits a job.
+    Returns fast so the UI can poll for status instead of blocking on scrape/synthesis.
+    """
     client = NocodbClient()
 
     try:
@@ -94,8 +116,62 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
     except Exception:
         return {"status": "error", "message": "Invalid query format"}
 
-    query_list = [q["query"] for q in queries_data if q.get("query")]
+    query_list = [q.get("query") for q in queries_data.get("queries", queries_data) if isinstance(q, dict) and q.get("query")] \
+        if isinstance(queries_data, dict) else \
+        [q["query"] for q in queries_data if isinstance(q, dict) and q.get("query")]
     if not query_list:
+        return {"status": "error", "message": "No queries to execute"}
+
+    try:
+        client._patch("messages", message_id, {"search_status": "queued", "pending_approval": 0})
+    except Exception:
+        _log.warning("planned_search queued patch failed", exc_info=True)
+
+    from workers.tool_queue import get_tool_queue
+    tq = get_tool_queue()
+    if tq:
+        job_id = tq.submit(
+            "planned_search_execute",
+            {"message_id": message_id, "org_id": org_id},
+            source="planned_search_api",
+            priority=2,
+        )
+        _log.info("Queued planned_search job %s for message_id %s", job_id, message_id)
+        return {"status": "queued", "message_id": message_id, "job_id": job_id}
+
+    _log.warning("Tool queue not available, running planned_search synchronously for message_id %s", message_id)
+    return await _run_planned_search_async(message_id, org_id)
+
+
+def run_planned_search_job(message_id: int, org_id: int) -> dict:
+    """Tool-queue handler entry point: runs the async worker on a worker thread via asyncio.run."""
+    return asyncio.run(_run_planned_search_async(message_id, org_id))
+
+
+async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
+    client = NocodbClient()
+
+    try:
+        msgs = client._get("messages", params={"where": f"(Id,eq,{message_id})", "limit": 1})
+        msg_row = (msgs.get("list") or [{}])[0]
+        query_content = msg_row.get("content") or "{}"
+    except Exception:
+        _log.warning("planned_search load message failed  id=%s", message_id, exc_info=True)
+        return {"status": "error", "message": "Message not found"}
+
+    try:
+        queries_data = json.loads(query_content)
+    except Exception:
+        client._patch("messages", message_id, {"search_status": "failed"})
+        return {"status": "error", "message": "Invalid query format"}
+
+    if isinstance(queries_data, dict):
+        raw_queries = queries_data.get("queries", [])
+    else:
+        raw_queries = queries_data
+    query_list = [q["query"] for q in raw_queries if isinstance(q, dict) and q.get("query")]
+    if not query_list:
+        client._patch("messages", message_id, {"search_status": "failed"})
         return {"status": "error", "message": "No queries to execute"}
 
     try:
@@ -103,10 +179,16 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
     except Exception:
         pass
 
+    from tools.search.queries import _extract_keywords
+    query_keywords: set[str] = set()
+    for q in query_list:
+        for kw in _extract_keywords(q):
+            query_keywords.add(kw.lower())
+
     results = await _search_all(query_list)
     results = _filter_results_by_relevance(results, query_list)
 
-    needed = get_feature_value("planned_search_successful_scrapes_needed", 10)
+    needed = get_feature("planned_search", "successful_scrapes_needed", 10)
 
     from tools.scraper.search import SearchScraper
 
@@ -124,10 +206,15 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
             continue
         scraped = await asyncio.to_thread(_scrape, url)
         if scraped.get("status") == "ok" and scraped.get("text"):
+            title = r.get("title", "")
+            snippet = scraped.get("text", "")[:1000]
+            ratio, label = _score_against_keywords(f"{title} {snippet}", query_keywords)
             scraped_results.append({
                 "url": scraped.get("canonical") or url,
-                "title": r.get("title", ""),
-                "snippet": scraped.get("text", "")[:1000],
+                "title": title,
+                "snippet": snippet,
+                "relevance": label,
+                "relevance_score": ratio,
             })
 
     conversation_id = msg_row.get("conversation_id") or 0
@@ -140,7 +227,7 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
                 sources=[{
                     "title": src.get("title", "")[:255],
                     "url": src.get("url", ""),
-                    "relevance": "high",
+                    "relevance": src.get("relevance", "unknown"),
                     "source_type": "web",
                     "snippet": src.get("snippet", ""),
                     "used_in_answer": True,
@@ -148,6 +235,11 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
             )
         except Exception:
             _log.warning("planned_search add source failed", exc_info=True)
+
+    try:
+        client._patch("messages", message_id, {"search_status": "synthesizing"})
+    except Exception:
+        pass
 
     user_question = _find_original_question(client, conversation_id, message_id)
     answer_text, answer_tokens = await _synthesize_answer(user_question, scraped_results)
@@ -176,7 +268,7 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
                         sources=[{
                             "title": src.get("title", "")[:255],
                             "url": src.get("url", ""),
-                            "relevance": "high",
+                            "relevance": src.get("relevance", "unknown"),
                             "source_type": "web",
                             "snippet": src.get("snippet", ""),
                             "used_in_answer": True,
@@ -187,12 +279,13 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
         except Exception:
             _log.warning("planned_search answer message create failed", exc_info=True)
 
+    final_status = "completed" if answer_text else "failed"
     try:
         client._patch("messages", message_id, {
             "pending_approval": 0,
             "search_used": 1,
             "search_source_count": len(scraped_results),
-            "search_status": "completed",
+            "search_status": final_status,
         })
     except Exception:
         _log.warning("planned_search patch message failed", exc_info=True)
@@ -344,9 +437,22 @@ def get_search_results(message_id: int, org_id: int) -> dict:
 
     try:
         sources = client.list_message_search_sources(message_id=message_id)
-        return {
-            "status": "ok",
-            "sources": sources,
-        }
     except Exception:
         return {"status": "error", "message": "Failed to get sources"}
+
+    search_status = None
+    source_count = None
+    try:
+        msgs = client._get("messages", params={"where": f"(Id,eq,{message_id})", "limit": 1})
+        msg_row = (msgs.get("list") or [{}])[0]
+        search_status = msg_row.get("search_status")
+        source_count = msg_row.get("search_source_count")
+    except Exception:
+        _log.warning("planned_search status lookup failed  id=%s", message_id, exc_info=True)
+
+    return {
+        "status": "ok",
+        "search_status": search_status,
+        "source_count": source_count,
+        "sources": sources,
+    }

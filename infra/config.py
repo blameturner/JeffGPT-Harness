@@ -15,6 +15,24 @@ _log = logging.getLogger("config")
 load_dotenv()
 
 
+def _collect_nested_models(features: dict, models: dict) -> None:
+    """Walk feature sections; any sub-dict with a 'models' child contributes those
+    entries to the flat models registry. Lets each domain co-locate its model defs
+    with its feature flags, while keeping get_function_config(name) flat."""
+    for section_name, section in features.items():
+        if not isinstance(section, dict):
+            continue
+        nested = section.get("models")
+        if isinstance(nested, dict):
+            for model_name, model_cfg in nested.items():
+                if model_name in models:
+                    _log.warning(
+                        "model %r defined in both top-level models and features.%s.models — features wins",
+                        model_name, section_name,
+                    )
+                models[model_name] = model_cfg
+
+
 def load_platform_config() -> dict:
     config_path = Path(__file__).parent.parent / "config.json"
     try:
@@ -28,11 +46,13 @@ def load_platform_config() -> dict:
         _log.error("failed to parse config.json: %s", e)
         raise SystemExit(1)
 
-    models = cfg.get("models", {})
+    models = dict(cfg.get("models", {}))
     features = cfg.get("features", {})
 
+    _collect_nested_models(features, models)
+
     if not models:
-        _log.error("config.json has no 'models' section")
+        _log.error("config.json has no models defined (top-level or nested)")
         raise SystemExit(1)
 
     return {"models": models, "features": features}
@@ -55,11 +75,26 @@ def is_feature_enabled(name: str) -> bool:
     features = PLATFORM.get("features", {})
     if name not in features:
         _log.warning("feature %r not in config.json, defaulting to True", name)
-    return features.get(name, True)
+        return True
+    val = features[name]
+    if isinstance(val, dict):
+        return bool(val.get("enabled", True))
+    return bool(val)
 
 
 def get_feature_value(name: str, default: Any = None) -> Any:
-    return PLATFORM.get("features", {}).get(name, default)
+    val = PLATFORM.get("features", {}).get(name, default)
+    if isinstance(val, dict):
+        return val.get("enabled", default)
+    return val
+
+
+def get_feature(section: str, key: str, default: Any = None) -> Any:
+    """Read a nested feature value, e.g. get_feature('research', 'max_queries', 20)."""
+    sec = PLATFORM.get("features", {}).get(section)
+    if not isinstance(sec, dict):
+        return default
+    return sec.get(key, default)
 
 MODEL_DISCOVERY_TIMEOUT_S = int(os.getenv("MODEL_DISCOVERY_TIMEOUT_S", "60"))
 MODEL_DISCOVERY_INTERVAL_S = 2

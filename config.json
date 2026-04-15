@@ -9,11 +9,7 @@
     "web_search_summarise_batch": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500,  "max_input_chars": 10000, "frequency_penalty": 0.2 },
     "chat_summarise":             { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000, "frequency_penalty": 0.2 },
     "content_quality":            { "role": "t3_tool",    "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500 },
-    "relationships":              { "role": "t1_secondary", "temperature": 0.1, "max_tokens": 800,  "max_input_chars": 8000, "frequency_penalty": 0.3 },
-    "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 },
-    "planned_search":            { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
-    "planned_search_answer":     { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 },
-    "research_planner":          { "role": "t2_secondary", "temperature": 0.2, "max_tokens": 4000, "max_input_chars": 10000 }
+    "relationships":              { "role": "t1_secondary", "temperature": 0.1, "max_tokens": 800,  "max_input_chars": 8000, "frequency_penalty": 0.3 }
   },
   "features": {
     "web_search": true,
@@ -22,12 +18,33 @@
     "search_extraction": true,
     "intent_classifier": true,
     "scraper": true,
-    "research_planner": true,
-    "research_max_queries": 20,
-    "research_agent": true,
-    "research_max_iterations": 3,
-    "research_confidence_threshold": 80,
-    "planned_search": true,
-    "planned_search_successful_scrapes_needed": 10
+    "research": {
+      "planner_enabled": true,
+      "agent_enabled": true,
+      "max_queries": 20,
+      "max_iterations": 3,
+      "confidence_threshold": 80,
+      "models": {
+        "research_planner": { "role": "t2_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
+        "research_agent":   { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 }
+      }
+    },
+    "planned_search": {
+      "enabled": true,
+      "successful_scrapes_needed": 10,
+      "models": {
+        "planned_search":        { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
+        "planned_search_answer": { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 }
+      }
+    },
+    "pathfinder": {
+      "enabled": true,
+      "max_depth": 3,
+      "max_pages": 500,
+      "concurrency": 8,
+      "per_host_delay_s": 0.5,
+      "robots_cache_ttl_s": 3600,
+      "sitemap_limit": 500
+    }
   }
 }

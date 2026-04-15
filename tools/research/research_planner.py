@@ -2,7 +2,7 @@ import json
 import logging
 import re
 
-from infra.config import is_feature_enabled
+from infra.config import get_feature
 from shared.models import model_call
 
 _log = logging.getLogger("research_planner")
@@ -95,32 +95,104 @@ Respond with ONLY valid JSON, no explanation, no markdown."""
 
 
 def create_research_plan(topic: str, org_id: int = 0) -> dict:
+    """Create a shell research_plans row and queue the planner job.
+    Returns immediately with the plan_id so the UI can poll for status.
+    """
     from infra.nocodb_client import NocodbClient
+    from workers.tool_queue import get_tool_queue
 
-    if not is_feature_enabled("research_planner"):
+    if not get_feature("research", "planner_enabled", True):
         return {"status": "disabled", "error": "research_planner feature disabled"}
-
-    max_queries = is_feature_enabled("research_max_queries") or DEFAULT_MAX_QUERIES
-
-    plan = _generate_plan(topic, max_queries)
-    if "error" in plan:
-        return {"status": "failed", "error": plan["error"]}
 
     client = NocodbClient()
     try:
         row = client._post("research_plans", {
             "org_id": org_id,
             "topic": topic,
-            "hypotheses": json.dumps(plan.get("hypotheses", [])),
-            "sub_topics": json.dumps(plan.get("sub_topics", [])),
-            "queries": json.dumps(plan.get("queries", [])),
-            "schema": json.dumps(plan.get("schema", {})),
-            "status": "generating"
+            "hypotheses": "[]",
+            "sub_topics": "[]",
+            "queries": "[]",
+            "schema": "{}",
+            "iterations": 0,
+            "status": "planning",
         })
-        return {"status": "created", "plan_id": row.get("Id")}
+        plan_id = row.get("Id")
     except Exception as e:
-        _log.warning("save plan failed  topic=%s  error=%s", topic[:40], e)
+        _log.warning("shell plan save failed  topic=%s  error=%s", topic[:40], e)
         return {"status": "failed", "error": str(e)[:200]}
+
+    tq = get_tool_queue()
+    if tq:
+        job_id = tq.submit(
+            "research_planner",
+            {"plan_id": plan_id},
+            source="research_api",
+            priority=3,
+        )
+        _log.info("Queued research planner job %s for plan_id %d", job_id, plan_id)
+        return {"status": "queued", "plan_id": plan_id, "job_id": job_id}
+
+    _log.warning("Tool queue not available, running planner synchronously for plan_id %d", plan_id)
+    return run_research_planner_job(plan_id)
+
+
+def run_research_planner_job(plan_id: int) -> dict:
+    """Planner tool-queue handler: generate queries/schema for an existing row, then queue the agent."""
+    from infra.nocodb_client import NocodbClient
+    from workers.tool_queue import get_tool_queue
+
+    if not get_feature("research", "planner_enabled", True):
+        return {"status": "disabled", "error": "research_planner feature disabled"}
+
+    max_queries = get_feature("research", "max_queries", DEFAULT_MAX_QUERIES)
+
+    client = NocodbClient()
+    plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+    plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
+    if not plan:
+        return {"status": "not_found", "plan_id": plan_id}
+
+    topic = plan.get("topic", "")
+    if not topic:
+        client._patch("research_plans", plan_id, {"status": "failed", "error_message": "no topic"})
+        return {"status": "failed", "error": "no topic", "plan_id": plan_id}
+
+    generated = _generate_plan(topic, max_queries)
+    if "error" in generated:
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": str(generated.get("error"))[:500],
+        })
+        return {"status": "failed", "error": generated["error"], "plan_id": plan_id}
+
+    queries = (generated.get("queries") or [])[:max_queries]
+
+    try:
+        client._patch("research_plans", plan_id, {
+            "hypotheses": json.dumps(generated.get("hypotheses", [])),
+            "sub_topics": json.dumps(generated.get("sub_topics", [])),
+            "queries": json.dumps(queries),
+            "schema": json.dumps(generated.get("schema", {})),
+            "status": "generating",
+        })
+    except Exception as e:
+        _log.warning("plan patch failed  id=%d  error=%s", plan_id, e)
+        client._patch("research_plans", plan_id, {"status": "failed", "error_message": str(e)[:500]})
+        return {"status": "failed", "error": str(e)[:200], "plan_id": plan_id}
+
+    tq = get_tool_queue()
+    if tq:
+        job_id = tq.submit(
+            "research_agent",
+            {"plan_id": plan_id},
+            source="research_planner",
+            priority=3,
+        )
+        _log.info("Queued research agent job %s for plan_id %d", job_id, plan_id)
+    else:
+        _log.warning("Tool queue not available, research agent will not run automatically for plan_id %d", plan_id)
+
+    return {"status": "generating", "plan_id": plan_id, "query_count": len(queries)}
 
 
 def get_next_plan() -> dict | None:

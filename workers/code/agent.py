@@ -354,6 +354,7 @@ class CodeAgent(BaseAgent):
                         for a in plan.actions:
                             a.params["_org_id"] = self.org_id
                             a.params["_collection"] = code_collection
+                            a.params["_conversation_id"] = conversation_id
                             if a.tool.value == "rag_lookup" and "collections" not in a.params:
                                 cols = [code_collection, "code_knowledge"]
                                 if codebase_collection:

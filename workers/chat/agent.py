@@ -141,6 +141,7 @@ class ChatAgent(BaseAgent):
                 tool_labels = {
                     "web_search": "web search",
                     "rag_lookup": "conversation history lookup",
+                    "planned_search": "planned search (awaiting approval)",
                 }
                 hint_names = [tool_labels.get(h, h) for h in sorted(hints)]
                 instant_summary = f"Running {', '.join(hint_names)} for: {user_message[:80]}"
@@ -225,6 +226,7 @@ class ChatAgent(BaseAgent):
                         for a in plan.actions:
                             a.params["_org_id"] = self.org_id
                             a.params["_collection"] = collection_name
+                            a.params["_conversation_id"] = conversation_id
                         emit({
                             "type": "tool_status",
                             "phase": "planning",

@@ -1,10 +1,17 @@
 import json
 import logging
 
-from infra.config import is_feature_enabled
+from infra.config import get_feature
 from infra.memory import recall
 from infra.nocodb_client import NocodbClient
 from tools.research.critic import analyze_gaps, get_confidence_threshold
+from tools.search.intent import (
+    CHAT_INTENT_RESEARCH,
+    INTENT_RESPONSE_TEMPLATE,
+    INTENT_ROUTE_CHAT,
+    SEARCH_POLICY_FULL,
+)
+from tools.search.orchestrator import run_web_search
 from shared.models import model_call
 
 _log = logging.getLogger("research.agent")
@@ -12,21 +19,74 @@ _log = logging.getLogger("research.agent")
 DEFAULT_MAX_ITERATIONS = 3
 
 
-def _get_retrieval_context(topic: str, queries: list, org_id: int, collection: str = "discovery") -> str:
-    context_parts = [f"Research Topic: {topic}\n"]
-    for q in queries[:10]:
+def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict:
+    return {
+        "route": INTENT_ROUTE_CHAT,
+        "intent": CHAT_INTENT_RESEARCH,
+        "secondary_intent": None,
+        "entities": ([topic] if topic else []) + (entities or []),
+        "location_hint": None,
+        "time_sensitive": False,
+        "temporal_anchor": None,
+        "confidence": "high",
+        "search_policy": SEARCH_POLICY_FULL,
+        "response_template": INTENT_RESPONSE_TEMPLATE[CHAT_INTENT_RESEARCH],
+    }
+
+
+def _fetch_fresh_context(topic: str, queries: list, org_id: int) -> tuple[str, list[dict]]:
+    """Run web_search for each query; return aggregated context block and collected sources."""
+    context_parts: list[str] = []
+    all_sources: list[dict] = []
+    intent = _research_intent_dict(topic)
+    for q in queries:
         try:
-            results = recall(q, org_id=org_id, collection_name=collection, n_results=5)
-            if results:
-                context_parts.append(f"\n--- Query: {q} ---")
-                for r in results:
-                    text = r.get("text", "")[:500]
-                    meta = r.get("metadata", {})
-                    source = meta.get("url", "unknown")
-                    context_parts.append(f"[Source: {source}]\n{text}")
+            context_block, sources, confidence = run_web_search(q, org_id=org_id, intent_dict=intent)
         except Exception as e:
-            _log.warning("recall failed for query: %s  error=%s", q[:40], e)
-    return "\n\n".join(context_parts)
+            _log.warning("web search failed for query: %s  error=%s", q[:40], e)
+            continue
+        if context_block:
+            context_parts.append(f"\n--- Query: {q} (confidence={confidence}) ---")
+            context_parts.append(context_block)
+        if sources:
+            all_sources.extend(sources)
+    return "\n\n".join(context_parts), all_sources
+
+
+def _recall_accumulated(queries: list, org_id: int, n_per_query: int = 4) -> str:
+    """Pull prior web_search results from RAG across earlier iterations, deduped by URL."""
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for q in queries:
+        try:
+            hits = recall(q, org_id=org_id, collection_name="web_search", n_results=n_per_query)
+        except Exception as e:
+            _log.warning("recall web_search failed for query: %s  error=%s", q[:40], e)
+            continue
+        for h in hits:
+            meta = h.get("metadata") or {}
+            url = meta.get("url") or ""
+            if url in seen:
+                continue
+            seen.add(url)
+            title = meta.get("title") or url or "unknown"
+            text = (h.get("text") or "")[:800]
+            blocks.append(f"[Source: {title} ({url})]\n{text}")
+    return "\n\n".join(blocks)
+
+
+def _build_context(topic: str, fresh_queries: list, prior_queries: list, org_id: int) -> str:
+    fresh_text, _sources = _fetch_fresh_context(topic, fresh_queries, org_id)
+    parts = [f"Research Topic: {topic}\n"]
+    if prior_queries:
+        accumulated = _recall_accumulated(prior_queries, org_id)
+        if accumulated:
+            parts.append("=== ACCUMULATED PRIOR FINDINGS ===")
+            parts.append(accumulated)
+    if fresh_text:
+        parts.append("=== NEW FINDINGS (this iteration) ===" if prior_queries else "=== FINDINGS ===")
+        parts.append(fresh_text)
+    return "\n\n".join(parts)
 
 
 def _synthesize(topic: str, context: str, schema: dict, iteration: int) -> dict:
@@ -55,10 +115,10 @@ INSTRUCTIONS:
 
 
 def run_research_agent(plan_id: int) -> dict:
-    if not is_feature_enabled("research_agent"):
+    if not get_feature("research", "agent_enabled", True):
         return {"status": "disabled", "error": "research_agent feature disabled"}
 
-    max_iterations = is_feature_enabled("research_max_iterations") or DEFAULT_MAX_ITERATIONS
+    max_iterations = get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
     confidence_threshold = get_confidence_threshold()
 
     client = NocodbClient()
@@ -76,7 +136,26 @@ def run_research_agent(plan_id: int) -> dict:
 
     client._patch("research_plans", plan_id, {"status": "synthesizing"})
 
-    context = _get_retrieval_context(topic, queries, org_id)
+    if iterations == 0:
+        fresh_queries = queries
+        prior_queries: list = []
+    else:
+        fresh_queries = []
+        prev_report_raw = plan.get("gap_report") or ""
+        if prev_report_raw:
+            try:
+                prev_report = json.loads(prev_report_raw)
+                fresh_queries = prev_report.get("new_search_requirements", []) or []
+            except (json.JSONDecodeError, TypeError):
+                _log.warning("gap_report parse failed  plan_id=%d, searching all queries", plan_id)
+        if not fresh_queries:
+            fresh_queries = queries
+            prior_queries = []
+        else:
+            fresh_set = set(fresh_queries)
+            prior_queries = [q for q in queries if q not in fresh_set]
+
+    context = _build_context(topic, fresh_queries, prior_queries, org_id)
 
     synthesis = _synthesize(topic, context, schema, iterations)
 
@@ -94,7 +173,7 @@ def run_research_agent(plan_id: int) -> dict:
     new_queries_list = queries + new_queries
     updated_queries = json.dumps(new_queries_list)
 
-    if ready or confidence >= confidence_threshold or iterations >= max_iterations:
+    if ready or confidence >= confidence_threshold or iterations + 1 >= max_iterations:
         paper_content = synthesis.get("content", "")
         client._patch("research_plans", plan_id, {
             "status": "completed",
@@ -135,6 +214,20 @@ def run_research_agent(plan_id: int) -> dict:
             "iterations": iterations + 1,
             "queries": updated_queries
         })
+
+        from workers.tool_queue import get_tool_queue
+        tq = get_tool_queue()
+        if tq:
+            job_id = tq.submit(
+                "research_agent",
+                {"plan_id": plan_id},
+                source="research_agent_iteration",
+                priority=3,
+            )
+            _log.info("Re-queued research agent job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
+        else:
+            _log.warning("Tool queue not available, next iteration will not run for plan_id %d", plan_id)
+
         return {"status": "needs_more_research", "confidence": confidence, "new_queries": new_queries, "plan_id": plan_id}
     else:
         client._patch("research_plans", plan_id, {
