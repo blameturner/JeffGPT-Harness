@@ -17,7 +17,10 @@
     "tools_framework": true,
     "search_extraction": true,
     "intent_classifier": true,
-    "scraper": true,
+    "scraper": {
+      "enabled": true,
+      "batch_size": 10
+    },
     "research": {
       "planner_enabled": true,
       "agent_enabled": true,

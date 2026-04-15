@@ -357,10 +357,15 @@ def discover(
         )
         return local_added, local_filtered, 0, 0, is_seed, link_count
 
+    attempts_multiplier = _cfg("max_attempts_multiplier", 5)
+    max_attempts = max(max_pages * attempts_multiplier, max_pages + 20)
+
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         in_flight: set = set()
-        while (frontier or in_flight) and processed < max_pages:
-            while frontier and len(in_flight) < concurrency and processed + len(in_flight) < max_pages:
+        while (frontier or in_flight) and added < max_pages and processed < max_attempts:
+            while (frontier and len(in_flight) < concurrency
+                   and added + len(in_flight) < max_pages
+                   and processed + len(in_flight) < max_attempts):
                 url, depth, source = frontier.popleft()
                 with visited_lock:
                     if url in visited:
@@ -387,18 +392,26 @@ def discover(
                     errors += 1
                     _log.debug("worker error: %s", e)
 
+    if added < max_pages and processed >= max_attempts:
+        _log.warning(
+            "pathfinder hit attempts ceiling  added=%d/%d processed=%d scrape_failed=%d",
+            added, max_pages, processed, scrape_failed,
+        )
+
     if not seed_ok:
         _log.warning("pathfinder SEED SCRAPE FAILED  seed=%s — no links discovered from seed", seed[:120])
     elif seed_link_count == 0:
         _log.warning("pathfinder seed scraped but ZERO links extracted  seed=%s", seed[:120])
 
     _log.info(
-        "pathfinder done  seed=%s  processed=%d  added=%d  filtered=%d  scrape_failed=%d  robots_blocked=%d  errors=%d  seed_ok=%s  seed_links=%d",
-        seed[:80], processed, added, skipped_filter, scrape_failed, skipped_robots, errors, seed_ok, seed_link_count,
+        "pathfinder done  seed=%s  added=%d/%d  attempts=%d  filtered=%d  scrape_failed=%d  robots_blocked=%d  errors=%d  seed_ok=%s  seed_links=%d",
+        seed[:80], added, max_pages, processed, skipped_filter, scrape_failed, skipped_robots, errors, seed_ok, seed_link_count,
     )
     return {
-        "processed": processed,
         "added": added,
+        "target": max_pages,
+        "attempts": processed,
+        "processed": processed,  # backwards compat
         "skipped_filter": skipped_filter,
         "skipped_robots": skipped_robots,
         "scrape_failed": scrape_failed,
