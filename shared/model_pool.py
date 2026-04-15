@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 from contextlib import contextmanager
@@ -25,8 +26,69 @@ _SAFE_ROLES: tuple[str, ...] = tuple(sorted(set(_FAST_POOL + _TOOL_POOL)))
 _role_semaphores: dict[str, threading.Semaphore] = {}
 _role_sem_lock = threading.Lock()
 
-# background tasks watch this and back off when user requests are waiting
+# Thread/task-local flag: when True, every model_call/acquire_role/acquire_model
+# invoked on this logical path is treated as priority=True even if the caller
+# didn't pass priority explicitly. Set by chat/code request handlers at entry
+# via user_priority_scope(); propagates through tool subcalls (search
+# extraction, intent classifier, query generation, summariser, etc.) so
+# chat's side-calls don't accidentally queue behind background enrichment.
+_user_priority_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_user_priority_ctx", default=False
+)
+
+
+@contextmanager
+def user_priority_scope() -> Iterator[None]:
+    """Mark the current call stack as user-initiated. All nested model_call
+    activity treats priority as True automatically. Safe to nest (restores
+    prior value on exit)."""
+    token = _user_priority_ctx.set(True)
+    try:
+        yield
+    finally:
+        _user_priority_ctx.reset(token)
+
+
+def user_priority_active() -> bool:
+    """True when the current call stack is inside a user_priority_scope."""
+    return _user_priority_ctx.get()
+
+
+# Signal that a priority=True (user-facing) caller is currently blocked waiting
+# for a model slot. Background (priority=False) acquirers check this event
+# BEFORE calling sem.acquire() and yield until it clears — otherwise a
+# background summariser/classifier/etc. call arriving a millisecond earlier
+# could take the last slot and leave the user's chat waiting behind it
+# (threading.Semaphore offers no priority-aware acquire).
 _user_requests_waiting = threading.Event()
+
+# Max seconds a background caller will yield to a pending user request before
+# giving up and taking the slot anyway. Prevents a stuck priority event from
+# starving background work entirely.
+_USER_YIELD_TIMEOUT_S = 120.0
+# Poll interval while yielding — short enough to grab the slot quickly once
+# the user caller finishes, long enough not to busy-spin.
+_USER_YIELD_POLL_S = 0.25
+
+
+def _yield_to_user_if_waiting(label: str) -> None:
+    """Block-wait (up to _USER_YIELD_TIMEOUT_S) while _user_requests_waiting
+    is set. Background model-acquirers call this before touching the semaphore
+    so user-facing callers consistently win the race for the next free slot.
+    Priority=True callers MUST NOT call this — they're the ones being yielded
+    to."""
+    if not _user_requests_waiting.is_set():
+        return
+    waited = 0.0
+    while _user_requests_waiting.is_set() and waited < _USER_YIELD_TIMEOUT_S:
+        # wait returns True on set, False on timeout. We clear-wait by polling
+        # since Event doesn't give us a "wait until cleared" primitive.
+        _user_requests_waiting.wait(timeout=_USER_YIELD_POLL_S)
+        if not _user_requests_waiting.is_set():
+            break
+        waited += _USER_YIELD_POLL_S
+    if waited > 0:
+        _log.info("background acquirer (%s) yielded %.1fs to user request", label, waited)
 
 
 def _sem_for(role: str) -> threading.Semaphore:
@@ -57,8 +119,14 @@ def _present_candidates(pool: tuple[str, ...]) -> list[tuple[str, dict, threadin
 @contextmanager
 def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str | None, str | None]]:
     # caller MUST post to yielded url — resolver may pick a different role than a separate URL lookup
+    # Auto-promote to priority when the call stack is inside user_priority_scope().
+    if not priority and user_priority_active():
+        priority = True
     if priority:
         _user_requests_waiting.set()
+    else:
+        # Background callers yield to any pending user-priority acquirer.
+        _yield_to_user_if_waiting(f"pool={pool_name}")
 
     pool = _POOLS.get(pool_name, ())
     if not pool:
@@ -164,8 +232,16 @@ def acquire_role(role: str, priority: bool = False) -> Iterator[tuple[str | None
         yield None, None
         return
 
+    # Auto-promote to priority when the call stack is inside user_priority_scope().
+    if not priority and user_priority_active():
+        priority = True
+
     if priority:
         _user_requests_waiting.set()
+    else:
+        # Background callers yield to any pending user-priority acquirer so we
+        # don't grab the last slot a millisecond before chat/code tries to.
+        _yield_to_user_if_waiting(f"role={role}")
 
     sem = _sem_for(role)
     if not sem.acquire(blocking=False):

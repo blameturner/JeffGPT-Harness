@@ -186,6 +186,11 @@ class CodeAgent(BaseAgent):
         def emit(event: dict):
             STORE.append(job, event)
 
+        # Mark user-priority so nested model_calls auto-promote and background
+        # tool_queue workers yield. See workers/chat/agent.py for context.
+        from shared.model_pool import _user_priority_ctx
+        _user_priority_ctx.set(True)
+
         # signal active session so queue workers back off
         from workers.tool_queue import touch_chat_activity
         touch_chat_activity()

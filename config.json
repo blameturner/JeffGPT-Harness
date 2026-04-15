@@ -24,6 +24,7 @@
       "classifier_model": "scrape_classifier",
       "dispatch_interval_minutes": 10,
       "max_jobs_per_dispatch": 25,
+      "min_run_interval_seconds": 120,
       "rag_collection": "discovery",
       "summary_collection": "discovery_summaries",
       "models": {
@@ -62,17 +63,22 @@
       "batch_size": 5,
       "max_links_per_seed": 100,
       "stale_after_minutes": 60,
-      "fallback_to_scrape_targets": true
+      "fallback_to_scrape_targets": true,
+      "min_run_interval_seconds": 120
+    },
+    "scraper_runtime": {
+      "_comment": "scraper feature config lives in features.scraper — this key is unused; the scraper handler reads scraper.min_run_interval_seconds",
+      "min_run_interval_seconds": 120
     },
     "tool_queue": {
       "priority_backoff_seconds": {
-        "1": 30,
-        "2": 60,
-        "3": 60,
-        "4": 120,
-        "5": 300
+        "1": 600,
+        "2": 600,
+        "3": 600,
+        "4": 600,
+        "5": 600
       },
-      "default_backoff_seconds": 300
+      "default_backoff_seconds": 600
     }
   }
 }

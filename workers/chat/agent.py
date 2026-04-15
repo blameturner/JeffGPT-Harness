@@ -43,6 +43,15 @@ class ChatAgent(BaseAgent):
         response_style: str | None = None,
     ) -> None:
         from shared.jobs import STORE
+        from shared.model_pool import _user_priority_ctx
+
+        # Mark this call stack as user-initiated so every nested model_call —
+        # tool_planner, intent_classifier, search extraction, queries, quality,
+        # chat synthesis — auto-promotes to priority=True. Background
+        # tool_queue handlers (summariser, classifier, pathfinder, etc.) check
+        # this signal via _user_requests_waiting and yield before taking a
+        # model slot, so chat/code never sit behind background work.
+        _user_priority_ctx.set(True)
 
         if temperature is None:
             temperature = chat_temperature(response_style)
