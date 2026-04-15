@@ -198,8 +198,11 @@ def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
 
 @router.get("/research-plans/list")
 def research_plans_list(org_id: int, status: str | None = None, limit: int = 50):
+    # No `fields=` on research_plans — NocoDB v1 returns 404 for the whole request if
+    # any listed column doesn't exist, and the schema's been in flux. research_plans
+    # has no m2m links so returning all columns has no perf cost.
     client = NocodbClient()
-    params: dict = {"limit": limit, "fields": _RESEARCH_PLAN_LIST_FIELDS}
+    params: dict = {"limit": limit}
     if status:
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
@@ -216,7 +219,6 @@ def research_plan_get(plan_id: int):
     data = client._get("research_plans", params={
         "where": f"(Id,eq,{plan_id})",
         "limit": 1,
-        "fields": _RESEARCH_PLAN_LIST_FIELDS,
     })
     rows = data.get("list", [])
     if not rows:
