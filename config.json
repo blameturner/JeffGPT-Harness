@@ -55,7 +55,20 @@
       "concurrency": 8,
       "per_host_delay_s": 0.5,
       "robots_cache_ttl_s": 3600,
-      "sitemap_limit": 500
+      "sitemap_limit": 500,
+      "recrawl_interval_minutes": 5,
+      "stale_after_minutes": 60,
+      "fallback_to_scrape_targets": true
+    },
+    "tool_queue": {
+      "priority_backoff_seconds": {
+        "1": 30,
+        "2": 60,
+        "3": 60,
+        "4": 120,
+        "5": 120
+      },
+      "default_backoff_seconds": 300
     }
   }
 }

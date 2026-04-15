@@ -192,9 +192,9 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
 
     needed = get_feature("planned_search", "successful_scrapes_needed", 10)
 
-    from tools.scraper.search import SearchScraper
+    from tools.scraper.pathfinder import PathfinderScraper
 
-    scraper = SearchScraper()
+    scraper = PathfinderScraper()
     scraped_results: list[dict] = []
 
     def _scrape(url: str) -> dict:

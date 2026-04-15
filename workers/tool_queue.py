@@ -16,10 +16,11 @@ _log = logging.getLogger("tool_queue")
 
 NOCODB_TABLE = "tool_jobs"
 
-# priority tiers gate jobs by seconds-since-last-chat-activity;
-# p1/p2=user-facing (short backoff), p3=normal, p4+=true background (long backoff)
-_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 120, 3: 120}
-_DEFAULT_BACKOFF = 600.0  # priority 4-5
+# priority tiers gate jobs by seconds-since-last-chat-activity.
+# Defaults below are used only if `features.tool_queue` isn't in config.json;
+# the config-driven overrides are the source of truth at runtime.
+_DEFAULT_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 60, 3: 60, 4: 120, 5: 120}
+_DEFAULT_BACKOFF = 300.0
 
 _last_chat_activity: float = 0.0
 _activity_lock = threading.Lock()
@@ -39,7 +40,24 @@ def seconds_since_chat() -> float:
 
 
 def _backoff_for_priority(priority: int) -> float:
-    return _PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
+    # Read config each time so edits to config.json take effect without restart-of-workers
+    try:
+        from infra.config import get_feature
+        per_pri = get_feature("tool_queue", "priority_backoff_seconds", None)
+        if isinstance(per_pri, dict):
+            val = per_pri.get(str(priority), per_pri.get(priority))
+            if val is not None:
+                return float(val)
+        default = get_feature("tool_queue", "default_backoff_seconds", None)
+        if default is not None:
+            return float(default)
+    except Exception:
+        pass
+    return _DEFAULT_PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
+
+
+# legacy aliases used elsewhere in this module (kept for compatibility)
+_PRIORITY_BACKOFF = _DEFAULT_PRIORITY_BACKOFF
 
 
 @dataclass
@@ -271,12 +289,16 @@ class ToolJobQueue:
         idle = seconds_since_chat()
         if idle == float("inf"):
             idle = -1  # no chat activity yet
+
+        p1 = _backoff_for_priority(1)
+        p2 = _backoff_for_priority(2)
+        background = _backoff_for_priority(5)
         backoff_state = "active"
-        if idle < 0 or idle >= _DEFAULT_BACKOFF:
+        if idle < 0 or idle >= background:
             backoff_state = "clear"
-        elif idle >= _PRIORITY_BACKOFF.get(2, 300):
+        elif idle >= p2:
             backoff_state = "priority_1_2_only"
-        elif idle >= _PRIORITY_BACKOFF.get(1, 120):
+        elif idle >= p1:
             backoff_state = "priority_1_only"
 
         return {
@@ -286,9 +308,9 @@ class ToolJobQueue:
                 "state": backoff_state,
                 "idle_seconds": round(idle, 0),
                 "thresholds": {
-                    "priority_1": _PRIORITY_BACKOFF.get(1, 120),
-                    "priority_2": _PRIORITY_BACKOFF.get(2, 300),
-                    "background": _DEFAULT_BACKOFF,
+                    "priority_1": p1,
+                    "priority_2": p2,
+                    "background": background,
                 },
             },
         }

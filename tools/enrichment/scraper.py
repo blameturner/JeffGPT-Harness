@@ -18,8 +18,13 @@ BACKOFF_BASE_HOURS = 1
 BACKOFF_MAX_HOURS = 168  # 7 days
 
 
+_NOCODB_DT_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # NocoDB v1 DateTime columns reject microseconds + tz suffix (isoformat()); stick to
+    # ISO-short so PATCHes succeed and last_scraped_at/next_crawl_at actually persist.
+    return datetime.now(timezone.utc).strftime(_NOCODB_DT_FORMAT)
 
 
 def _next_crawl_at(frequency_hours: int, failures: int) -> str:
@@ -30,7 +35,7 @@ def _next_crawl_at(frequency_hours: int, failures: int) -> str:
         # exponential backoff: 1h, 2h, 4h, 8h ... capped
         backoff = min(BACKOFF_BASE_HOURS * (2 ** (failures - 1)), BACKOFF_MAX_HOURS)
         delta = timedelta(hours=max(base, backoff))
-    return (datetime.now(timezone.utc) + delta).isoformat()
+    return (datetime.now(timezone.utc) + delta).strftime(_NOCODB_DT_FORMAT)
 
 
 def _content_hash(text: str) -> str:

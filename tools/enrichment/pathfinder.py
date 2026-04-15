@@ -309,6 +309,7 @@ def discover(
     max_pages: int | None = None,
     same_host_only: bool = True,
     concurrency: int | None = None,
+    register_as_root: bool = True,
 ) -> dict:
     if not _cfg("enabled", True):
         return {"processed": 0, "added": 0, "error": "pathfinder_disabled"}
@@ -331,8 +332,10 @@ def discover(
     client = NocodbClient()
     ua = "Mozilla/5.0 (compatible; JeffGPT-Pathfinder/1.0)"
 
-    # ensure the seed exists as a discovery row (root) so future re-crawls have an anchor
-    discovery_root_id = upsert_discovery_root(client, seed, org_id)
+    # ensure the seed exists as a discovery row (root) so future re-crawls have an anchor.
+    # Skip when the caller is crawling a scrape_target URL as a fallback seed — those
+    # shouldn't be promoted to discovery roots.
+    discovery_root_id = upsert_discovery_root(client, seed, org_id) if register_as_root else None
 
     # `enqueued` tracks every URL that's ever been put in the frontier (so we don't
     # enqueue duplicates). The outer submit loop trusts that everything in the
@@ -508,7 +511,8 @@ def discover(
         try:
             client._patch("discovery", discovery_root_id, {
                 "status": "scraped" if seed_ok else "failed",
-                "processed_at": datetime.now(timezone.utc).isoformat(),
+                # NocoDB v1 DateTime columns reject isoformat()'s microseconds+tz suffix
+                "processed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
                 "error_message": "" if seed_ok else "seed scrape failed",
             })
         except Exception:
@@ -536,8 +540,18 @@ def discover(
 
 
 def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
-    """Pick the discovery root that hasn't been crawled in the longest time (or ever)."""
-    # never crawled first
+    """Pick the next discovery root ONLY IF it's stale (never crawled, or processed_at
+    older than the `pathfinder.stale_after_minutes` threshold). Returns None when every
+    discovery root has been crawled within the fresh window — the caller should then
+    fall back to `_pick_next_scrape_target_seed` so pathfinder stops looping the same
+    roots over and over."""
+    from datetime import datetime, timedelta, timezone
+
+    stale_minutes = int(_cfg("stale_after_minutes", 60))
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(minutes=max(stale_minutes, 1))
+
+    # never-crawled first
     try:
         never = client._get("discovery", params={
             "where": "(depth,eq,0)~and(processed_at,is,null)",
@@ -548,15 +562,50 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
             return never[0]
     except Exception:
         pass
-    # then oldest-processed
+
+    # oldest processed_at — but only if it crosses the stale threshold
     try:
         oldest = client._get("discovery", params={
             "where": "(depth,eq,0)",
             "limit": 1,
             "sort": "processed_at",
         }).get("list", [])
-        return oldest[0] if oldest else None
+        if not oldest:
+            return None
+        row = oldest[0]
+        pa_str = row.get("processed_at") or row.get("updated_at")
+        if not pa_str:
+            return row  # no processed_at set — treat as stale
+        try:
+            pa = datetime.fromisoformat(str(pa_str).replace("Z", "+00:00"))
+            if pa.tzinfo is None:
+                pa = pa.replace(tzinfo=timezone.utc)
+        except Exception:
+            return row  # unparseable — treat as stale
+        if pa <= threshold:
+            return row
+        return None  # freshest root was crawled within the window; defer to fallback
     except Exception:
+        return None
+
+
+def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
+    """Fallback picker: grab a shallow scrape_target (depth <=1) to crawl as a new seed.
+    Used when every discovery root is fresh — lets pathfinder explore deeper into
+    previously-discovered URLs instead of re-running the same roots on a loop."""
+    if not _cfg("fallback_to_scrape_targets", True):
+        return None
+    try:
+        # NocoDB accepts `lte` on integer columns; sort by last_scraped_at so stale
+        # or never-scraped targets come first.
+        rows = client._get("scrape_targets", params={
+            "where": "(active,eq,1)~and(depth,lte,1)",
+            "limit": 1,
+            "sort": "last_scraped_at,CreatedAt",
+        }).get("list", [])
+        return rows[0] if rows else None
+    except Exception:
+        _log.debug("pathfinder fallback scrape_targets query failed", exc_info=True)
         return None
 
 
@@ -571,9 +620,8 @@ def _chain_next_pathfinder_job(reason: str = "chain") -> None:
 
 
 def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
-    """Tool-queue handler: pick (or use given) discovery root, run discover() to find new links,
-    then re-queue another pathfinder_crawl so the worker keeps walking through the discovery list.
-    UI-triggered crawls submit with {discovery_id} or just rely on the rolling chain."""
+    """Tool-queue handler: pick the next seed (stale discovery root → oldest
+    shallow scrape_target fallback), run discover(), then re-queue itself."""
     if isinstance(payload, int):
         discovery_id: int | None = payload
     elif isinstance(payload, dict):
@@ -582,16 +630,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
         discovery_id = None
 
     client = NocodbClient()
+    seed_source = "discovery"
+    scrape_target_id: int | None = None
 
-    if not discovery_id:
-        row = _pick_next_discovery_root(client)
-        if not row:
-            _log.debug("pathfinder: no discovery roots, idling")
-            return {"status": "idle"}
-        discovery_id = int(row.get("Id") or 0)
-        seed_url = row.get("url") or ""
-        org_id = int(row.get("org_id") or 0)
-    else:
+    if discovery_id:
         try:
             rows = client._get("discovery", params={
                 "where": f"(Id,eq,{discovery_id})",
@@ -607,20 +649,56 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
         row = rows[0]
         seed_url = row.get("url") or ""
         org_id = int(row.get("org_id") or 0)
+    else:
+        row = _pick_next_discovery_root(client)
+        if row:
+            discovery_id = int(row.get("Id") or 0) or None
+            seed_url = row.get("url") or ""
+            org_id = int(row.get("org_id") or 0)
+        else:
+            # No stale discovery root — fall back to scrape_targets so pathfinder
+            # explores deeper instead of looping the same set of roots.
+            fallback = _pick_next_scrape_target_seed(client)
+            if not fallback:
+                _log.info("pathfinder: no stale discovery roots and no scrape_targets fallback — idle")
+                return {"status": "idle"}
+            seed_source = "scrape_target"
+            scrape_target_id = int(fallback.get("Id") or 0) or None
+            seed_url = fallback.get("url") or ""
+            org_id = int(fallback.get("org_id") or 0)
+            _log.info("pathfinder falling back to scrape_target  id=%s url=%s",
+                      scrape_target_id, seed_url[:100])
 
     if not seed_url:
         _chain_next_pathfinder_job("after_bad_url")
-        return {"status": "error", "reason": "no_url", "discovery_id": discovery_id}
+        return {"status": "error", "reason": "no_url", "seed_source": seed_source}
 
     try:
-        result = discover(seed_url, org_id)
+        # When seeding from a scrape_target, don't promote it to a discovery root.
+        result = discover(seed_url, org_id, register_as_root=(seed_source == "discovery"))
     except Exception as e:
-        _log.warning("pathfinder_crawl_job discover failed  id=%s url=%s error=%s",
-                     discovery_id, seed_url[:80], e, exc_info=True)
+        _log.warning("pathfinder_crawl_job discover failed  source=%s url=%s error=%s",
+                     seed_source, seed_url[:80], e, exc_info=True)
         result = {"status": "error", "reason": str(e)[:200]}
 
+    # Keep the fallback scrape_target's last_scraped_at fresh so the picker rotates through rows.
+    if seed_source == "scrape_target" and scrape_target_id:
+        try:
+            from datetime import datetime, timezone
+            client._patch("scrape_targets", scrape_target_id, {
+                "last_scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        except Exception:
+            _log.debug("pathfinder fallback last_scraped_at patch failed", exc_info=True)
+
     _chain_next_pathfinder_job("after_run")
-    return {"status": "ok", "discovery_id": discovery_id, **result}
+    return {
+        "status": "ok",
+        "seed_source": seed_source,
+        "discovery_id": discovery_id,
+        "scrape_target_id": scrape_target_id,
+        **result,
+    }
 
 
 def _wait_any(futures: set) -> tuple[list, set]:

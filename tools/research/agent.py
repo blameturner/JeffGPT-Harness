@@ -182,7 +182,8 @@ def run_research_agent(plan_id: int) -> dict:
             "gap_report": gap_report,
             "confidence_score": confidence,
             "iterations": iterations + 1,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
+            # NocoDB v1 DateTime columns reject isoformat()'s microseconds+tz suffix
+            "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         })
 
         if paper_content:
