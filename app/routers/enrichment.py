@@ -185,8 +185,9 @@ _SCRAPE_TARGET_LIST_FIELDS = (
 
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
+    # No `fields=` — see research-plans/list for rationale.
     client = NocodbClient()
-    params: dict = {"limit": limit, "fields": _DISCOVERY_LIST_FIELDS}
+    params: dict = {"limit": limit}
     if status:
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
@@ -228,6 +229,10 @@ def research_plan_get(plan_id: int):
 
 @router.get("/scrape-targets/list")
 def scrape_targets_list(org_id: int, status: str | None = None, active_only: bool = True, limit: int = 100):
+    # No `fields=` — NocoDB v1 returns 404 for the whole request if any listed
+    # column doesn't match the live schema, and the schema's been evolving
+    # (relevance_score/relevance_label just added). The m2m link to knowledge_sources
+    # was dropped, so there's no perf reason to restrict columns anyway.
     client = NocodbClient()
     parts = [f"(org_id,eq,{org_id})"]
     if active_only:
@@ -238,7 +243,6 @@ def scrape_targets_list(org_id: int, status: str | None = None, active_only: boo
         "where": "~and".join(parts),
         "limit": limit,
         "sort": "-CreatedAt",
-        "fields": _SCRAPE_TARGET_LIST_FIELDS,
     }
     data = client._get("scrape_targets", params=params)
     return {"status": "ok", "rows": data.get("list", [])}
