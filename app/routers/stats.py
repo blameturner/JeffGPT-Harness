@@ -28,9 +28,9 @@ def stats_usage(org_id: int, period: str = "30d"):
     period_start = start.strftime("%Y-%m-%d")
     period_end = now.strftime("%Y-%m-%d")
 
-    # nocodb v1 needs ISO-8601 with T separator and no microseconds/tz suffix; a space here gets
-    # url-encoded to + which the where parser rejects with 422.
-    start_nocodb = start.strftime("%Y-%m-%dT%H:%M:%S")
+    # nocodb v1's where parser rejects datetime values with T or url-encoded space; date-only
+    # YYYY-MM-DD is the only universally-accepted form for gte against CreatedAt.
+    start_nocodb = start.strftime("%Y-%m-%d")
 
     try:
         msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start_nocodb})"

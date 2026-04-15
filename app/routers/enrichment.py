@@ -157,6 +157,6 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
         params["where"] = f"(org_id,eq,{org_id})"
-    
+
     data = client._get("research_plans", params=params)
     return {"status": "ok", "rows": data.get("list", [])}
