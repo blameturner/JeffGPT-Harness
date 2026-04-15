@@ -71,15 +71,13 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
     always populated, so it's the reliable ordering."""
     rows: list[dict] = []
     try:
+        # No `fields=` — NocoDB v1 404s the whole request if any listed column
+        # is missing from the live schema, and this query must not fail or the
+        # scraper never picks anything up.
         rows = client._get("scrape_targets", params={
             "where": "(active,eq,1)",
             "limit": 1000,
             "sort": "CreatedAt",
-            "fields": (
-                "Id,org_id,url,depth,frequency_hours,consecutive_failures,"
-                "consecutive_unchanged,content_hash,chunk_count,last_scraped_at,"
-                "next_crawl_at,status,active"
-            ),
         }).get("list", [])
     except Exception:
         _log.warning("fetch_due_targets query failed", exc_info=True)
