@@ -114,7 +114,7 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
             "queries": "[]",
             "schema": "{}",
             "iterations": 0,
-            "status": "planning",
+            "status": "pending",
         })
         plan_id = row.get("Id")
     except Exception as e:
@@ -210,7 +210,7 @@ def get_next_plan() -> dict | None:
         return None
 
 
-def complete_plan(plan_id: int, status: str = "complete") -> None:
+def complete_plan(plan_id: int, status: str = "completed") -> None:
     from infra.nocodb_client import NocodbClient
 
     client = NocodbClient()

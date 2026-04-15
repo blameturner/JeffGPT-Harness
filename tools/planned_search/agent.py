@@ -175,7 +175,7 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
         return {"status": "error", "message": "No queries to execute"}
 
     try:
-        client._patch("messages", message_id, {"search_status": "running"})
+        client._patch("messages", message_id, {"search_status": "approved"})
     except Exception:
         pass
 
@@ -235,11 +235,6 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
             )
         except Exception:
             _log.warning("planned_search add source failed", exc_info=True)
-
-    try:
-        client._patch("messages", message_id, {"search_status": "synthesizing"})
-    except Exception:
-        pass
 
     user_question = _find_original_question(client, conversation_id, message_id)
     answer_text, answer_tokens = await _synthesize_answer(user_question, scraped_results)
@@ -405,7 +400,7 @@ def reject_searches(message_id: int) -> dict:
     try:
         client._patch("messages", message_id, {
             "pending_approval": 0,
-            "search_status": "rejected",
+            "search_status": "declined",
         })
         return {"status": "ok", "message_id": message_id}
     except Exception:

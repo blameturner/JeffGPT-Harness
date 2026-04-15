@@ -118,9 +118,6 @@ def run_research_agent(plan_id: int) -> dict:
     if not get_feature("research", "agent_enabled", True):
         return {"status": "disabled", "error": "research_agent feature disabled"}
 
-    max_iterations = get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
-    confidence_threshold = get_confidence_threshold()
-
     client = NocodbClient()
     plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
     plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
@@ -133,6 +130,9 @@ def run_research_agent(plan_id: int) -> dict:
     schema = json.loads(plan.get("schema", "{}"))
     iterations = plan.get("iterations", 0)
     org_id = plan.get("org_id", 0)
+
+    max_iterations = plan.get("max_iterations") or get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
+    confidence_threshold = plan.get("confidence_threshold") or get_confidence_threshold()
 
     client._patch("research_plans", plan_id, {"status": "synthesizing"})
 
@@ -174,13 +174,15 @@ def run_research_agent(plan_id: int) -> dict:
     updated_queries = json.dumps(new_queries_list)
 
     if ready or confidence >= confidence_threshold or iterations + 1 >= max_iterations:
+        from datetime import datetime, timezone
         paper_content = synthesis.get("content", "")
         client._patch("research_plans", plan_id, {
             "status": "completed",
             "paper_content": paper_content,
             "gap_report": gap_report,
             "confidence_score": confidence,
-            "iterations": iterations + 1
+            "iterations": iterations + 1,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         })
 
         if paper_content:
