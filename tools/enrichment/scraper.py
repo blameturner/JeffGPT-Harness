@@ -227,7 +227,7 @@ def _scrape_one_target(target_id: int) -> dict:
                         "scrape_target_id": target_id,
                     },
                     source="scrape_target",
-                    priority=5,
+                    priority=4,
                     org_id=org_id,
                 )
         except Exception:

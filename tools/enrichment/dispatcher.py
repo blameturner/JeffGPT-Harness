@@ -92,7 +92,7 @@ def jumpstart_pathfinder() -> dict:
 
     org_id = _default_org_id(client)
     try:
-        job_id = tq.submit("pathfinder_crawl", {}, source="pathfinder_jumpstart", priority=4, org_id=org_id)
+        job_id = tq.submit("pathfinder_crawl", {}, source="pathfinder_jumpstart", priority=5, org_id=org_id)
     except Exception:
         _log.warning("pathfinder jumpstart submit failed", exc_info=True)
         return {"status": "submit_failed"}

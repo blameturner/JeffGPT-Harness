@@ -514,9 +514,20 @@ class ToolJobQueue:
                     started_ts = datetime.fromisoformat(started).timestamp()
                 except Exception:
                     continue
-                # graph_extract runs LLM inference 7-16min so it needs an extended stale timeout
+                # Jobs with multiple LLM calls + web scraping need longer stale windows
+                # than the 300s default, or they'll be reset mid-flight while the handler
+                # is still working.
                 job_type = row.get("type") or ""
-                _STALE_MULTIPLIERS = {"graph_extract": 4}
+                _STALE_MULTIPLIERS = {
+                    "graph_extract": 4,          # 20m — LLM inference 7-16min
+                    "research_planner": 4,       # 20m — plan generation LLM
+                    "research_agent": 8,         # 40m — N web_search calls + synth LLM + critic LLM per iteration
+                    "planned_search_execute": 8, # 40m — up to 10 scrapes + synthesis LLM
+                    "pathfinder_crawl": 3,       # 15m — one scrape + link writes, but Playwright can stall
+                    "scrape_target": 3,          # 15m — Playwright fallback + embed
+                    "summarise_page": 3,         # 15m — summariser LLM
+                    "classify_relevance": 3,     # 15m — classifier LLM
+                }
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
                     noco_id = row.get("Id")

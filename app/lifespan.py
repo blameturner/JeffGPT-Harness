@@ -26,8 +26,15 @@ async def lifespan(app: FastAPI):
     from tools.enrichment.pathfinder import pathfinder_crawl_job
     from tools.enrichment.classifier import classify_relevance_job
     tool_queue = ToolJobQueue()
-    tool_queue.register("graph_extract", HandlerConfig(
-        handler=_handle_graph_extract, max_workers=1, priority_default=5,
+    # Priority tiers (lower number = picked first, shorter chat-idle needed):
+    #   2 = user-facing planned_search (runs first when user approves queries)
+    #   3 = research planner + agent (user-initiated, LLM-heavy)
+    #   4 = summarisers, classifier, graph_extract (downstream LLM jobs — run before
+    #       pathfinder/scraper so their queues stay shallow)
+    #   5 = pathfinder + scraper (background enrichment — runs only when higher tiers quiet)
+    tool_queue.register("planned_search_execute", HandlerConfig(
+        handler=lambda p: run_planned_search_job(p["message_id"], p["org_id"]),
+        max_workers=1, priority_default=2, source="planned_search",
     ))
     tool_queue.register("research_planner", HandlerConfig(
         handler=lambda p: run_research_planner_job(p["plan_id"]),
@@ -37,27 +44,26 @@ async def lifespan(app: FastAPI):
         handler=lambda p: run_research_agent(p["plan_id"]),
         max_workers=1, priority_default=3, source="research_agent",
     ))
-    tool_queue.register("planned_search_execute", HandlerConfig(
-        handler=lambda p: run_planned_search_job(p["message_id"], p["org_id"]),
-        max_workers=1, priority_default=2, source="planned_search",
+    tool_queue.register("summarise_page", HandlerConfig(
+        handler=summarise_page_job,
+        max_workers=1, priority_default=4, source="summariser",
+    ))
+    tool_queue.register("classify_relevance", HandlerConfig(
+        handler=classify_relevance_job,
+        max_workers=1, priority_default=4, source="classifier",
+    ))
+    tool_queue.register("graph_extract", HandlerConfig(
+        handler=_handle_graph_extract, max_workers=1, priority_default=4,
+    ))
+    tool_queue.register("pathfinder_crawl", HandlerConfig(
+        # accepts payload dict directly; picks next discovery root when payload is empty {}
+        handler=pathfinder_crawl_job,
+        max_workers=1, priority_default=5, source="pathfinder",
     ))
     tool_queue.register("scrape_target", HandlerConfig(
         # accepts payload dict directly; picks next due target when payload is empty {}
         handler=scrape_target_job,
         max_workers=2, priority_default=5, source="scraper",
-    ))
-    tool_queue.register("summarise_page", HandlerConfig(
-        handler=summarise_page_job,
-        max_workers=1, priority_default=5, source="summariser",
-    ))
-    tool_queue.register("pathfinder_crawl", HandlerConfig(
-        # accepts payload dict directly; picks next discovery root when payload is empty {}
-        handler=pathfinder_crawl_job,
-        max_workers=1, priority_default=4, source="pathfinder",
-    ))
-    tool_queue.register("classify_relevance", HandlerConfig(
-        handler=classify_relevance_job,
-        max_workers=1, priority_default=5, source="classifier",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue

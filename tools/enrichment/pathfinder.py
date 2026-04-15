@@ -436,7 +436,7 @@ def discover(
                     }
                     if depth == 0 and discovery_root_id:
                         payload["discovery_id"] = discovery_root_id
-                    tq.submit("summarise_page", payload, source="pathfinder", priority=5)
+                    tq.submit("summarise_page", payload, source="pathfinder", priority=4)
             except Exception:
                 _log.warning("summarise queue failed  url=%s", record_url[:80], exc_info=True)
 
@@ -670,7 +670,7 @@ def _chain_next_pathfinder(org_id: int = 1) -> None:
         tq = get_tool_queue()
         if tq:
             effective_org = org_id if org_id else 1
-            tq.submit("pathfinder_crawl", {}, source="pathfinder_chain", priority=4, org_id=effective_org)
+            tq.submit("pathfinder_crawl", {}, source="pathfinder_chain", priority=5, org_id=effective_org)
     except Exception:
         _log.warning("pathfinder chain submit failed", exc_info=True)
 
@@ -688,7 +688,7 @@ def _queue_classifier(target_id: int | None, url: str, text: str, org_id: int) -
                 "classify_relevance",
                 {"target_id": target_id, "url": url, "text": text[:20000], "org_id": org_id},
                 source="pathfinder",
-                priority=5,
+                priority=4,
                 org_id=org_id,
             )
     except Exception:

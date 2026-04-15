@@ -54,7 +54,7 @@ def pathfinder_discover(req: PathfinderRequest):
         "pathfinder_crawl",
         {"discovery_id": discovery_id},
         source="pathfinder_api",
-        priority=4,
+        priority=5,
         org_id=req.org_id,
     )
     return {"status": "queued", "discovery_id": discovery_id, "job_id": job_id}

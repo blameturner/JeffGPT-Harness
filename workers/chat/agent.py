@@ -525,7 +525,7 @@ class ChatAgent(BaseAgent):
                             },
                             source="chat",
                             org_id=self.org_id,
-                            priority=5,
+                            priority=4,
                         )
                         _log.info("chat conv=%s  [3/4] graph extraction queued  job=%s", conversation_id, job_id)
                 except Exception:
