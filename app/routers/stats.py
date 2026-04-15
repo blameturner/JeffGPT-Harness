@@ -28,20 +28,45 @@ def stats_usage(org_id: int, period: str = "30d"):
     period_start = start.strftime("%Y-%m-%d")
     period_end = now.strftime("%Y-%m-%d")
 
-    # nocodb v1's where parser rejects datetime values with T or url-encoded space; date-only
-    # YYYY-MM-DD is the only universally-accepted form for gte against CreatedAt.
-    start_nocodb = start.strftime("%Y-%m-%d")
+    def _parse_dt(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            ts = value / 1000.0 if value > 1e12 else float(value)
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            except Exception:
+                return None
+        s = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
+    def _within_period(row):
+        dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
+        if dt is None:
+            return True  # keep when timestamp is missing or unparseable
+        return dt >= start
+
+    # nocodb's where parser rejects gte filters on the CreatedAt system column in this version,
+    # so fetch by org_id and filter by date in Python on the way out.
     try:
-        msg_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start_nocodb})"
-        messages = db._get("messages", params={"where": msg_where, "limit": 5000}).get("list", [])
+        rows = db._get("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000}).get("list", [])
+        messages = [r for r in rows if _within_period(r)]
     except Exception:
         _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
         messages = []
 
     try:
-        run_where = f"(org_id,eq,{org_id})~and(CreatedAt,gte,{start_nocodb})"
-        runs = db._get("agent_runs", params={"where": run_where, "limit": 5000}).get("list", [])
+        rows = db._get("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000}).get("list", [])
+        runs = [r for r in rows if _within_period(r)]
     except Exception:
         _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
         runs = []
