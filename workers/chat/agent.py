@@ -135,7 +135,14 @@ class ChatAgent(BaseAgent):
             hints = gate_check(user_message, conversation_context=last_assistant)
             if not web_search_enabled or not self.search_enabled:
                 hints.discard("web_search")
-            _log.info("chat conv=%s  gate: hints=%s", conversation_id, sorted(hints) or "none")
+            # explicit UI signal: search_mode in {"planned", "deep", "deep_search", "planned_search"}
+            # forces the planned_search route regardless of message content.
+            search_mode = (getattr(self, "_search_mode", "normal") or "normal").lower()
+            _PLANNED_MODES = {"planned", "deep", "deep_search", "planned_search"}
+            if search_mode in _PLANNED_MODES and is_feature_enabled("planned_search"):
+                hints.add("planned_search")
+                hints.discard("web_search")
+            _log.info("chat conv=%s  gate: hints=%s mode=%s", conversation_id, sorted(hints) or "none", search_mode)
 
             if hints:
                 tool_labels = {
@@ -152,10 +159,63 @@ class ChatAgent(BaseAgent):
                     "tools": sorted(hints),
                 })
 
+                # planned_search is mutex with web_search — when hinted, dispatch it directly and skip
+                # the LLM planner, which otherwise tends to keep picking web_search.
+                if "planned_search" in hints:
+                    _log.info("chat conv=%s  planned_search fast-path", conversation_id)
+                    plan = ToolPlan(
+                        actions=[ToolAction(
+                            tool=ToolName.PLANNED_SEARCH,
+                            params={
+                                "question": user_message,
+                                "_org_id": self.org_id,
+                                "_conversation_id": conversation_id,
+                                "_collection": collection_name,
+                            },
+                            reason="planned search (proposes queries for approval)",
+                        )],
+                        summary=instant_summary,
+                    )
+                    ps_ok = False
+                    try:
+                        tool_context = asyncio.run(execute_plan(plan, emit))
+                        ps_ok = any(r.tool.value == "planned_search" and r.ok for r in tool_context.results)
+                        _log.info("chat conv=%s  planned_search dispatched  ok=%s elapsed=%.2fs",
+                                  conversation_id, ps_ok, time.perf_counter() - _t_tools)
+                    except Exception:
+                        _log.error("chat conv=%s  planned_search failed", conversation_id, exc_info=True)
+                        tool_context = ToolContext()
+
+                    if ps_ok:
+                        # short-circuit the chat: the proposal message is already saved
+                        # with pending_approval=1; the UI polls /planned_search/{id}
+                        # and the user approves/rejects to continue.
+                        emit({
+                            "type": "planned_search_pending",
+                            "conversation_id": conversation_id,
+                            "summary": "Proposed search queries — awaiting your approval.",
+                        })
+                        emit({
+                            "type": "done",
+                            "conversation_id": conversation_id,
+                            "awaiting": "planned_search_approval",
+                            "model": "planned_search",
+                            "tokens_input": 0,
+                            "tokens_output": 0,
+                            "duration_seconds": 0.0,
+                            "rag_enabled": False,
+                            "context_chars": 0,
+                        })
+                        cancel_rag(rag_future, rag_executor)
+                        return
+                    # if planned_search failed to produce queries, fall through to the
+                    # normal LLM planner so the user still gets a response
+                    hints = set()
+
                 # tools dispatchable without the planner (no model-generated params needed)
                 _DIRECT_TOOLS = {"web_search", "rag_lookup"}
 
-                if hints <= _DIRECT_TOOLS and hints:
+                if hints and hints <= _DIRECT_TOOLS:
                     _log.info("chat conv=%s  search fast-path  tools=%s", conversation_id, sorted(hints))
                     actions: list[ToolAction] = []
 
@@ -210,7 +270,7 @@ class ChatAgent(BaseAgent):
                         except Exception:
                             _log.error("chat conv=%s  search failed", conversation_id, exc_info=True)
                             tool_context = ToolContext()
-                else:
+                elif hints:
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:

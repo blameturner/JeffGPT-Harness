@@ -35,16 +35,43 @@ class ResearchAgentRequest(BaseModel):
 
 @router.post("/pathfinder/discover")
 def pathfinder_discover(req: PathfinderRequest):
-    from tools.enrichment.pathfinder import discover
+    """UI submits a seed URL: upsert as a discovery root and queue a pathfinder_crawl
+    job. The handler chains itself so pathfinder keeps walking through discovery rows."""
+    from tools.enrichment.pathfinder import upsert_discovery_root
 
-    result = discover(
-        req.seed_url,
-        req.org_id,
-        max_depth=req.max_depth,
-        max_pages=req.max_pages,
-        same_host_only=req.same_host_only,
+    client = NocodbClient()
+    discovery_id = upsert_discovery_root(client, req.seed_url, req.org_id)
+    if not discovery_id:
+        return {"status": "failed", "error": "discovery_upsert_failed"}
+
+    tq = get_tool_queue()
+    if not tq:
+        # fallback: run synchronously (degraded)
+        from tools.enrichment.pathfinder import discover
+        return {"status": "ok", **discover(req.seed_url, req.org_id)}
+
+    job_id = tq.submit(
+        "pathfinder_crawl",
+        {"discovery_id": discovery_id},
+        source="pathfinder_api",
+        priority=4,
+        org_id=req.org_id,
     )
-    return {"status": "ok", **result}
+    return {"status": "queued", "discovery_id": discovery_id, "job_id": job_id}
+
+
+@router.post("/scraper/start")
+def scraper_start():
+    """UI button: jumpstart the scraper chain if it's idle."""
+    from tools.enrichment.dispatcher import jumpstart_scraper
+    return jumpstart_scraper()
+
+
+@router.post("/pathfinder/start")
+def pathfinder_start():
+    """UI button: jumpstart the pathfinder chain if it's idle."""
+    from tools.enrichment.dispatcher import jumpstart_pathfinder
+    return jumpstart_pathfinder()
 
 
 @router.post("/pathfinder/fetch-next")
@@ -159,4 +186,21 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
         params["where"] = f"(org_id,eq,{org_id})"
 
     data = client._get("research_plans", params=params)
+    return {"status": "ok", "rows": data.get("list", [])}
+
+
+@router.get("/scrape-targets/list")
+def scrape_targets_list(org_id: int, status: str | None = None, active_only: bool = True, limit: int = 100):
+    client = NocodbClient()
+    parts = [f"(org_id,eq,{org_id})"]
+    if active_only:
+        parts.append("(active,eq,1)")
+    if status:
+        parts.append(f"(status,eq,{status})")
+    params = {
+        "where": "~and".join(parts),
+        "limit": limit,
+        "sort": "-CreatedAt",
+    }
+    data = client._get("scrape_targets", params=params)
     return {"status": "ok", "rows": data.get("list", [])}

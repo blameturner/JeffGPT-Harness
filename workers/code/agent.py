@@ -136,7 +136,7 @@ class CodeAgent(BaseAgent):
     ):
         super().__init__(model=model, org_id=org_id, search_enabled=search_enabled)
         if mode not in _SYSTEMS:
-            raise ValueError(f"Invalid mode '{mode}'. Must be plan|execute|debug.")
+            raise ValueError(f"Invalid mode '{mode}'. Must be one of {sorted(_SYSTEMS)}.")
         self.mode: Mode = mode
         self.approved_plan = approved_plan
         self.files = files or []

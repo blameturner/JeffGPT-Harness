@@ -56,9 +56,11 @@ async def execute(params: dict, emit) -> ToolResult:
             content=query_text,
             model="planned_search",
             pending_approval=1,
+            search_status="awaiting_approval",
         )
         message_id = msg.get("Id") or msg.get("id")
-        _log.info("planned_search message created  msg_id=%s queries=%d", message_id, len(query_list))
+        _log.info("planned_search message created  msg_id=%s queries=%d conv=%s",
+                  message_id, len(query_list), conversation_id)
     except Exception:
         _log.warning("planned_search message create failed", exc_info=True)
         message_id = None

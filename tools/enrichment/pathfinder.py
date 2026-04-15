@@ -208,10 +208,22 @@ def _fetch_sitemap_urls(sitemap_url: str, limit: int = 500) -> list[str]:
     return urls[:limit]
 
 
-def _url_exists(client: NocodbClient, url_hash: str, org_id: int) -> bool:
+def _discovery_url_exists(client: NocodbClient, url_hash: str, org_id: int) -> int | None:
     try:
         data = client._get("discovery", params={
             "where": f"(url_hash,eq,{url_hash})~and(org_id,eq,{org_id})",
+            "limit": 1,
+        })
+        rows = data.get("list", [])
+        return rows[0].get("Id") if rows else None
+    except Exception:
+        return None
+
+
+def _scrape_target_exists(client: NocodbClient, url: str, org_id: int) -> bool:
+    try:
+        data = client._get("scrape_targets", params={
+            "where": f"(url,eq,{url})~and(org_id,eq,{org_id})",
             "limit": 1,
         })
         return bool(data.get("list"))
@@ -219,31 +231,74 @@ def _url_exists(client: NocodbClient, url_hash: str, org_id: int) -> bool:
         return False
 
 
-def _add_url(
+def upsert_discovery_root(
+    client: NocodbClient,
+    url: str,
+    org_id: int,
+    score: float = 100.0,
+) -> int | None:
+    """Ensure the seed URL is recorded in the discovery table; return its row Id."""
+    uh = _url_hash(url)
+    existing_id = _discovery_url_exists(client, uh, org_id)
+    if existing_id:
+        return existing_id
+    try:
+        row = client._post("discovery", {
+            "org_id": org_id,
+            "url": url,
+            "url_hash": uh,
+            "source_url": "",
+            "depth": 0,
+            "domain": _host(url),
+            "score": score,
+            "status": "discovered",
+        })
+        return row.get("Id")
+    except Exception as e:
+        _log.warning("discovery seed insert failed  url=%s  error=%s", url[:80], e)
+        return None
+
+
+def _derive_target_name(url: str) -> str:
+    parts = urlparse(url)
+    path = (parts.path or "/").strip("/").replace("/", " · ") or parts.netloc
+    return f"{parts.netloc}: {path}"[:255]
+
+
+def _add_to_scrape_targets(
     client: NocodbClient,
     url: str,
     source_url: str,
     depth: int,
     org_id: int,
     score: float,
+    parent_target_id: int | None = None,
+    frequency_hours: int = 24,
 ) -> bool:
-    uh = _url_hash(url)
-    if _url_exists(client, uh, org_id):
+    """Insert a discovered URL into scrape_targets so the enrichment scraper picks it up."""
+    if _scrape_target_exists(client, url, org_id):
         return False
+    payload = {
+        "org_id": org_id,
+        "url": url,
+        "name": _derive_target_name(url),
+        "category": "auto",
+        "active": 1,
+        "frequency_hours": frequency_hours,
+        "depth": depth,
+        "discovered_from": source_url or "",
+        "auto_crawled": 1,
+        "consecutive_failures": 0,
+        "consecutive_unchanged": 0,
+        "chunk_count": 0,
+    }
+    if parent_target_id:
+        payload["parent_target"] = parent_target_id
     try:
-        client._post("discovery", {
-            "org_id": org_id,
-            "url": url,
-            "url_hash": uh,
-            "source_url": source_url,
-            "depth": depth,
-            "domain": _host(url),
-            "score": score,
-            "status": "discovered",
-        })
+        client._post("scrape_targets", payload)
         return True
     except Exception as e:
-        _log.warning("add url failed  url=%s  error=%s", url[:80], e)
+        _log.warning("scrape_targets insert failed  url=%s  error=%s", url[:80], e)
         return False
 
 
@@ -276,9 +331,16 @@ def discover(
     client = NocodbClient()
     ua = "Mozilla/5.0 (compatible; JeffGPT-Pathfinder/1.0)"
 
-    visited: set[str] = set()
-    visited_lock = threading.Lock()
-    frontier: deque[tuple[str, int, str]] = deque()  # (url, depth, source)
+    # ensure the seed exists as a discovery row (root) so future re-crawls have an anchor
+    discovery_root_id = upsert_discovery_root(client, seed, org_id)
+
+    # `enqueued` tracks every URL that's ever been put in the frontier (so we don't
+    # enqueue duplicates). The outer submit loop trusts that everything in the
+    # frontier is unique and just submits.
+    enqueued: set[str] = set()
+    enqueued_lock = threading.Lock()
+    frontier: deque[tuple[str, int, str]] = deque()
+    enqueued.add(seed)
     frontier.append((seed, 0, ""))
 
     # seed with sitemap hints (robots.txt Sitemap: lines, then common fallback paths)
@@ -292,9 +354,15 @@ def discover(
         for sm in sitemaps:
             for u in _fetch_sitemap_urls(sm, limit=sitemap_limit):
                 n = _normalize(u)
-                if n and (not same_host_only or _host(n) == seed_host):
-                    frontier.append((n, 1, sm))
-                    sitemap_urls_seeded += 1
+                if not n:
+                    continue
+                if same_host_only and _host(n) != seed_host:
+                    continue
+                if n in enqueued:
+                    continue
+                enqueued.add(n)
+                frontier.append((n, 1, sm))
+                sitemap_urls_seeded += 1
     _log.info("pathfinder seed=%s  sitemap_urls_seeded=%d", seed[:80], sitemap_urls_seeded)
 
     added = 0
@@ -327,8 +395,42 @@ def discover(
         canon = _normalize(result.get("canonical") or final)
         record_url = canon or final or url
 
-        sc = _score(record_url, seed_host, seed_path, depth)
-        local_added = 1 if _add_url(client, record_url, source or "", depth, org_id, sc) else 0
+        # the seed itself stays in `discovery` (already upserted as root); every other
+        # URL pathfinder reaches gets recorded as a scrape_targets row so the
+        # enrichment scraper can pick it up later.
+        local_added = 0
+        if depth > 0:
+            sc = _score(record_url, seed_host, seed_path, depth)
+            if _add_to_scrape_targets(
+                client,
+                record_url,
+                source or "",
+                depth,
+                org_id,
+                sc,
+                parent_target_id=None,
+            ):
+                local_added = 1
+
+        # queue a summarise tool_job for the page we just scraped, so the model run
+        # happens out-of-band on the tool queue (priority 5 = background)
+        page_text = (result.get("text") or "").strip()
+        if page_text:
+            try:
+                from workers.tool_queue import get_tool_queue
+                tq = get_tool_queue()
+                if tq:
+                    payload = {
+                        "url": record_url,
+                        "text": page_text[:30000],
+                        "org_id": org_id,
+                        "source": "pathfinder",
+                    }
+                    if depth == 0 and discovery_root_id:
+                        payload["discovery_id"] = discovery_root_id
+                    tq.submit("summarise_page", payload, source="pathfinder", priority=5)
+            except Exception:
+                _log.warning("summarise queue failed  url=%s", record_url[:80], exc_info=True)
 
         local_filtered = 0
         links = result.get("links") or []
@@ -344,10 +446,10 @@ def discover(
             if _is_binary(n) or _is_junk(n):
                 local_filtered += 1
                 continue
-            with visited_lock:
-                if n in visited:
+            with enqueued_lock:
+                if n in enqueued:
                     continue
-                visited.add(n)
+                enqueued.add(n)
             frontier.append((n, depth + 1, record_url))
 
         is_seed = (depth == 0)
@@ -367,10 +469,7 @@ def discover(
                    and added + len(in_flight) < max_pages
                    and processed + len(in_flight) < max_attempts):
                 url, depth, source = frontier.popleft()
-                with visited_lock:
-                    if url in visited:
-                        continue
-                    visited.add(url)
+                # already deduped at frontier-append time via `enqueued`; just submit
                 in_flight.add(pool.submit(_process, url, depth, source))
 
             if not in_flight:
@@ -403,6 +502,18 @@ def discover(
     elif seed_link_count == 0:
         _log.warning("pathfinder seed scraped but ZERO links extracted  seed=%s", seed[:120])
 
+    # update the discovery root row with the outcome of this crawl
+    if discovery_root_id:
+        from datetime import datetime, timezone
+        try:
+            client._patch("discovery", discovery_root_id, {
+                "status": "scraped" if seed_ok else "failed",
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "error_message": "" if seed_ok else "seed scrape failed",
+            })
+        except Exception:
+            _log.warning("discovery root patch failed  id=%s", discovery_root_id, exc_info=True)
+
     _log.info(
         "pathfinder done  seed=%s  added=%d/%d  attempts=%d  filtered=%d  scrape_failed=%d  robots_blocked=%d  errors=%d  seed_ok=%s  seed_links=%d",
         seed[:80], added, max_pages, processed, skipped_filter, scrape_failed, skipped_robots, errors, seed_ok, seed_link_count,
@@ -420,7 +531,96 @@ def discover(
         "seed_ok": seed_ok,
         "seed_link_count": seed_link_count,
         "sitemap_urls_seeded": sitemap_urls_seeded,
+        "discovery_root_id": discovery_root_id,
     }
+
+
+def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
+    """Pick the discovery root that hasn't been crawled in the longest time (or ever)."""
+    # never crawled first
+    try:
+        never = client._get("discovery", params={
+            "where": "(depth,eq,0)~and(processed_at,is,null)",
+            "limit": 1,
+            "sort": "CreatedAt",
+        }).get("list", [])
+        if never:
+            return never[0]
+    except Exception:
+        pass
+    # then oldest-processed
+    try:
+        oldest = client._get("discovery", params={
+            "where": "(depth,eq,0)",
+            "limit": 1,
+            "sort": "processed_at",
+        }).get("list", [])
+        return oldest[0] if oldest else None
+    except Exception:
+        return None
+
+
+def _chain_next_pathfinder_job(reason: str = "chain") -> None:
+    try:
+        from workers.tool_queue import get_tool_queue
+        tq = get_tool_queue()
+        if tq:
+            tq.submit("pathfinder_crawl", {}, source=f"pathfinder_{reason}", priority=4)
+    except Exception:
+        _log.warning("pathfinder chain submit failed  reason=%s", reason, exc_info=True)
+
+
+def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
+    """Tool-queue handler: pick (or use given) discovery root, run discover() to find new links,
+    then re-queue another pathfinder_crawl so the worker keeps walking through the discovery list.
+    UI-triggered crawls submit with {discovery_id} or just rely on the rolling chain."""
+    if isinstance(payload, int):
+        discovery_id: int | None = payload
+    elif isinstance(payload, dict):
+        discovery_id = payload.get("discovery_id")
+    else:
+        discovery_id = None
+
+    client = NocodbClient()
+
+    if not discovery_id:
+        row = _pick_next_discovery_root(client)
+        if not row:
+            _log.debug("pathfinder: no discovery roots, idling")
+            return {"status": "idle"}
+        discovery_id = int(row.get("Id") or 0)
+        seed_url = row.get("url") or ""
+        org_id = int(row.get("org_id") or 0)
+    else:
+        try:
+            rows = client._get("discovery", params={
+                "where": f"(Id,eq,{discovery_id})",
+                "limit": 1,
+            }).get("list", [])
+        except Exception:
+            _log.warning("pathfinder_crawl_job lookup failed  id=%d", discovery_id, exc_info=True)
+            _chain_next_pathfinder_job("after_lookup_error")
+            return {"status": "error", "discovery_id": discovery_id}
+        if not rows:
+            _chain_next_pathfinder_job("after_not_found")
+            return {"status": "not_found", "discovery_id": discovery_id}
+        row = rows[0]
+        seed_url = row.get("url") or ""
+        org_id = int(row.get("org_id") or 0)
+
+    if not seed_url:
+        _chain_next_pathfinder_job("after_bad_url")
+        return {"status": "error", "reason": "no_url", "discovery_id": discovery_id}
+
+    try:
+        result = discover(seed_url, org_id)
+    except Exception as e:
+        _log.warning("pathfinder_crawl_job discover failed  id=%s url=%s error=%s",
+                     discovery_id, seed_url[:80], e, exc_info=True)
+        result = {"status": "error", "reason": str(e)[:200]}
+
+    _chain_next_pathfinder_job("after_run")
+    return {"status": "ok", "discovery_id": discovery_id, **result}
 
 
 def _wait_any(futures: set) -> tuple[list, set]:

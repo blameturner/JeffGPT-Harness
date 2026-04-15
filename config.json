@@ -19,7 +19,15 @@
     "intent_classifier": true,
     "scraper": {
       "enabled": true,
-      "batch_size": 10
+      "batch_size": 10,
+      "summariser_model": "scrape_summariser",
+      "dispatch_interval_minutes": 5,
+      "max_jobs_per_dispatch": 25,
+      "rag_collection": "discovery",
+      "summary_collection": "discovery_summaries",
+      "models": {
+        "scrape_summariser": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500, "max_input_chars": 12000, "frequency_penalty": 0.2 }
+      }
     },
     "research": {
       "planner_enabled": true,
@@ -28,7 +36,7 @@
       "max_iterations": 3,
       "confidence_threshold": 80,
       "models": {
-        "research_planner": { "role": "t2_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
+        "research_planner": { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
         "research_agent":   { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 }
       }
     },
