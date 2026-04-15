@@ -64,7 +64,7 @@ def jumpstart_scraper() -> dict:
 
     org_id = _default_org_id(client)
     try:
-        job_id = tq.submit("scrape_target", {}, source="scraper_jumpstart", priority=5, org_id=org_id)
+        job_id = tq.submit("scrape_target", {}, source="scraper_jumpstart", priority=4, org_id=org_id)
     except Exception:
         _log.warning("scraper jumpstart submit failed", exc_info=True)
         return {"status": "submit_failed"}

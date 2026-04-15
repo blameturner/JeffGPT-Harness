@@ -244,6 +244,30 @@ def _scrape_one_target(target_id: int) -> dict:
     }
 
 
+def _seconds_since_last_scrape_target_completion(client: NocodbClient) -> float:
+    """Newest completed scrape_target batch's age in seconds. inf if none yet."""
+    try:
+        rows = client._get("tool_jobs", params={
+            "where": "(type,eq,scrape_target)~and(status,eq,completed)",
+            "sort": "-completed_at",
+            "limit": 1,
+        }).get("list", [])
+    except Exception:
+        return float("inf")
+    if not rows:
+        return float("inf")
+    ts_str = rows[0].get("completed_at") or ""
+    if not ts_str:
+        return float("inf")
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return float("inf")
+    return (datetime.now(timezone.utc) - ts).total_seconds()
+
+
 def scrape_target_job(payload: dict | int | None = None) -> dict:
     """Tool-queue handler. Runs as a BATCH: processes up to `scraper.batch_size`
     due targets then exits. No self-chain — the 5-min dispatcher schedules the
@@ -256,6 +280,21 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         return _scrape_one_target(payload)
     if isinstance(payload, dict) and payload.get("target_id"):
         return _scrape_one_target(int(payload["target_id"]))
+
+    # Cooldown guard for the scheduled/batch path: if another scrape_target batch
+    # completed in the last `scraper.min_run_interval_seconds` (default 60s), skip
+    # this run. Protects against stray submitters flooding the queue (the chain
+    # bug that spun pathfinder every 1.5s could happen here too).
+    min_interval = float(get_feature("scraper", "min_run_interval_seconds", 60))
+    if min_interval > 0:
+        client_cooldown = NocodbClient()
+        elapsed = _seconds_since_last_scrape_target_completion(client_cooldown)
+        if elapsed < min_interval:
+            _log.info(
+                "scraper batch skip: last completion %.1fs ago, gate=%.0fs",
+                elapsed, min_interval,
+            )
+            return {"status": "skipped_cooldown", "elapsed_s": round(elapsed, 1)}
 
     # Scheduled / jumpstart path: batch
     batch_size = int(get_feature("scraper", "batch_size", DEFAULT_BATCH_SIZE))

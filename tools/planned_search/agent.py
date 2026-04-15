@@ -10,9 +10,57 @@ from infra.nocodb_client import NocodbClient
 from tools.contract import ToolName, ToolResult
 from tools.dispatcher import register_executor
 from tools.planned_search.planner import generate_planned_queries
-from tools.search.web_search import _filter_results_by_relevance, _search_all
+from tools.search.engine import searxng_search
 
 _log = logging.getLogger("planned_search.agent")
+
+# planned_search does its OWN searxng fan-out + relevance filter. It deliberately
+# does NOT call tools.search.web_search (the LLM-orchestrated web_search tool) —
+# planned_search is an explicit, user-approved query path and must not trigger
+# the implicit web_search pipeline.
+_PLANNED_MAX_URLS = 5
+_PLANNED_SEARXNG_PER_QUERY = 10
+_PLANNED_RELEVANCE_THRESHOLD = 0.25
+
+
+async def _planned_search_all(queries: list[str]) -> list[dict]:
+    async def _one(q: str) -> list[dict]:
+        try:
+            return await asyncio.to_thread(searxng_search, q, _PLANNED_SEARXNG_PER_QUERY) or []
+        except Exception as e:
+            _log.warning("planned_search searxng failed q=%r: %s", q[:80], e)
+            return []
+
+    results_per_query = await asyncio.gather(*[_one(q) for q in queries])
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for rs in results_per_query:
+        for r in rs:
+            url = (r.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            deduped.append(r)
+    return deduped[:_PLANNED_MAX_URLS]
+
+
+def _planned_filter_by_relevance(results: list[dict], queries: list[str]) -> list[dict]:
+    if not results or _PLANNED_RELEVANCE_THRESHOLD <= 0:
+        return results
+    from tools.search.queries import _extract_keywords
+    keywords: set[str] = set()
+    for q in queries:
+        for kw in _extract_keywords(q):
+            keywords.add(kw.lower())
+    if not keywords:
+        return results
+    kept: list[dict] = []
+    for r in results:
+        haystack = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
+        hits = sum(1 for kw in keywords if kw in haystack)
+        if hits / len(keywords) >= _PLANNED_RELEVANCE_THRESHOLD:
+            kept.append(r)
+    return kept
 
 
 @register_executor(ToolName.PLANNED_SEARCH)
@@ -187,8 +235,8 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
         for kw in _extract_keywords(q):
             query_keywords.add(kw.lower())
 
-    results = await _search_all(query_list)
-    results = _filter_results_by_relevance(results, query_list)
+    results = await _planned_search_all(query_list)
+    results = _planned_filter_by_relevance(results, query_list)
 
     needed = get_feature("planned_search", "successful_scrapes_needed", 10)
 

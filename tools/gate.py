@@ -118,6 +118,13 @@ def gate_check(
     if "web_search" not in hints and "planned_search" not in hints and len(msg) > 30:
         hints.add("web_search")
 
+    # planned_search supersedes web_search: when the user asks for a research-style
+    # investigation, only the explicit, user-approved planned_search pipeline should
+    # run. Firing web_search alongside planned_search double-scrapes and trips the
+    # "planned_search invoking web_search" behaviour.
+    if "planned_search" in hints:
+        hints.discard("web_search")
+
     hints = {h for h in hints if is_feature_enabled(h)}
 
     if hints:

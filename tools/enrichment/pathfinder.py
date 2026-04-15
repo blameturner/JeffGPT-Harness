@@ -564,60 +564,21 @@ def discover(
 
 
 def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
-    """Pick the next discovery root. Priority:
-      1. Rows with status='discovered' — never been crawled. Oldest (by CreatedAt) first.
-      2. Else: rows whose UpdatedAt crossed the stale_after_minutes threshold.
-    Returns None when every root has been crawled recently — caller falls back
-    to scrape_targets.
-
-    Uses `status` as the never-crawled marker (set to 'discovered' on insert,
-    flipped to 'scraped'/'failed' by the crawl patch) because NocoDB's Timestamp
-    writes have been unreliable in this deployment."""
-    from datetime import datetime, timedelta, timezone
-
-    # Step 1: never-crawled rows (status stays 'discovered' until the crawl patch).
+    """Pick the next NEVER-crawled discovery root (status='discovered'), oldest
+    by CreatedAt. Returns None once every discovery row has been crawled at
+    least once — caller then falls through to scrape_targets (per the product
+    rule: each discovery URL is crawled ONCE, then pathfinder rotates through
+    scrape_targets by oldest UpdatedAt)."""
     try:
         never = client._get("discovery", params={
             "where": "(depth,eq,0)~and(status,eq,discovered)",
             "limit": 1,
             "sort": "CreatedAt",
         }).get("list", [])
-        if never:
-            return never[0]
+        return never[0] if never else None
     except Exception:
         _log.warning("pathfinder picker never-crawled query failed", exc_info=True)
-
-    # Step 2: previously-crawled rows whose UpdatedAt is past the stale window.
-    stale_minutes = int(_cfg("stale_after_minutes", 60))
-    now = datetime.now(timezone.utc)
-    threshold = now - timedelta(minutes=max(stale_minutes, 1))
-
-    try:
-        rows = client._get("discovery", params={
-            "where": "(depth,eq,0)",
-            "limit": 20,
-            "sort": "UpdatedAt,CreatedAt",
-        }).get("list", [])
-    except Exception:
-        _log.warning("pathfinder picker stale query failed", exc_info=True)
         return None
-
-    for r in rows:
-        # only consider rows that have been crawled at least once (status != 'discovered')
-        if (r.get("status") or "") == "discovered":
-            continue
-        ts_str = r.get("UpdatedAt") or r.get("updated_at") or r.get("CreatedAt")
-        if not ts_str:
-            continue
-        try:
-            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            return r  # unparseable timestamp — treat as stale
-        if ts <= threshold:
-            return r
-    return None  # everything fresh — caller falls back to scrape_targets
 
 
 def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
@@ -742,13 +703,40 @@ def _process_one_seed(
     }
 
 
-def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
-    """Tool-queue handler. Processes ONE URL per invocation, then chains the next
-    pathfinder_crawl job (inflight-guarded so there's never more than one in queue).
+def _seconds_since_last_pathfinder_completion(client: NocodbClient) -> float:
+    """How long since the newest completed pathfinder_crawl finished. Returns
+    inf if none has ever completed. Used by the cooldown guard below so an
+    aggressive submitter (cron misfire, UI loop, leftover chain) can't spin
+    this handler faster than `pathfinder.min_run_interval_seconds`."""
+    from datetime import datetime, timezone
+    try:
+        rows = client._get("tool_jobs", params={
+            "where": "(type,eq,pathfinder_crawl)~and(status,eq,completed)",
+            "sort": "-completed_at",
+            "limit": 1,
+        }).get("list", [])
+    except Exception:
+        return float("inf")
+    if not rows:
+        return float("inf")
+    ts_str = rows[0].get("completed_at") or ""
+    if not ts_str:
+        return float("inf")
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return float("inf")
+    return (datetime.now(timezone.utc) - ts).total_seconds()
 
-    The 10-min cron is a safety net — normally the chain keeps one pathfinder_crawl
-    perpetually queued; if the chain ever breaks, the cron recovers.
-    """
+
+def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
+    """Tool-queue handler. Processes ONE URL per invocation then EXITS.
+    No self-chain — the `pathfinder.recrawl_interval_minutes` cron (default 10 min)
+    is the sole driver, so pathfinder runs at most once per cron cycle regardless
+    of chat activity or backoff state. This avoids the runaway chain that fired
+    a new job every few seconds."""
     if isinstance(payload, int):
         direct_discovery_id: int | None = payload
     elif isinstance(payload, dict):
@@ -759,6 +747,21 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
     client = NocodbClient()
     chain_org_id = 1  # default tenant if we can't derive from a picked row
 
+    # Cooldown guard: bail if another pathfinder_crawl completed recently. Applies
+    # only to scheduled/background runs (direct_discovery_id paths are user-initiated
+    # and should run immediately). Prevents the 1.5s runaway log even if an unknown
+    # submitter is flooding the queue.
+    if direct_discovery_id is None:
+        min_interval = float(_cfg("min_run_interval_seconds", 60))
+        if min_interval > 0:
+            elapsed = _seconds_since_last_pathfinder_completion(client)
+            if elapsed < min_interval:
+                _log.info(
+                    "pathfinder skip: last completion %.1fs ago, gate=%.0fs",
+                    elapsed, min_interval,
+                )
+                return {"status": "skipped_cooldown", "elapsed_s": round(elapsed, 1)}
+
     # UI-triggered path: specific discovery row.
     if direct_discovery_id:
         try:
@@ -768,10 +771,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             }).get("list", [])
         except Exception:
             _log.warning("pathfinder direct lookup failed  id=%d", direct_discovery_id, exc_info=True)
-            _chain_next_pathfinder(chain_org_id)
+            # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
             return {"status": "error", "discovery_id": direct_discovery_id}
         if not rows:
-            _chain_next_pathfinder(chain_org_id)
+            # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
             return {"status": "not_found", "discovery_id": direct_discovery_id}
         row = rows[0]
         chain_org_id = int(row.get("org_id") or 0)
@@ -782,7 +785,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             seed_source="discovery",
             discovery_id=int(row.get("Id") or 0) or None,
         )
-        _chain_next_pathfinder(chain_org_id)
+        # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 
     # Scheduled/chained path: pick ONE seed. Stale discovery first, then oldest scrape_target.
@@ -796,7 +799,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             seed_source="discovery",
             discovery_id=int(seed.get("Id") or 0) or None,
         )
-        _chain_next_pathfinder(chain_org_id)
+        # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 
     fallback = _pick_next_scrape_target_seed(client)
@@ -809,7 +812,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             seed_source="scrape_target",
             scrape_target_id=int(fallback.get("Id") or 0) or None,
         )
-        _chain_next_pathfinder(chain_org_id)
+        # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 
     # Nothing to do. Don't chain — let the 10-min cron restart us when work appears.

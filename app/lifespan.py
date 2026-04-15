@@ -29,9 +29,12 @@ async def lifespan(app: FastAPI):
     # Priority tiers (lower number = picked first, shorter chat-idle needed):
     #   2 = user-facing planned_search (runs first when user approves queries)
     #   3 = research planner + agent (user-initiated, LLM-heavy)
-    #   4 = summarisers, classifier, graph_extract (downstream LLM jobs — run before
-    #       pathfinder/scraper so their queues stay shallow)
-    #   5 = pathfinder + scraper (background enrichment — runs only when higher tiers quiet)
+    #   4 = summarisers, classifier, graph_extract, scrape_target (downstream work
+    #       on already-known URLs — runs ahead of pathfinder so pipelines drain)
+    #   5 = pathfinder (exploratory/discovery — lowest priority, runs only when
+    #       everything above is quiet)
+    # scrape_target is deliberately one tier ABOVE pathfinder_crawl: we'd rather
+    # finish scraping known-good targets than spend compute discovering new ones.
     tool_queue.register("planned_search_execute", HandlerConfig(
         handler=lambda p: run_planned_search_job(p["message_id"], p["org_id"]),
         max_workers=1, priority_default=2, source="planned_search",
@@ -63,7 +66,7 @@ async def lifespan(app: FastAPI):
     tool_queue.register("scrape_target", HandlerConfig(
         # accepts payload dict directly; picks next due target when payload is empty {}
         handler=scrape_target_job,
-        max_workers=2, priority_default=5, source="scraper",
+        max_workers=2, priority_default=4, source="scraper",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue

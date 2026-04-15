@@ -136,6 +136,38 @@ def run_research_agent(plan_id: int) -> dict:
 
     client._patch("research_plans", plan_id, {"status": "synthesizing"})
 
+    # Guard every path after the status flip: if ANY exception escapes, flip the
+    # row to "failed" so it doesn't sit stuck on "synthesizing" until the stale
+    # checker resets it (40 min on this job type).
+    try:
+        return _run_research_agent_inner(
+            client, plan_id, topic, queries, schema, iterations,
+            org_id, max_iterations, confidence_threshold, plan,
+        )
+    except Exception as e:
+        _log.error("research_agent uncaught error  plan_id=%d", plan_id, exc_info=True)
+        try:
+            client._patch("research_plans", plan_id, {
+                "status": "failed",
+                "error_message": f"uncaught: {str(e)[:300]}",
+            })
+        except Exception:
+            _log.warning("research_agent failure patch also failed  plan_id=%d", plan_id, exc_info=True)
+        return {"status": "failed", "plan_id": plan_id, "error": str(e)[:300]}
+
+
+def _run_research_agent_inner(
+    client,
+    plan_id: int,
+    topic: str,
+    queries: list,
+    schema: dict,
+    iterations: int,
+    org_id: int,
+    max_iterations: int,
+    confidence_threshold: int,
+    plan: dict,
+) -> dict:
     if iterations == 0:
         fresh_queries = queries
         prior_queries: list = []
