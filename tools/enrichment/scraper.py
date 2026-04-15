@@ -65,14 +65,21 @@ def _parse_iso(value) -> datetime | None:
 
 
 def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
-    """Return scrape_targets rows that need scraping. NocoDB v1's where parser rejects
-    gte/lte filters on datetime columns, so we fetch active rows and filter in Python."""
+    """Return scrape_targets rows that need scraping. Sort by CreatedAt (oldest first)
+    so never-scraped rows surface in order. Any datetime-column sort here can silently
+    fail on NocoDB v1 when the column has mixed null/datetime values — CreatedAt is
+    always populated, so it's the reliable ordering."""
     rows: list[dict] = []
     try:
         rows = client._get("scrape_targets", params={
             "where": "(active,eq,1)",
             "limit": 1000,
-            "sort": "next_crawl_at,CreatedAt",
+            "sort": "CreatedAt",
+            "fields": (
+                "Id,org_id,url,depth,frequency_hours,consecutive_failures,"
+                "consecutive_unchanged,content_hash,chunk_count,last_scraped_at,"
+                "next_crawl_at,status,active"
+            ),
         }).get("list", [])
     except Exception:
         _log.warning("fetch_due_targets query failed", exc_info=True)
@@ -88,6 +95,7 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
         nca = _parse_iso(r.get("next_crawl_at"))
         if nca is None or nca <= now:
             due.append(r)
+    _log.debug("fetch_due_targets  total=%d never=%d due=%d", len(rows), len(never), len(due))
     return (never + due)[:limit]
 
 
@@ -98,42 +106,10 @@ def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
         _log.warning("scrape_target patch failed  id=%d", target_id, exc_info=True)
 
 
-def _chain_next_job(reason: str = "chain") -> None:
-    """Submit a follow-up scrape_target job (no payload — handler picks next due target)."""
-    try:
-        from workers.tool_queue import get_tool_queue
-        tq = get_tool_queue()
-        if tq:
-            tq.submit("scrape_target", {}, source=f"scraper_{reason}", priority=5)
-    except Exception:
-        _log.warning("scrape_target chain submit failed  reason=%s", reason, exc_info=True)
-
-
-def scrape_target_job(payload: dict | int | None = None) -> dict:
-    """Tool-queue handler: pick (or use given) due scrape_target, scrape + summarise + embed,
-    then re-queue another scrape_target job so the worker keeps draining the backlog.
-    Stops chaining when there are no due targets — the 5-min dispatcher will jumpstart it again."""
-    if not is_feature_enabled("scraper"):
-        return {"status": "disabled"}
-
-    # accept payload as dict (preferred), int (legacy direct id), or None (pick next)
-    if isinstance(payload, int):
-        target_id = payload
-    elif isinstance(payload, dict):
-        target_id = payload.get("target_id")
-    else:
-        target_id = None
-
+def _scrape_one_target(target_id: int) -> dict:
+    """Process a single scrape_target row: scrape, embed on change, queue summarise,
+    update bookkeeping. Does NOT chain — caller batches."""
     client = NocodbClient()
-
-    if not target_id:
-        due = fetch_due_targets(client, limit=1)
-        if not due:
-            _log.debug("scraper: no due targets, idling — waiting for dispatcher")
-            return {"status": "idle"}
-        target_id = int(due[0].get("Id") or 0)
-        if not target_id:
-            return {"status": "error", "reason": "bad_target_row"}
 
     try:
         rows = client._get("scrape_targets", params={
@@ -141,16 +117,14 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
             "limit": 1,
         }).get("list", [])
     except Exception:
-        _log.warning("scrape_target_job lookup failed  id=%d", target_id, exc_info=True)
-        _chain_next_job("after_lookup_error")
+        _log.warning("scrape_target lookup failed  id=%d", target_id, exc_info=True)
         return {"status": "error", "target_id": target_id}
     if not rows:
-        _chain_next_job("after_not_found")
         return {"status": "not_found", "target_id": target_id}
 
     row = rows[0]
     url = row.get("url") or ""
-    org_id = row.get("org_id") or 0
+    org_id = int(row.get("org_id") or 0)
     frequency_hours = int(row.get("frequency_hours") or DEFAULT_FREQUENCY_HOURS)
     consecutive_failures = int(row.get("consecutive_failures") or 0)
     consecutive_unchanged = int(row.get("consecutive_unchanged") or 0)
@@ -171,7 +145,6 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
             "next_crawl_at": _next_crawl_at(frequency_hours, new_failures),
         })
         _log.warning("scrape_target exception  id=%d url=%s error=%s", target_id, url[:100], e)
-        _chain_next_job("after_exception")
         return {"status": "error", "target_id": target_id, "url": url}
 
     if result.get("status") != "ok":
@@ -190,7 +163,6 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         _patch_target(client, target_id, patch)
         _log.info("scrape_target failed  id=%d url=%s reason=%s failures=%d",
                   target_id, url[:100], err, new_failures)
-        _chain_next_job("after_failure")
         return {"status": "failed", "target_id": target_id, "url": url, "reason": err}
 
     text = (result.get("text") or "").strip()
@@ -202,7 +174,6 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
             "consecutive_failures": new_failures,
             "next_crawl_at": _next_crawl_at(frequency_hours, new_failures),
         })
-        _chain_next_job("after_empty")
         return {"status": "failed", "target_id": target_id, "url": url, "reason": "empty_text"}
 
     new_hash = _content_hash(text)
@@ -242,7 +213,7 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         "last_scrape_error": "",
     })
 
-    # if content changed, queue an out-of-band summarise job (priority 5 = background)
+    # on content change, queue one summarise_page job per scrape (one per change, not one per attempt)
     if not unchanged:
         try:
             from workers.tool_queue import get_tool_queue
@@ -259,19 +230,62 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
                     },
                     source="scrape_target",
                     priority=5,
+                    org_id=org_id,
                 )
         except Exception:
             _log.warning("summarise queue failed  target_id=%d", target_id, exc_info=True)
 
     _log.info("scrape_target ok  id=%d url=%s chars=%d chunks=%d unchanged=%s",
               target_id, url[:100], len(text), chunks_added, unchanged)
-    _chain_next_job("after_ok")
     return {
         "status": "ok",
         "target_id": target_id,
         "url": url,
         "chunks": chunks_added,
         "unchanged": unchanged,
+    }
+
+
+def scrape_target_job(payload: dict | int | None = None) -> dict:
+    """Tool-queue handler. Runs as a BATCH: processes up to `scraper.batch_size`
+    due targets then exits. No self-chain — the 5-min dispatcher schedules the
+    next batch. Legacy int payload is treated as a specific target_id.
+    """
+    if not is_feature_enabled("scraper"):
+        return {"status": "disabled"}
+
+    if isinstance(payload, int):
+        return _scrape_one_target(payload)
+    if isinstance(payload, dict) and payload.get("target_id"):
+        return _scrape_one_target(int(payload["target_id"]))
+
+    # Scheduled / jumpstart path: batch
+    batch_size = int(get_feature("scraper", "batch_size", DEFAULT_BATCH_SIZE))
+    client = NocodbClient()
+    targets = fetch_due_targets(client, limit=batch_size)
+    if not targets:
+        _log.info("scraper batch: no due targets — idle")
+        return {"status": "idle", "processed": 0}
+
+    processed: list[dict] = []
+    for t in targets:
+        tid = int(t.get("Id") or 0)
+        if not tid:
+            continue
+        out = _scrape_one_target(tid)
+        processed.append(out)
+
+    successful = sum(1 for p in processed if p.get("status") == "ok")
+    chunks = sum(int(p.get("chunks") or 0) for p in processed)
+    _log.info(
+        "scraper batch done  processed=%d successful=%d chunks=%d",
+        len(processed), successful, chunks,
+    )
+    return {
+        "status": "ok",
+        "processed": len(processed),
+        "successful": successful,
+        "chunks": chunks,
     }
 
 
@@ -284,7 +298,8 @@ def scrape_next() -> dict | None:
 
 
 def run_scraper(batch_size: int | None = None) -> dict:
-    """Manual trigger: scrape up to N due targets in-process. The scheduler usually drives this."""
+    """Manual trigger: scrape up to N due targets in-process. Same as the batch
+    handler above but callable from the legacy endpoint."""
     if not is_feature_enabled("scraper"):
         return {"status": "disabled", "successful": 0}
     if batch_size is None:
@@ -296,7 +311,7 @@ def run_scraper(batch_size: int | None = None) -> dict:
     failed = 0
     chunks = 0
     for t in targets[:batch_size]:
-        out = scrape_target_job(int(t.get("Id") or 0))
+        out = _scrape_one_target(int(t.get("Id") or 0))
         if out.get("status") == "ok":
             successful += 1
             chunks += int(out.get("chunks") or 0)

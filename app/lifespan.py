@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     from tools.enrichment.scraper import scrape_target_job
     from tools.enrichment.summariser import summarise_page_job
     from tools.enrichment.pathfinder import pathfinder_crawl_job
+    from tools.enrichment.classifier import classify_relevance_job
     tool_queue = ToolJobQueue()
     tool_queue.register("graph_extract", HandlerConfig(
         handler=_handle_graph_extract, max_workers=1, priority_default=5,
@@ -53,6 +54,10 @@ async def lifespan(app: FastAPI):
         # accepts payload dict directly; picks next discovery root when payload is empty {}
         handler=pathfinder_crawl_job,
         max_workers=1, priority_default=4, source="pathfinder",
+    ))
+    tool_queue.register("classify_relevance", HandlerConfig(
+        handler=classify_relevance_job,
+        max_workers=1, priority_default=5, source="classifier",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue

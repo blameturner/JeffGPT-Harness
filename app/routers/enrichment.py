@@ -163,15 +163,35 @@ def research_agent_next():
     return {"status": "ok", "row": row}
 
 
+# Passing an explicit `fields` on NocoDB list GETs stops the m2m link expansion
+# (which otherwise generates a massive UNION ALL query per linked table — one
+# sub-SELECT per row — and tanks list-endpoint latency once tables grow).
+_DISCOVERY_LIST_FIELDS = (
+    "Id,org_id,url,url_hash,source_url,depth,domain,score,status,"
+    "error_message,created_at,processed_at,CreatedAt"
+)
+_RESEARCH_PLAN_LIST_FIELDS = (
+    "Id,org_id,topic,hypotheses,sub_topics,queries,schema,iterations,"
+    "max_iterations,confidence_score,confidence_threshold,gap_report,"
+    "paper_content,status,error_message,created_at,completed_at,CreatedAt"
+)
+_SCRAPE_TARGET_LIST_FIELDS = (
+    "Id,org_id,url,name,category,active,frequency_hours,depth,discovered_from,"
+    "auto_crawled,use_playwright,status,last_scraped_at,next_crawl_at,"
+    "consecutive_failures,consecutive_unchanged,content_hash,chunk_count,"
+    "last_scrape_error,CreatedAt"
+)
+
+
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
     client = NocodbClient()
-    params = {"limit": limit}
+    params: dict = {"limit": limit, "fields": _DISCOVERY_LIST_FIELDS}
     if status:
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
         params["where"] = f"(org_id,eq,{org_id})"
-    
+
     data = client._get("discovery", params=params)
     return {"status": "ok", "rows": data.get("list", [])}
 
@@ -179,7 +199,7 @@ def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
 @router.get("/research-plans/list")
 def research_plans_list(org_id: int, status: str | None = None, limit: int = 50):
     client = NocodbClient()
-    params = {"limit": limit}
+    params: dict = {"limit": limit, "fields": _RESEARCH_PLAN_LIST_FIELDS}
     if status:
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
@@ -187,6 +207,21 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
 
     data = client._get("research_plans", params=params)
     return {"status": "ok", "rows": data.get("list", [])}
+
+
+@router.get("/research-plans/{plan_id}")
+def research_plan_get(plan_id: int):
+    """Fetch a single research plan (including paper_content) for the report UI."""
+    client = NocodbClient()
+    data = client._get("research_plans", params={
+        "where": f"(Id,eq,{plan_id})",
+        "limit": 1,
+        "fields": _RESEARCH_PLAN_LIST_FIELDS,
+    })
+    rows = data.get("list", [])
+    if not rows:
+        return {"status": "not_found", "row": None}
+    return {"status": "ok", "row": rows[0]}
 
 
 @router.get("/scrape-targets/list")
@@ -197,10 +232,11 @@ def scrape_targets_list(org_id: int, status: str | None = None, active_only: boo
         parts.append("(active,eq,1)")
     if status:
         parts.append(f"(status,eq,{status})")
-    params = {
+    params: dict = {
         "where": "~and".join(parts),
         "limit": limit,
         "sort": "-CreatedAt",
+        "fields": _SCRAPE_TARGET_LIST_FIELDS,
     }
     data = client._get("scrape_targets", params=params)
     return {"status": "ok", "rows": data.get("list", [])}

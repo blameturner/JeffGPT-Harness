@@ -21,12 +21,14 @@
       "enabled": true,
       "batch_size": 10,
       "summariser_model": "scrape_summariser",
-      "dispatch_interval_minutes": 5,
+      "classifier_model": "scrape_classifier",
+      "dispatch_interval_minutes": 10,
       "max_jobs_per_dispatch": 25,
       "rag_collection": "discovery",
       "summary_collection": "discovery_summaries",
       "models": {
-        "scrape_summariser": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500, "max_input_chars": 12000, "frequency_penalty": 0.2 }
+        "scrape_summariser": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500, "max_input_chars": 12000, "frequency_penalty": 0.2 },
+        "scrape_classifier": { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 200, "max_input_chars": 8000 }
       }
     },
     "research": {
@@ -50,13 +52,15 @@
     },
     "pathfinder": {
       "enabled": true,
-      "max_depth": 3,
+      "max_depth": 0,
       "max_pages": 500,
       "concurrency": 8,
       "per_host_delay_s": 0.5,
       "robots_cache_ttl_s": 3600,
-      "sitemap_limit": 500,
-      "recrawl_interval_minutes": 5,
+      "sitemap_limit": 200,
+      "recrawl_interval_minutes": 10,
+      "batch_size": 5,
+      "max_links_per_seed": 100,
       "stale_after_minutes": 60,
       "fallback_to_scrape_targets": true
     },
