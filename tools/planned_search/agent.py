@@ -168,6 +168,9 @@ async def execute(params: dict, emit) -> ToolResult:
             model="planned_search",
             pending_approval=1,
             search_status="awaiting_approval",
+            # Store the original question so synthesis can retrieve it reliably
+            # even if the user message write races or has a higher Id than this row.
+            search_context_text=user_question,
         )
         message_id = msg.get("Id") or msg.get("id")
         _log.info("planned_search message created  msg_id=%s queries=%d conv=%s",
@@ -176,12 +179,20 @@ async def execute(params: dict, emit) -> ToolResult:
         _log.warning("planned_search message create failed", exc_info=True)
         message_id = None
 
+    if not message_id:
+        return ToolResult(
+            tool=ToolName.PLANNED_SEARCH,
+            action_index=0,
+            ok=False,
+            data="Planned search could not be saved. Please retry.",
+            elapsed_s=round(time.time() - t0, 2),
+        )
+
     render_content = f"[planned_search]\n" + "\n".join(
         f"- {q['query']}" + (f" ({q.get('reason')})" if q.get("reason") else "")
         for q in query_list
     )
-    if message_id:
-        render_content += f"\n\n[message_id:{message_id}]"
+    render_content += f"\n\n[message_id:{message_id}]"
 
     return ToolResult(
         tool=ToolName.PLANNED_SEARCH,
@@ -430,6 +441,14 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
                 })
 
     conversation_id = msg_row.get("conversation_id") or 0
+    # Prefer the question stored directly on the proposal row (written at creation time).
+    # Fall back to querying the conversation history for older rows that pre-date this field.
+    stored_question = (msg_row.get("search_context_text") or "").strip()
+    user_question = stored_question or _find_original_question(client, conversation_id, message_id)
+    if not user_question:
+        _log.warning("planned_search could not recover original question  msg_id=%s conv=%s",
+                     message_id, conversation_id)
+
     for src in scraped_results:
         try:
             client.add_message_search_sources(
@@ -448,7 +467,6 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
         except Exception:
             _log.warning("planned_search add source failed", exc_info=True)
 
-    user_question = _find_original_question(client, conversation_id, message_id)
     answer_text, answer_tokens = await _synthesize_answer(user_question, scraped_results)
 
     answer_msg_id = None

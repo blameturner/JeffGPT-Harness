@@ -127,21 +127,31 @@ def _build_context(topic: str, fresh_queries: list, prior_queries: list, org_id:
 
 def _synthesize(topic: str, context: str, schema: dict, iteration: int) -> dict:
     timeout_s = _research_timeout("synthesis_timeout_s", DEFAULT_SYNTHESIS_TIMEOUT_S)
-    prompt = f"""You are a Research Synthesis Agent. Write a comprehensive research paper on the topic.
+
+    # Build a human-readable section guide from the schema keys so the model knows
+    # what to cover, without constraining the output to JSON.
+    schema_guide = ""
+    if schema:
+        fields = list(schema.keys()) if isinstance(schema, dict) else []
+        if fields:
+            schema_guide = "Cover the following topics as sections:\n" + "\n".join(f"- {f}" for f in fields)
+
+    prompt = f"""You are a Research Synthesis Agent. Write a comprehensive, well-structured research paper in Markdown format.
 
 TOPIC: {topic}
 ITERATION: {iteration + 1}
-SCHEMA (data structure to produce): {json.dumps(schema)}
+{schema_guide}
 
 AVAILABLE CONTEXT:
 {context[:25000]}
 
 INSTRUCTIONS:
 1. Write a comprehensive research paper using the context above.
-2. Every claim must cite a source using [Source: URL] format.
-3. Structure the output according to the schema.
-4. If information is missing or insufficient, note it as "INCOMPLETE".
-5. Output ONLY valid JSON matching the schema structure."""
+2. Use Markdown formatting with ## section headers and ### subsections.
+3. Every factual claim must cite a source inline as [Source: URL].
+4. If information for a section is missing or insufficient, note it as _Information unavailable_.
+5. End with a ## Sources section listing all cited URLs.
+6. Output ONLY the Markdown document — no JSON, no code fences, no preamble."""
 
     def _run():
         return model_call("research_agent", prompt, max_tokens=4000, temperature=0.3)
@@ -190,6 +200,51 @@ def _patch_or_log(client, plan_id: int, patch: dict, label: str) -> None:
         client._patch("research_plans", plan_id, patch)
     except Exception:
         _log.debug("research_plans patch failed  plan_id=%d  label=%s", plan_id, label, exc_info=True)
+
+
+def _coerce_query_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _dedupe_queries(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in items:
+        key = q.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+    return out
+
+
+def _fallback_queries_from_gaps(topic: str, gap_analysis: dict) -> list[str]:
+    out: list[str] = []
+    for g in (gap_analysis.get("gaps_found") or []):
+        if not isinstance(g, dict):
+            continue
+        field = str(g.get("field") or "").strip()
+        needed = str(g.get("needed") or "").strip()
+        if field and needed:
+            out.append(f"{topic} {field} {needed}")
+        elif field:
+            out.append(f"{topic} {field} latest evidence")
+    if not out and topic:
+        out = [
+            f"{topic} latest statistics",
+            f"{topic} primary sources",
+            f"{topic} peer reviewed evidence",
+        ]
+    return _dedupe_queries(out)[:5]
 
 
 def run_research_agent(plan_id: int) -> dict:
@@ -275,8 +330,7 @@ def _run_research_agent_inner(
 
     # Bound the critic call the same way — without a timeout wrapper a hung
     # model_call inside analyze_gaps would stall the handler AFTER synthesis
-    # already succeeded, wasting the synthesis and sitting the row on
-    # "synthesizing" indefinitely.
+    # already succeeded, wasting the synthesis.
     critic_timeout_s = _research_timeout("critic_timeout_s", DEFAULT_CRITIC_TIMEOUT_S)
     gap_analysis = _call_with_timeout(
         analyze_gaps,
@@ -285,20 +339,47 @@ def _run_research_agent_inner(
         "critic",
     )
     if gap_analysis is None:
-        # Timed out or raised. Bail with a failure marker rather than retrying
-        # — if the model is stuck, another call won't help this iteration.
+        # Critic timed out or raised. We have a valid synthesis — save it and
+        # complete rather than discarding the work. Mark confidence as 50
+        # (unknown) so the UI can show it was an imperfect run.
+        _log.warning(
+            "research critic timeout/error — completing with synthesis result  plan_id=%d",
+            plan_id,
+        )
+        from datetime import datetime, timezone
+        paper_content = synthesis.get("content", "")
         client._patch("research_plans", plan_id, {
-            "status": "failed",
-            "error_message": f"critic timeout/error after {critic_timeout_s}s",
+            "status": "completed",
+            "paper_content": paper_content,
+            "gap_report": "{}",
+            "confidence_score": 50,
+            "iterations": iterations + 1,
+            "error_message": f"critic timeout after {critic_timeout_s}s — completed best-effort",
+            "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         })
-        return {"status": "failed", "plan_id": plan_id, "error": "critic timeout"}
+        if paper_content:
+            try:
+                from workers.post_turn import ingest_output
+                ingest_output(
+                    output=paper_content,
+                    user_text=topic,
+                    org_id=org_id,
+                    conversation_id=0,
+                    model="research_agent",
+                    rag_collection="research",
+                    knowledge_collection="research_knowledge",
+                    source="research",
+                    extra_metadata={"plan_id": plan_id, "topic": topic, "iteration": iterations + 1},
+                )
+            except Exception:
+                _log.warning("research ingest_output failed (critic timeout path)  plan_id=%d", plan_id, exc_info=True)
+        return {"status": "completed", "confidence": 50, "plan_id": plan_id, "note": "critic_timeout_best_effort"}
 
     gap_report = json.dumps(gap_analysis)
     confidence = gap_analysis.get("confidence_score", 0)
     ready = gap_analysis.get("ready_for_completion", False)
-    # `or []` guards against the model returning null for this key — `None + list`
-    # would raise TypeError on line `new_queries_list = queries + new_queries`.
-    new_queries = gap_analysis.get("new_search_requirements") or []
+    # Normalize model output so odd shapes (null/string/mixed) don't derail iteration.
+    new_queries = _coerce_query_list(gap_analysis.get("new_search_requirements") or [])
 
     new_queries_list = queries + new_queries
     updated_queries = json.dumps(new_queries_list)
@@ -360,17 +441,58 @@ def _run_research_agent_inner(
             )
             _log.info("Re-queued research agent job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
         else:
-            _log.warning("Tool queue not available, next iteration will not run for plan_id %d", plan_id)
+            _log.warning("Tool queue not available, continuing synchronously for plan_id %d", plan_id)
+            return run_research_agent(plan_id)
 
         return {"status": "needs_more_research", "confidence": confidence, "new_queries": new_queries, "plan_id": plan_id}
     else:
+        if iterations + 1 < max_iterations:
+            fallback_queries = _fallback_queries_from_gaps(topic, gap_analysis)
+            if fallback_queries:
+                merged = _dedupe_queries(queries + fallback_queries)
+                client._patch("research_plans", plan_id, {
+                    "status": "generating",
+                    "gap_report": gap_report,
+                    "confidence_score": confidence,
+                    "iterations": iterations + 1,
+                    "queries": json.dumps(merged),
+                    "error_message": "critic produced no new_search_requirements; generated fallback queries",
+                })
+                from workers.tool_queue import get_tool_queue
+                tq = get_tool_queue()
+                if tq:
+                    job_id = tq.submit(
+                        "research_agent",
+                        {"plan_id": plan_id, "org_id": org_id},
+                        source="research_agent_fallback_iteration",
+                        priority=3,
+                        org_id=org_id,
+                    )
+                    _log.info("Re-queued research agent fallback job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
+                    return {
+                        "status": "needs_more_research",
+                        "confidence": confidence,
+                        "new_queries": fallback_queries,
+                        "plan_id": plan_id,
+                        "note": "fallback_queries_generated",
+                    }
+                _log.warning("Tool queue unavailable for fallback iteration; continuing synchronously  plan_id=%d", plan_id)
+                return run_research_agent(plan_id)
+
+        # Final fallback: preserve synthesized markdown as best-effort completion
+        # instead of failing hard with an unusable row.
+        from datetime import datetime, timezone
+        paper_content = synthesis.get("content", "")
         client._patch("research_plans", plan_id, {
-            "status": "failed",
+            "status": "completed",
+            "paper_content": paper_content,
             "gap_report": gap_report,
             "confidence_score": confidence,
-            "error_message": "No new queries but not ready"
+            "iterations": iterations + 1,
+            "error_message": "No new queries produced before max iterations; completed best-effort",
+            "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         })
-        return {"status": "failed", "confidence": confidence, "plan_id": plan_id}
+        return {"status": "completed", "confidence": confidence, "plan_id": plan_id, "note": "best_effort_no_new_queries"}
 
 
 def get_next_research() -> dict | None:

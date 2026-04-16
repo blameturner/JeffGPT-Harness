@@ -173,6 +173,26 @@ class ChatAgent(BaseAgent):
                 # the LLM planner, which otherwise tends to keep picking web_search.
                 if "planned_search" in hints:
                     _log.info("chat conv=%s  planned_search fast-path", conversation_id)
+
+                    # Write user message FIRST so its NocoDB Id is lower than the
+                    # proposal message that execute() is about to create.
+                    # _find_original_question queries Id < proposal_id — the user row
+                    # must already exist in the DB before the proposal is inserted.
+                    _ps_style_key, _ = chat_style_prompt(response_style)
+                    _ps_user_written = schedule_user_message_write(
+                        db=self.db,
+                        conversation_id=conversation_id,
+                        org_id=self.org_id,
+                        user_message=user_message,
+                        model=self.model,
+                        style_key=_ps_style_key,
+                    )
+                    if not _ps_user_written.wait(timeout=10.0):
+                        _log.warning(
+                            "planned_search user message write still pending after 10s  conv=%s",
+                            conversation_id,
+                        )
+
                     plan = ToolPlan(
                         actions=[ToolAction(
                             tool=ToolName.PLANNED_SEARCH,
@@ -197,9 +217,9 @@ class ChatAgent(BaseAgent):
                         tool_context = ToolContext()
 
                     if ps_ok:
-                        # short-circuit the chat: the proposal message is already saved
-                        # with pending_approval=1; the UI polls /planned_search/{id}
-                        # and the user approves/rejects to continue.
+                        # short-circuit: proposal is already saved with pending_approval=1;
+                        # the UI polls /planned_search/{id} for the user to approve/reject.
+                        # User message was already written above so the conversation is intact.
                         emit({
                             "type": "planned_search_pending",
                             "conversation_id": conversation_id,

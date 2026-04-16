@@ -651,12 +651,12 @@ def _process_one_seed(
                      seed_source, seed_url[:80], e, exc_info=True)
         result = {"status": "error", "reason": str(e)[:200]}
 
-    # Queue the relevance classifier for scrape_target-sourced URLs. Seeds (discovery)
-    # aren't classified — they're operator-submitted roots, not candidates for rejection.
-    if seed_source == "scrape_target" and scrape_target_id:
+    # Queue the relevance classifier whenever we have a scrape_target row for this URL,
+    # regardless of whether the seed came from discovery or a direct scrape_target pick.
+    # Also nudge UpdatedAt on the scrape_target so the fallback picker rotates correctly.
+    if scrape_target_id:
         seed_text = (result.get("seed_text") or "").strip() if isinstance(result, dict) else ""
         _queue_classifier(scrape_target_id, seed_url, seed_text, org_id)
-        # Also nudge UpdatedAt so the picker rotates.
         try:
             client._patch("scrape_targets", scrape_target_id, {"active": 1})
         except Exception:
@@ -787,12 +787,26 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
     fallback = _pick_next_scrape_target_seed(client)
     if fallback:
         chain_org_id = int(fallback.get("org_id") or 0)
+        fallback_url = fallback.get("url") or ""
+        fallback_target_id = int(fallback.get("Id") or 0) or None
+
+        # Register into discovery so it is tracked and won't be re-picked
+        # as a blind fallback indefinitely. upsert_discovery_root is a no-op
+        # if the row already exists.
+        discovery_id = upsert_discovery_root(client, fallback_url, chain_org_id)
+        _log.info(
+            "pathfinder fallback scrape_target promoted to discovery  "
+            "target_id=%s discovery_id=%s url=%s",
+            fallback_target_id, discovery_id, fallback_url[:80],
+        )
+
         res = _process_one_seed(
             client,
-            seed_url=fallback.get("url") or "",
+            seed_url=fallback_url,
             org_id=chain_org_id,
-            seed_source="scrape_target",
-            scrape_target_id=int(fallback.get("Id") or 0) or None,
+            seed_source="discovery",
+            discovery_id=discovery_id,
+            scrape_target_id=fallback_target_id,
         )
         # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res

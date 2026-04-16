@@ -83,6 +83,16 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
         nca = _parse_iso(r.get("next_crawl_at"))
         if nca is None or nca <= now:
             due.append(r)
+
+    # Manual/operator-added targets (auto_crawled=0 or NULL) always go before
+    # pathfinder-discovered ones (auto_crawled=1). Within each group the existing
+    # CreatedAt ordering is preserved (oldest first).
+    def _auto_key(r: dict) -> int:
+        return 1 if r.get("auto_crawled") else 0
+
+    never.sort(key=_auto_key)
+    due.sort(key=_auto_key)
+
     _log.debug("fetch_due_targets  total=%d never=%d due=%d", len(rows), len(never), len(due))
     return (never + due)[:limit]
 
