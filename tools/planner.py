@@ -14,10 +14,11 @@ _log = logging.getLogger("tools.planner")
 
 
 SYSTEM_PROMPT = """Output ONLY valid JSON. No markdown, no prose.
-Tools: web_search(queries:[str]), rag_lookup(query:str), planned_search(question:str)
+Tools: web_search(queries:[str]), rag_lookup(query:str), planned_search(question:str), url_scraper(urls:[str], query:str)
 web_search: quick inline search, 4-5 DIVERSE queries targeting different aspects. Results in seconds. Use for direct user questions needing current info.
 rag_lookup: only when user references prior conversations.
 planned_search: proposes a query plan for the user to approve before running heavy scrape+synthesis. Use for complex multi-aspect questions, explicit research/investigate/deep-dive requests, or when the user wants to review queries before we spend compute. Do NOT combine with web_search in the same plan.
+url_scraper: scrape user-provided URLs during this turn. Use when message includes one or more links. Can be combined with web_search.
 Max 4 actions. "summary": one sentence shown to user.
 
 

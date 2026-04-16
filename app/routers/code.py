@@ -77,10 +77,10 @@ def list_codebases(org_id: int):
         prefix = f"org_{org_id}_codebase_"
         codebases = []
         if "knowledge_sources" in db.tables:
-            rows = db._get("knowledge_sources", params={
+            rows = db._get_paginated("knowledge_sources", params={
                 "where": f"(org_id,eq,{org_id})~and(type,eq,codebase)",
                 "limit": 200,
-            }).get("list", [])
+            })
             for row in rows:
                 collection_name = row.get("collection_name") or ""
                 record_count = 0

@@ -18,17 +18,23 @@ from shared.models import model_call
 _log = logging.getLogger("research.agent")
 
 DEFAULT_MAX_ITERATIONS = 3
-# Per-query ceiling for run_web_search. SEARCH_POLICY_FULL's internal budget is
-# 60s but the orchestrator only enforces that cap for CONTEXTUAL; FULL runs
-# uncapped. Without this outer timeout, one slow LLM call inside web_search
-# hangs the whole research iteration and the plan sits stuck on "synthesizing".
-_WEB_SEARCH_PER_QUERY_TIMEOUT_S = 90
-# Ceiling for the synthesis LLM call. model_call has no internal timeout.
-_SYNTHESIS_TIMEOUT_S = 300
-# Ceiling for the critic (analyze_gaps) LLM call. Same rationale as synthesis
-# — critic runs another model_call after synthesis and could hang just the
-# same. Shorter cap because the critic prompt is smaller.
-_CRITIC_TIMEOUT_S = 120
+DEFAULT_WEB_SEARCH_PER_QUERY_TIMEOUT_S = 180
+DEFAULT_SYNTHESIS_TIMEOUT_S = 1200
+DEFAULT_CRITIC_TIMEOUT_S = 480
+
+
+def _research_timeout(primary_key: str, default_s: int, *legacy_keys: str) -> int:
+    for key in (primary_key, *legacy_keys):
+        raw = get_feature("research", key, None)
+        if raw in (None, ""):
+            continue
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except Exception:
+            continue
+    return default_s
 
 
 def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict:
@@ -47,23 +53,18 @@ def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict
 
 
 def _run_web_search_with_timeout(query: str, org_id: int, intent: dict) -> tuple[str, list[dict], str] | None:
-    """Wrap run_web_search in a thread + hard timeout. Returns None on timeout
-    or exception so the caller can skip this query instead of hanging forever.
-    The orchestrator only enforces hard_cap_s for SEARCH_POLICY_CONTEXTUAL;
-    research uses SEARCH_POLICY_FULL which otherwise has no outer cap.
-
-    Important: we do NOT use `with ThreadPoolExecutor(...)` because its
-    __exit__ calls shutdown(wait=True), which would block waiting for the
-    timed-out thread to finish — defeating the timeout. Python threads
-    cannot be force-killed, so we let the hung thread leak in the
-    background (shutdown wait=False) and return control to the handler."""
+    timeout_s = _research_timeout(
+        "web_search_per_query_timeout_s",
+        DEFAULT_WEB_SEARCH_PER_QUERY_TIMEOUT_S,
+        "web_search_timeout_s",
+    )
     ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-ws")
     try:
         fut = ex.submit(run_web_search, query, org_id=org_id, intent_dict=intent)
         try:
-            return fut.result(timeout=_WEB_SEARCH_PER_QUERY_TIMEOUT_S)
+            return fut.result(timeout=timeout_s)
         except _futures.TimeoutError:
-            _log.warning("web search timeout after %ds  query=%s", _WEB_SEARCH_PER_QUERY_TIMEOUT_S, query[:60])
+            _log.warning("web search timeout after %ds  query=%s", timeout_s, query[:60])
             return None
         except Exception as e:
             _log.warning("web search failed for query: %s  error=%s", query[:40], e)
@@ -73,9 +74,6 @@ def _run_web_search_with_timeout(query: str, org_id: int, intent: dict) -> tuple
 
 
 def _fetch_fresh_context(topic: str, queries: list, org_id: int) -> tuple[str, list[dict]]:
-    """Run web_search for each query with a per-query hard timeout; return
-    aggregated context block and collected sources. A hanging query is skipped
-    rather than blocking the whole research iteration."""
     context_parts: list[str] = []
     all_sources: list[dict] = []
     intent = _research_intent_dict(topic)
@@ -93,7 +91,6 @@ def _fetch_fresh_context(topic: str, queries: list, org_id: int) -> tuple[str, l
 
 
 def _recall_accumulated(queries: list, org_id: int, n_per_query: int = 4) -> str:
-    """Pull prior web_search results from RAG across earlier iterations, deduped by URL."""
     seen: set[str] = set()
     blocks: list[str] = []
     for q in queries:
@@ -129,6 +126,7 @@ def _build_context(topic: str, fresh_queries: list, prior_queries: list, org_id:
 
 
 def _synthesize(topic: str, context: str, schema: dict, iteration: int) -> dict:
+    timeout_s = _research_timeout("synthesis_timeout_s", DEFAULT_SYNTHESIS_TIMEOUT_S)
     prompt = f"""You are a Research Synthesis Agent. Write a comprehensive research paper on the topic.
 
 TOPIC: {topic}
@@ -148,17 +146,15 @@ INSTRUCTIONS:
     def _run():
         return model_call("research_agent", prompt, max_tokens=4000, temperature=0.3)
 
-    # Same rationale as _run_web_search_with_timeout: avoid `with` so the
-    # executor doesn't block on shutdown when the LLM call hangs.
     ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-syn")
     try:
         fut = ex.submit(_run)
         try:
-            result, _ = fut.result(timeout=_SYNTHESIS_TIMEOUT_S)
+            result, _ = fut.result(timeout=timeout_s)
             return {"status": "ok", "content": result}
         except _futures.TimeoutError:
-            _log.warning("synthesis timeout after %ds  topic=%s", _SYNTHESIS_TIMEOUT_S, topic[:40])
-            return {"status": "failed", "error": f"synthesis timeout after {_SYNTHESIS_TIMEOUT_S}s"}
+            _log.warning("synthesis timeout after %ds  topic=%s", timeout_s, topic[:40])
+            return {"status": "failed", "error": f"synthesis timeout after {timeout_s}s"}
         except Exception as e:
             _log.warning("synthesis failed  topic=%s  error=%s", topic[:40], e)
             return {"status": "failed", "error": str(e)[:200]}
@@ -167,9 +163,6 @@ INSTRUCTIONS:
 
 
 def _call_with_timeout(fn, args: tuple, timeout_s: float, label: str):
-    """Generic thread+timeout wrapper. Returns the function result, or None if
-    it timed out or raised. Uses shutdown(wait=False) so a hung thread doesn't
-    block the calling handler."""
     ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"research-{label}")
     try:
         fut = ex.submit(fn, *args)
@@ -186,8 +179,6 @@ def _call_with_timeout(fn, args: tuple, timeout_s: float, label: str):
 
 
 def _safe_json_loads(raw, fallback):
-    """json.loads that never raises — returns `fallback` on any parse error.
-    Corrupt queries/schema JSON in the DB row should NOT crash the handler."""
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -195,9 +186,6 @@ def _safe_json_loads(raw, fallback):
 
 
 def _patch_or_log(client, plan_id: int, patch: dict, label: str) -> None:
-    """Best-effort row update. If the DB blips mid-run we still want the
-    handler to continue and return cleanly — the final except-path will
-    retry the terminal patch."""
     try:
         client._patch("research_plans", plan_id, patch)
     except Exception:
@@ -210,9 +198,7 @@ def run_research_agent(plan_id: int) -> dict:
 
     client = NocodbClient()
 
-    # Whole-handler guard: ANY exception — including DB errors before the status
-    # flip or bad JSON in plan fields — lands in the except path and flips the
-    # row to "failed". The plan can never be left stuck in a non-terminal state.
+
     try:
         plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
         plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
@@ -229,12 +215,6 @@ def run_research_agent(plan_id: int) -> dict:
         max_iterations = plan.get("max_iterations") or get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
         confidence_threshold = plan.get("confidence_threshold") or get_confidence_threshold()
 
-        # Status lifecycle (so the UI can see WHERE a run is stuck):
-        #   searching     -> inside _fetch_fresh_context (web_search per query)
-        #   synthesizing  -> inside _synthesize (LLM synthesis)
-        #   completed/failed/generating -> terminal or next-iteration state
-        # Previously this code flipped to "synthesizing" at entry, so every hang —
-        # even in web_search — presented as "stuck on synthesizing".
         _patch_or_log(client, plan_id, {"status": "searching"}, "searching")
 
         return _run_research_agent_inner(
@@ -297,10 +277,11 @@ def _run_research_agent_inner(
     # model_call inside analyze_gaps would stall the handler AFTER synthesis
     # already succeeded, wasting the synthesis and sitting the row on
     # "synthesizing" indefinitely.
+    critic_timeout_s = _research_timeout("critic_timeout_s", DEFAULT_CRITIC_TIMEOUT_S)
     gap_analysis = _call_with_timeout(
         analyze_gaps,
         (topic, synthesis.get("content", ""), schema, context),
-        _CRITIC_TIMEOUT_S,
+        critic_timeout_s,
         "critic",
     )
     if gap_analysis is None:
@@ -308,7 +289,7 @@ def _run_research_agent_inner(
         # — if the model is stuck, another call won't help this iteration.
         client._patch("research_plans", plan_id, {
             "status": "failed",
-            "error_message": f"critic timeout/error after {_CRITIC_TIMEOUT_S}s",
+            "error_message": f"critic timeout/error after {critic_timeout_s}s",
         })
         return {"status": "failed", "plan_id": plan_id, "error": "critic timeout"}
 
@@ -372,9 +353,10 @@ def _run_research_agent_inner(
         if tq:
             job_id = tq.submit(
                 "research_agent",
-                {"plan_id": plan_id},
+                {"plan_id": plan_id, "org_id": org_id},
                 source="research_agent_iteration",
                 priority=3,
+                org_id=org_id,
             )
             _log.info("Re-queued research agent job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
         else:

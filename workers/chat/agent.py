@@ -158,6 +158,7 @@ class ChatAgent(BaseAgent):
                     "web_search": "web search",
                     "rag_lookup": "conversation history lookup",
                     "planned_search": "planned search (awaiting approval)",
+                    "url_scraper": "URL scraping",
                 }
                 hint_names = [tool_labels.get(h, h) for h in sorted(hints)]
                 instant_summary = f"Running {', '.join(hint_names)} for: {user_message[:80]}"
@@ -222,11 +223,47 @@ class ChatAgent(BaseAgent):
                     hints = set()
 
                 # tools dispatchable without the planner (no model-generated params needed)
-                _DIRECT_TOOLS = {"web_search", "rag_lookup"}
+                _DIRECT_TOOLS = {"web_search", "rag_lookup", "url_scraper"}
 
                 if hints and hints <= _DIRECT_TOOLS:
                     _log.info("chat conv=%s  search fast-path  tools=%s", conversation_id, sorted(hints))
+                    pre_results = []
+
+                    # If the user included URLs AND asked for search, scrape URLs first
+                    # so synthesis sees those page contents before web_search context.
+                    if "url_scraper" in hints and len(hints) > 1:
+                        pre_plan = ToolPlan(
+                            actions=[ToolAction(
+                                tool=ToolName.URL_SCRAPER,
+                                params={
+                                    "query": user_message,
+                                    "_org_id": self.org_id,
+                                    "_collection": collection_name,
+                                },
+                                reason="scrape user-provided URLs",
+                            )],
+                            summary=instant_summary,
+                        )
+                        try:
+                            pre_ctx = asyncio.run(execute_plan(pre_plan, emit))
+                            pre_results = pre_ctx.results
+                        except Exception:
+                            _log.error("chat conv=%s  url_scraper pre-run failed", conversation_id, exc_info=True)
+                        hints = set(hints)
+                        hints.discard("url_scraper")
+
                     actions: list[ToolAction] = []
+
+                    if "url_scraper" in hints:
+                        actions.append(ToolAction(
+                            tool=ToolName.URL_SCRAPER,
+                            params={
+                                "query": user_message,
+                                "_org_id": self.org_id,
+                                "_collection": collection_name,
+                            },
+                            reason="scrape user-provided URLs",
+                        ))
 
                     if "web_search" in hints:
                         convo_topics = extract_conversation_topics(history)
@@ -274,11 +311,15 @@ class ChatAgent(BaseAgent):
                         plan = ToolPlan(actions=actions, summary=instant_summary)
                         try:
                             tool_context = asyncio.run(execute_plan(plan, emit))
+                            if pre_results:
+                                tool_context.results = pre_results + tool_context.results
                             ok = sum(1 for r in tool_context.results if r.ok)
                             _log.info("chat conv=%s  search complete  results=%d/%d elapsed=%.2fs", conversation_id, ok, len(tool_context.results), time.perf_counter() - _t_tools)
                         except Exception:
                             _log.error("chat conv=%s  search failed", conversation_id, exc_info=True)
                             tool_context = ToolContext()
+                    elif pre_results:
+                        tool_context = ToolContext(plan_summary=instant_summary, results=pre_results)
                 elif hints:
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""

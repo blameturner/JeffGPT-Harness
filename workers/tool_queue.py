@@ -56,6 +56,21 @@ def _backoff_for_priority(priority: int) -> float:
     return _DEFAULT_PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
 
 
+def _additional_idle_for_job_type(job_type: str) -> float:
+    """Per-job-type additive idle gate (seconds), layered on top of priority backoff.
+    Lets us keep one global chat-idle floor while slowing especially heavy types."""
+    try:
+        from infra.config import get_feature
+        per_type = get_feature("tool_queue", "job_type_additional_idle_seconds", None)
+        if isinstance(per_type, dict):
+            val = per_type.get(job_type)
+            if val is not None:
+                return max(0.0, float(val))
+    except Exception:
+        pass
+    return 0.0
+
+
 # legacy aliases used elsewhere in this module (kept for compatibility)
 _PRIORITY_BACKOFF = _DEFAULT_PRIORITY_BACKOFF
 
@@ -218,6 +233,14 @@ class ToolJobQueue:
         if not config:
             raise ValueError(f"unknown job type: {job_type}")
 
+        if not org_id:
+            payload_org = payload.get("org_id") if isinstance(payload, dict) else None
+            if payload_org not in (None, ""):
+                try:
+                    org_id = int(payload_org)
+                except Exception:
+                    org_id = 0
+
         if config.dedup_key and not depends_on:
             dedup_val = payload.get(config.dedup_key, "")
             if dedup_val:
@@ -271,7 +294,7 @@ class ToolJobQueue:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
                 return {"error": "table not found"}
-            rows = db._get(NOCODB_TABLE, params={"limit": 500}).get("list", [])
+            rows = db._get_paginated(NOCODB_TABLE, params={"limit": 500})
         except Exception:
             return {"error": "db query failed"}
 
@@ -437,7 +460,7 @@ class ToolJobQueue:
                 idle = seconds_since_chat()
                 # pre-claim gate uses the smallest backoff so p1 isn't blocked here;
                 # real priority-specific threshold is enforced post-claim below
-                min_gate = _backoff_for_priority(1)
+                min_gate = _backoff_for_priority(1) + _additional_idle_for_job_type(job_type)
                 if idle < min_gate:
                     if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
                         _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
@@ -475,7 +498,7 @@ class ToolJobQueue:
             # per-job backoff: unclaim and sleep if priority threshold not met
             if job_type != "scrape":
                 idle = seconds_since_chat()
-                required = _backoff_for_priority(job.priority)
+                required = _backoff_for_priority(job.priority) + _additional_idle_for_job_type(job_type)
                 if idle < required:
                     wait_secs = min(required - idle, 60)
                     _log.info("queue %s: job %s (priority=%d) needs %.0fs idle, currently %.0fs — sleeping %.0fs",
@@ -551,10 +574,10 @@ class ToolJobQueue:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
                 return
-            rows = db._get(NOCODB_TABLE, params={
+            rows = db._get_paginated(NOCODB_TABLE, params={
                 "where": "(status,eq,running)",
                 "limit": 100,
-            }).get("list", [])
+            })
             now = time.time()
             for row in rows:
                 started = row.get("started_at") or ""
@@ -689,10 +712,10 @@ class ToolJobQueue:
 
             # url dedup has to filter in python — nocodb where-clauses choke on urls with special chars
             if key == "url":
-                rows = db._get(NOCODB_TABLE, params={
+                rows = db._get_paginated(NOCODB_TABLE, params={
                     "where": f"(type,eq,{job_type})~and(status,in,queued,running)",
                     "limit": 200,
-                }).get("list", [])
+                })
                 for row in rows:
                     pj = row.get("payload_json") or "{}"
                     if isinstance(pj, str):
@@ -736,10 +759,10 @@ class ToolJobQueue:
             if NOCODB_TABLE not in db.tables:
                 _log.info("table %s not found — starting with empty queue", NOCODB_TABLE)
                 return
-            rows = db._get(NOCODB_TABLE, params={
+            rows = db._get_paginated(NOCODB_TABLE, params={
                 "where": "(status,eq,running)",
                 "limit": 200,
-            }).get("list", [])
+            })
             for row in rows:
                 noco_id = row.get("Id")
                 db._patch(NOCODB_TABLE, noco_id, {

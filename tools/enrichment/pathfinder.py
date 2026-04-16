@@ -436,7 +436,7 @@ def discover(
                     }
                     if depth == 0 and discovery_root_id:
                         payload["discovery_id"] = discovery_root_id
-                    tq.submit("summarise_page", payload, source="pathfinder", priority=4)
+                    tq.submit("summarise_page", payload, source="pathfinder", priority=4, org_id=org_id)
             except Exception:
                 _log.warning("summarise queue failed  url=%s", record_url[:80], exc_info=True)
 

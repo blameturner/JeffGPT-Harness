@@ -58,14 +58,14 @@ def stats_usage(org_id: int, period: str = "30d"):
     # nocodb's where parser rejects gte filters on the CreatedAt system column in this version,
     # so fetch by org_id and filter by date in Python on the way out.
     try:
-        rows = db._get("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000}).get("list", [])
+        rows = db._get_paginated("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
         messages = [r for r in rows if _within_period(r)]
     except Exception:
         _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
         messages = []
 
     try:
-        rows = db._get("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000}).get("list", [])
+        rows = db._get_paginated("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
         runs = [r for r in rows if _within_period(r)]
     except Exception:
         _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)

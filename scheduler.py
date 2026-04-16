@@ -10,7 +10,6 @@ _log = logging.getLogger("scheduler")
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from infra.config import NOCODB_BASE_ID, NOCODB_TOKEN, NOCODB_URL
 
 _scheduler: BackgroundScheduler | None = None
 AGENT_JOB_PREFIX = "agent_schedule_"
@@ -19,23 +18,14 @@ AGENT_JOB_PREFIX = "agent_schedule_"
 def _fetch_agent_schedules() -> list[dict]:
     _log.debug("fetching agent_schedules from nocodb")
     try:
-        meta = requests.get(
-            f"{NOCODB_URL}/api/v1/db/meta/projects/{NOCODB_BASE_ID}/tables",
-            headers={"xc-token": NOCODB_TOKEN},
-            timeout=10,
-        )
-        meta.raise_for_status()
-        tables = {t["title"]: t["id"] for t in meta.json()["list"]}
-        if "agent_schedules" not in tables:
+        from infra.nocodb_client import NocodbClient
+        client = NocodbClient()
+        if "agent_schedules" not in client.tables:
             return []
-        data = requests.get(
-            f"{NOCODB_URL}/api/v1/db/data/noco/{NOCODB_BASE_ID}/{tables['agent_schedules']}",
-            headers={"xc-token": NOCODB_TOKEN},
-            params={"where": "(active,eq,1)", "limit": 500},
-            timeout=10,
-        )
-        data.raise_for_status()
-        return data.json().get("list", [])
+        return client._get_paginated("agent_schedules", params={
+            "where": "(active,eq,1)",
+            "limit": 500,
+        })
     except Exception as e:
         _log.error("fetch agent_schedules failed: %s", e)
         return []

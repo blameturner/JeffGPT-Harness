@@ -143,12 +143,21 @@ def research_agent_run(req: ResearchAgentRequest):
         from tools.research.agent import run_research_agent
         result = run_research_agent(req.plan_id)
         return {"status": result.get("status"), **result}
-    
+
+    org_id = 0
+    try:
+        row = NocodbClient()._get("research_plans", params={"where": f"(Id,eq,{req.plan_id})", "limit": 1})
+        plan = row.get("list", [])[0] if row.get("list") else None
+        org_id = int((plan or {}).get("org_id") or 0)
+    except Exception:
+        _log.warning("research_agent_run org lookup failed  plan_id=%d", req.plan_id, exc_info=True)
+
     job_id = tq.submit(
         "research_agent",
-        {"plan_id": req.plan_id},
+        {"plan_id": req.plan_id, "org_id": org_id},
         source="enrichment_api",
-        priority=3
+        priority=3,
+        org_id=org_id,
     )
     return {"status": "queued", "job_id": job_id}
 
@@ -193,8 +202,8 @@ def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
     else:
         params["where"] = f"(org_id,eq,{org_id})"
 
-    data = client._get("discovery", params=params)
-    return {"status": "ok", "rows": data.get("list", [])}
+    rows = client._get_paginated("discovery", params=params)
+    return {"status": "ok", "rows": rows}
 
 
 @router.get("/research-plans/list")
@@ -209,8 +218,8 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
     else:
         params["where"] = f"(org_id,eq,{org_id})"
 
-    data = client._get("research_plans", params=params)
-    return {"status": "ok", "rows": data.get("list", [])}
+    rows = client._get_paginated("research_plans", params=params)
+    return {"status": "ok", "rows": rows}
 
 
 @router.get("/research-plans/{plan_id}")
@@ -244,5 +253,5 @@ def scrape_targets_list(org_id: int, status: str | None = None, active_only: boo
         "limit": limit,
         "sort": "-CreatedAt",
     }
-    data = client._get("scrape_targets", params=params)
-    return {"status": "ok", "rows": data.get("list", [])}
+    rows = client._get_paginated("scrape_targets", params=params)
+    return {"status": "ok", "rows": rows}

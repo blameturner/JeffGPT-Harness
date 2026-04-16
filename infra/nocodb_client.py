@@ -45,6 +45,24 @@ class NocodbClient:
         response.raise_for_status()
         return response.json()
 
+    def _get_paginated(self, table: str, params: dict, page_size: int = 50) -> list[dict]:
+        # NocoDB expands M2M links as one UNION ALL subquery per row. Large pages
+        # hit SQLite's compound-SELECT cap, so we fetch in small chunks.
+        out: list[dict] = []
+        offset = 0
+        target = int(params.get("limit", 500))
+        base = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+        while len(out) < target:
+            chunk_size = min(page_size, target - len(out))
+            chunk = self._get(table, params={**base, "limit": chunk_size, "offset": offset})
+            rows = chunk.get("list", [])
+            out.extend(rows)
+            page_info = chunk.get("pageInfo") or {}
+            if page_info.get("isLastPage") or len(rows) < chunk_size:
+                break
+            offset += len(rows)
+        return out
+
     def _post(self, table: str, data: dict) -> dict:
         _log.debug("db write  %s", table)
         response = requests.post(
@@ -80,11 +98,10 @@ class NocodbClient:
         return response.json()
 
     def list_agents(self, org_id: int, limit: int = 200) -> list[dict]:
-        data = self._get("agents", params={
+        rows = self._get_paginated("agents", params={
             "where": f"(org_id,eq,{org_id})~and(deleted_at,is,null)",
             "limit": limit,
         })
-        rows = data.get("list", [])
         _log.debug("list_agents  org=%d count=%d", org_id, len(rows))
         return rows
 
@@ -184,20 +201,18 @@ class NocodbClient:
         return self._patch("conversations", conversation_id, {"Id": conversation_id, **data})
 
     def list_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
-        data = self._get("conversations", params={
+        return self._get_paginated("conversations", params={
             "where": f"(org_id,eq,{org_id})",
             "sort": "-CreatedAt",
             "limit": limit,
         })
-        return data.get("list", [])
 
     def list_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
-        data = self._get("messages", params={
+        return self._get_paginated("messages", params={
             "where": f"(conversation_id,eq,{conversation_id})",
             "sort": "CreatedAt",
             "limit": limit,
         })
-        return data.get("list", [])
 
     def add_message(
         self,
@@ -283,7 +298,7 @@ class NocodbClient:
         params: dict = {"sort": "source_index", "limit": 500}
         if parts:
             params["where"] = "~and".join(parts)
-        return self._get("message_search_sources", params=params).get("list", [])
+        return self._get_paginated("message_search_sources", params=params)
 
     def create_code_conversation(
         self,
@@ -315,20 +330,18 @@ class NocodbClient:
         return self._patch("code_conversations", conversation_id, {"Id": conversation_id, **data})
 
     def list_code_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
-        data = self._get("code_conversations", params={
+        return self._get_paginated("code_conversations", params={
             "where": f"(org_id,eq,{org_id})",
             "sort": "-CreatedAt",
             "limit": limit,
         })
-        return data.get("list", [])
 
     def list_code_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
-        data = self._get("code_messages", params={
+        return self._get_paginated("code_messages", params={
             "where": f"(conversation_id,eq,{conversation_id})",
             "sort": "CreatedAt",
             "limit": limit,
         })
-        return data.get("list", [])
 
     def add_code_message(
         self,
@@ -363,11 +376,10 @@ class NocodbClient:
 
     def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:
         try:
-            data = self._get(table, params={
+            return self._get_paginated(table, params={
                 "where": f"(conversation_id,eq,{conversation_id})",
                 "limit": limit,
             })
-            return data.get("list", [])
         except (requests.HTTPError, KeyError):
             _log.debug("_list_by_conversation  table=%s conv=%d returned empty (table may lack column)", table, conversation_id)
             return []
@@ -383,11 +395,10 @@ class NocodbClient:
 
     def list_observations_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
         try:
-            data = self._get("observations", params={
+            return self._get_paginated("observations", params={
                 "where": f"(conversation_id,eq,{conversation_id})",
                 "limit": limit,
             })
-            return data.get("list", [])
         except requests.HTTPError:
             _log.debug("list_observations  conv=%d returned empty (table may lack column)", conversation_id)
             return []

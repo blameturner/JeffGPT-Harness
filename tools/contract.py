@@ -9,6 +9,7 @@ class ToolName(str, Enum):
     WEB_SEARCH = "web_search"
     RAG_LOOKUP = "rag_lookup"
     PLANNED_SEARCH = "planned_search"
+    URL_SCRAPER = "url_scraper"
 
 
 class ToolAction(BaseModel):

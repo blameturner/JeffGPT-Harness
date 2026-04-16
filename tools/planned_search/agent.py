@@ -10,6 +10,7 @@ from infra.nocodb_client import NocodbClient
 from tools.contract import ToolName, ToolResult
 from tools.dispatcher import register_executor
 from tools.planned_search.planner import generate_planned_queries
+from tools.scraper.pathfinder import PathfinderScraper
 from tools.search.engine import searxng_search
 
 _log = logging.getLogger("planned_search.agent")
@@ -26,9 +27,15 @@ _log = logging.getLogger("planned_search.agent")
 # we have headroom after block-page/stub drops.
 _PLANNED_SEARXNG_PER_QUERY = 10
 _PLANNED_RELEVANCE_THRESHOLD = 0.25
-# Hard ceiling for synthesis — matches research agent's timeout policy.
-_PLANNED_SYNTHESIS_TIMEOUT_S = 300
-_PLANNED_PLANNER_TIMEOUT_S = 60
+
+
+def _planned_timeout_s(key: str, default_s: int) -> int:
+    raw = get_feature("planned_search", key, default_s)
+    try:
+        val = int(raw)
+        return val if val > 0 else default_s
+    except Exception:
+        return default_s
 
 
 def _planned_max_urls() -> int:
@@ -213,6 +220,11 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
     try:
         msgs = client._get("messages", params={"where": f"(Id,eq,{message_id})", "limit": 1})
         msg_row = (msgs.get("list") or [{}])[0]
+        row_org_id = int(msg_row.get("org_id") or 0)
+        if not row_org_id:
+            return {"status": "error", "message": "Message has no org_id"}
+        if int(org_id or 0) != row_org_id:
+            return {"status": "error", "message": "org_id mismatch for message"}
         query_content = msg_row.get("content") or "{}"
     except Exception:
         return {"status": "error", "message": "Message not found"}
@@ -238,20 +250,52 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
     if tq:
         job_id = tq.submit(
             "planned_search_execute",
-            {"message_id": message_id, "org_id": org_id},
+            {"message_id": message_id, "org_id": row_org_id},
             source="planned_search_api",
             priority=2,
+            org_id=row_org_id,
         )
         _log.info("Queued planned_search job %s for message_id %s", job_id, message_id)
         return {"status": "queued", "message_id": message_id, "job_id": job_id}
 
     _log.warning("Tool queue not available, running planned_search synchronously for message_id %s", message_id)
-    return await _run_planned_search_async(message_id, org_id)
+    return await _run_planned_search_async(message_id, row_org_id)
 
 
 def run_planned_search_job(message_id: int, org_id: int) -> dict:
     """Tool-queue handler entry point: runs the async worker on a worker thread via asyncio.run."""
     return asyncio.run(_run_planned_search_async(message_id, org_id))
+
+
+def run_planned_search_scrape_job(payload: dict) -> dict:
+    url = (payload.get("url") or "").strip()
+    title = (payload.get("title") or "").strip()
+    org_id = int(payload.get("org_id") or 0)
+    query_keywords = set((payload.get("query_keywords") or []))
+
+    if not url:
+        return {"status": "error", "reason": "missing_url"}
+
+    scraper = PathfinderScraper()
+    scraped = scraper.scrape(url)
+    if scraped.get("status") != "ok" or not scraped.get("text"):
+        return {"status": "failed", "reason": scraped.get("error") or "scrape_failed", "url": url}
+
+    text = scraped.get("text", "")
+    if _looks_like_block_page(text):
+        return {"status": "failed", "reason": "block_page", "url": url}
+
+    snippet = text[:1000]
+    ratio, label = _score_against_keywords(f"{title} {snippet}", query_keywords)
+    return {
+        "status": "ok",
+        "url": scraped.get("canonical") or url,
+        "title": title,
+        "snippet": snippet,
+        "relevance": label,
+        "relevance_score": ratio,
+        "org_id": org_id,
+    }
 
 
 async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
@@ -296,37 +340,94 @@ async def _run_planned_search_async(message_id: int, org_id: int) -> dict:
 
     needed = get_feature("planned_search", "successful_scrapes_needed", 10)
 
-    from tools.scraper.pathfinder import PathfinderScraper
-
-    scraper = PathfinderScraper()
     scraped_results: list[dict] = []
-
-    def _scrape(url: str) -> dict:
-        return scraper.scrape(url)
-
-    for r in results:
-        if len(scraped_results) >= needed:
-            break
-        url = (r.get("url") or "").strip()
-        if not url:
-            continue
-        scraped = await asyncio.to_thread(_scrape, url)
-        if scraped.get("status") == "ok" and scraped.get("text"):
-            text = scraped.get("text", "")
-            if _looks_like_block_page(text):
-                _log.info("planned_search drop  reason=block_page  url=%s chars=%d",
-                          url[:100], len(text))
+    from workers.tool_queue import get_tool_queue
+    tq = get_tool_queue()
+    if tq:
+        scrape_job_ids: list[str] = []
+        keywords_payload = sorted(query_keywords)
+        for r in results:
+            url = (r.get("url") or "").strip()
+            if not url:
                 continue
-            title = r.get("title", "")
-            snippet = text[:1000]
-            ratio, label = _score_against_keywords(f"{title} {snippet}", query_keywords)
-            scraped_results.append({
-                "url": scraped.get("canonical") or url,
-                "title": title,
-                "snippet": snippet,
-                "relevance": label,
-                "relevance_score": ratio,
-            })
+            job_id = tq.submit(
+                "planned_search_scrape",
+                {
+                    "url": url,
+                    "title": r.get("title", ""),
+                    "org_id": org_id,
+                    "query_keywords": keywords_payload,
+                },
+                source="planned_search_execute",
+                priority=2,
+                org_id=org_id,
+            )
+            scrape_job_ids.append(job_id)
+
+        scrape_timeout_s = _planned_timeout_s("scrape_timeout_s", 1800)
+        deadline = time.time() + scrape_timeout_s
+        pending = set(scrape_job_ids)
+        while pending and len(scraped_results) < needed and time.time() < deadline:
+            finished: list[str] = []
+            for job_id in pending:
+                job = tq.get_job(job_id)
+                if not job or job.status in ("queued", "running"):
+                    continue
+                finished.append(job_id)
+                if job.status == "completed":
+                    res = job.result or {}
+                    if res.get("status") == "ok":
+                        scraped_results.append({
+                            "url": res.get("url", ""),
+                            "title": res.get("title", ""),
+                            "snippet": res.get("snippet", ""),
+                            "relevance": res.get("relevance", "unknown"),
+                            "relevance_score": res.get("relevance_score", 0.0),
+                        })
+                        if len(scraped_results) >= needed:
+                            break
+            for job_id in finished:
+                pending.discard(job_id)
+            if pending and len(scraped_results) < needed:
+                await asyncio.sleep(1)
+        if pending and len(scraped_results) < needed:
+            _log.warning(
+                "planned_search scrape phase timeout after %ds  completed=%d/%d",
+                scrape_timeout_s,
+                len(scrape_job_ids) - len(pending),
+                len(scrape_job_ids),
+            )
+    else:
+        from tools.scraper.pathfinder import PathfinderScraper
+
+        scraper = PathfinderScraper()
+
+        def _scrape(url: str) -> dict:
+            return scraper.scrape(url)
+
+        for r in results:
+            if len(scraped_results) >= needed:
+                break
+            url = (r.get("url") or "").strip()
+            if not url:
+                continue
+            scraped = await asyncio.to_thread(_scrape, url)
+            if scraped.get("status") == "ok" and scraped.get("text"):
+                text = scraped.get("text", "")
+                if _looks_like_block_page(text):
+                    _log.info("planned_search drop  reason=block_page  url=%s chars=%d",
+                              url[:100], len(text))
+                    continue
+                title = r.get("title", "")
+                snippet = text[:1000]
+                ratio, label = _score_against_keywords(f"{title} {snippet}", query_keywords)
+                scraped_results.append({
+                    "url": scraped.get("canonical") or url,
+                    "title": title,
+                    "snippet": snippet,
+                    "relevance": label,
+                    "relevance_score": ratio,
+                })
 
     conversation_id = msg_row.get("conversation_id") or 0
     for src in scraped_results:
@@ -500,13 +601,14 @@ async def _synthesize_answer(question: str, sources: list[dict]) -> tuple[str, i
     # model_call has no internal timeout; wrap in asyncio.wait_for so the whole
     # planned_search job can't hang on a stalled LLM. Same policy as research.
     try:
+        timeout_s = _planned_timeout_s("synthesis_timeout_s", 1800)
         raw, tokens = await asyncio.wait_for(
             asyncio.to_thread(model_call, "planned_search_answer", prompt, True),
-            timeout=_PLANNED_SYNTHESIS_TIMEOUT_S,
+            timeout=timeout_s,
         )
         return (raw or "").strip(), tokens or 0
     except asyncio.TimeoutError:
-        _log.warning("planned_search synthesis timeout after %ds", _PLANNED_SYNTHESIS_TIMEOUT_S)
+        _log.warning("planned_search synthesis timeout after %ds", timeout_s)
         return "", 0
     except Exception:
         _log.warning("planned_search synthesis failed", exc_info=True)
@@ -550,19 +652,25 @@ def get_search_results(message_id: int, org_id: int) -> dict:
     client = NocodbClient()
 
     try:
+        msgs = client._get("messages", params={"where": f"(Id,eq,{message_id})", "limit": 1})
+        msg_row = (msgs.get("list") or [{}])[0]
+        row_org_id = int(msg_row.get("org_id") or 0)
+        if not row_org_id:
+            return {"status": "error", "message": "Message has no org_id"}
+        if int(org_id or 0) != row_org_id:
+            return {"status": "error", "message": "org_id mismatch for message"}
+    except Exception:
+        return {"status": "error", "message": "Message not found"}
+
+    try:
         sources = client.list_message_search_sources(message_id=message_id)
     except Exception:
         return {"status": "error", "message": "Failed to get sources"}
 
     search_status = None
     source_count = None
-    try:
-        msgs = client._get("messages", params={"where": f"(Id,eq,{message_id})", "limit": 1})
-        msg_row = (msgs.get("list") or [{}])[0]
-        search_status = msg_row.get("search_status")
-        source_count = msg_row.get("search_source_count")
-    except Exception:
-        _log.warning("planned_search status lookup failed  id=%s", message_id, exc_info=True)
+    search_status = msg_row.get("search_status")
+    source_count = msg_row.get("search_source_count")
 
     return {
         "status": "ok",

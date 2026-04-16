@@ -65,6 +65,8 @@ _PLANNED_SEARCH = re.compile(
     r"landscape|survey of)\b",
     re.I,
 )
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 # NOTE: an earlier version of this regex also matched "analysis of", "compare",
 # "vs", "best resources/tools/...", "how do i learn|use|choose|pick|evaluate",
 # "guide to", "tutorial on", etc. That was far too broad — common chat
@@ -88,6 +90,8 @@ def gate_check(
 
     if _definitely_no_search(msg):
         hints: set[str] = set()
+        if _URL_IN_TEXT.search(msg):
+            hints.add("url_scraper")
         if _RAG_LOOKUP.search(msg):
             hints.add("rag_lookup")
         if conversation_context and _FOLLOW_UP.search(msg):
@@ -105,6 +109,8 @@ def gate_check(
         return hints
 
     hints: set[str] = set()
+    if _URL_IN_TEXT.search(msg):
+        hints.add("url_scraper")
     if _explicit_search_intent(msg)[0] or _EXTRA_SEARCH.search(msg):
         hints.add("web_search")
     if _RAG_LOOKUP.search(msg):

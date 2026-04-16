@@ -5,19 +5,21 @@ import time
 
 import httpx
 
-from infra.config import MODELS, REASONER_ROLE, get_function_config, no_think_params
+from infra.config import MODELS, REASONER_ROLE, get_feature, get_function_config, no_think_params
 from shared.model_pool import acquire_model, acquire_role
 
 _log = logging.getLogger("workers.models")
 
-# 3600s (1 hour) was the prior value and caused every LLM call in the system —
-# research synthesis, critic, planner, summariser, classifier, intent, chat
-# summariser, tool_planner, etc. — to potentially sit for 60 minutes on a
-# stalled model. 900s (15 min) is long enough for a slow CPU-bound synthesis
-# on a busy local model but fast enough to bail out while the user still cares.
-# Higher-level callers (research, planned_search) apply tighter per-call caps
-# on top of this floor.
-FAST_TIMEOUT = 900
+DEFAULT_FAST_TIMEOUT = 900
+
+
+def _http_timeout_s() -> int:
+    raw = get_feature("models", "http_timeout_s", DEFAULT_FAST_TIMEOUT)
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_FAST_TIMEOUT
+    except Exception:
+        return DEFAULT_FAST_TIMEOUT
 
 # chat-only functions bypass the reasoner guard below
 _CHAT_ONLY_FUNCTIONS = frozenset({"chat", "code"})
@@ -67,7 +69,7 @@ def _raw_model_call(
         r = httpx.post(
             f"{url}/v1/chat/completions",
             json=params,
-            timeout=FAST_TIMEOUT,
+            timeout=_http_timeout_s(),
         )
         r.raise_for_status()
         data = r.json()
@@ -88,9 +90,10 @@ def _raw_model_call(
         )
         return "", 0
     except httpx.TimeoutException:
+        timeout_s = _http_timeout_s()
         _log.error(
             "%s timeout after %ds from %s (prompt_len=%d)",
-            label, FAST_TIMEOUT, url, len(prompt),
+            label, timeout_s, url, len(prompt),
         )
         return "", 0
     except Exception:

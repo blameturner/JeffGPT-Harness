@@ -17,6 +17,15 @@
     "tools_framework": true,
     "search_extraction": true,
     "intent_classifier": true,
+    "url_scraper": {
+      "enabled": true,
+      "max_urls_per_turn": 3,
+      "max_links_per_url": 30,
+      "scrape_timeout_s": 60
+    },
+    "models": {
+      "http_timeout_s": 3600
+    },
     "scraper": {
       "enabled": true,
       "batch_size": 10,
@@ -37,6 +46,10 @@
       "agent_enabled": true,
       "max_queries": 20,
       "max_iterations": 3,
+      "planner_timeout_s": 1800,
+      "web_search_per_query_timeout_s": 600,
+      "synthesis_timeout_s": 3600,
+      "critic_timeout_s": 1800,
       "confidence_threshold": 80,
       "models": {
         "research_planner": { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
@@ -46,6 +59,8 @@
     "planned_search": {
       "enabled": true,
       "successful_scrapes_needed": 10,
+      "scrape_timeout_s": 1800,
+      "synthesis_timeout_s": 1800,
       "models": {
         "planned_search":        { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
         "planned_search_answer": { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 }
@@ -72,13 +87,17 @@
     },
     "tool_queue": {
       "priority_backoff_seconds": {
-        "1": 600,
-        "2": 600,
-        "3": 600,
-        "4": 600,
-        "5": 600
+        "1": 120,
+        "2": 120,
+        "3": 120,
+        "4": 120,
+        "5": 120
       },
-      "default_backoff_seconds": 600
+      "default_backoff_seconds": 120,
+      "job_type_additional_idle_seconds": {
+        "summarise_page": 180,
+        "pathfinder_crawl": 1080
+      }
     }
   }
 }

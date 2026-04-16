@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import concurrent.futures as _futures
 
 from infra.config import get_feature
 from shared.models import model_call
@@ -8,6 +9,16 @@ from shared.models import model_call
 _log = logging.getLogger("research_planner")
 
 DEFAULT_MAX_QUERIES = 20
+DEFAULT_PLANNER_TIMEOUT_S = 1200
+
+
+def _planner_timeout_s() -> int:
+    raw = get_feature("research", "planner_timeout_s", DEFAULT_PLANNER_TIMEOUT_S)
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_PLANNER_TIMEOUT_S
+    except Exception:
+        return DEFAULT_PLANNER_TIMEOUT_S
 
 
 def _strip_fence(raw: str) -> str:
@@ -70,11 +81,24 @@ Generate a JSON research plan with:
 
 Respond with ONLY valid JSON, no explanation, no markdown."""
 
+    timeout_s = _planner_timeout_s()
+
+    def _run():
+        return model_call("research_planner", prompt)
+
+    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-plan")
     try:
-        result, _ = model_call("research_planner", prompt)
-    except Exception as e:
-        _log.warning("plan generation failed  topic=%s  error=%s", topic[:40], e)
-        return {"error": str(e)[:200]}
+        fut = ex.submit(_run)
+        try:
+            result, _ = fut.result(timeout=timeout_s)
+        except _futures.TimeoutError:
+            _log.warning("planner timeout after %ds  topic=%s", timeout_s, topic[:40])
+            return {"error": f"planner timeout after {timeout_s}s"}
+        except Exception as e:
+            _log.warning("plan generation failed  topic=%s  error=%s", topic[:40], e)
+            return {"error": str(e)[:200]}
+    finally:
+        ex.shutdown(wait=False)
 
     if not result:
         return {"error": "empty model response"}
@@ -125,9 +149,10 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
     if tq:
         job_id = tq.submit(
             "research_planner",
-            {"plan_id": plan_id},
+            {"plan_id": plan_id, "org_id": org_id},
             source="research_api",
             priority=3,
+            org_id=org_id,
         )
         _log.info("Queued research planner job %s for plan_id %d", job_id, plan_id)
         return {"status": "queued", "plan_id": plan_id, "job_id": job_id}
@@ -182,11 +207,13 @@ def run_research_planner_job(plan_id: int) -> dict:
 
     tq = get_tool_queue()
     if tq:
+        plan_org_id = int(plan.get("org_id") or 0)
         job_id = tq.submit(
             "research_agent",
-            {"plan_id": plan_id},
+            {"plan_id": plan_id, "org_id": plan_org_id},
             source="research_planner",
             priority=3,
+            org_id=plan_org_id,
         )
         _log.info("Queued research agent job %s for plan_id %d", job_id, plan_id)
     else:
