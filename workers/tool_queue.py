@@ -21,6 +21,8 @@ NOCODB_TABLE = "tool_jobs"
 # the config-driven overrides are the source of truth at runtime.
 _DEFAULT_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 60, 3: 60, 4: 120, 5: 120}
 _DEFAULT_BACKOFF = 300.0
+_DEFAULT_STRICT_CHAT_IDLE_S = 600.0
+_DEFAULT_STARTUP_GRACE_S = 600.0
 
 _last_chat_activity: float = 0.0
 _activity_lock = threading.Lock()
@@ -69,6 +71,35 @@ def _additional_idle_for_job_type(job_type: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _strict_chat_idle_floor_s() -> float:
+    """Hard minimum idle time before ANY queued job can run.
+    This is layered on top of per-priority backoff and is intentionally strict
+    so chat/code traffic always gets first access to model slots."""
+    try:
+        from infra.config import get_feature
+        raw = get_feature("tool_queue", "strict_chat_idle_seconds", _DEFAULT_STRICT_CHAT_IDLE_S)
+        val = float(raw)
+        return val if val > 0 else _DEFAULT_STRICT_CHAT_IDLE_S
+    except Exception:
+        return _DEFAULT_STRICT_CHAT_IDLE_S
+
+
+def _startup_grace_s() -> float:
+    """Hard cooldown after process start before queue workers execute jobs."""
+    try:
+        from infra.config import get_feature
+        raw = get_feature("tool_queue", "startup_grace_seconds", _DEFAULT_STARTUP_GRACE_S)
+        val = float(raw)
+        return val if val > 0 else _DEFAULT_STARTUP_GRACE_S
+    except Exception:
+        return _DEFAULT_STARTUP_GRACE_S
+
+
+def _is_interactive_source(source: str) -> bool:
+    s = (source or "").strip().lower()
+    return s == "chat" or s == "code" or s.startswith("chat_") or s.startswith("code_")
 
 
 # legacy aliases used elsewhere in this module (kept for compatibility)
@@ -183,6 +214,7 @@ class ToolJobQueue:
         self._stale_thread: threading.Thread | None = None
         self._subscribers: list[list[dict]] = []
         self._sub_lock = threading.Lock()
+        self._started_at: float = 0.0
 
     def register(self, job_type: str, config: HandlerConfig):
         self._handlers[job_type] = config
@@ -190,6 +222,7 @@ class ToolJobQueue:
 
     def start(self):
         self._stop.clear()
+        self._started_at = time.time()
         self._load_pending()
         for job_type, config in self._handlers.items():
             threads: list[threading.Thread] = []
@@ -455,12 +488,25 @@ class ToolJobQueue:
             if self._stop.is_set():
                 break
 
-            # scrape is pure I/O so it ignores chat backoff; model-bound jobs must not
-            if job_type != "scrape":
+            queued_head = self._peek_next_queued(job_type)
+            head_is_interactive = bool(queued_head and _is_interactive_source(queued_head.source))
+
+            # strict startup/chat gate for all non-interactive jobs.
+            if not head_is_interactive:
+                startup_elapsed = (time.time() - self._started_at) if self._started_at else 0.0
+                startup_gate = _startup_grace_s()
+                if startup_elapsed < startup_gate:
+                    if int(startup_elapsed) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
+                        _log.info(
+                            "queue %s: startup cooldown — backing off (elapsed=%.0fs, gate=%.0fs)",
+                            worker_id, startup_elapsed, startup_gate,
+                        )
+                    continue
+
                 idle = seconds_since_chat()
-                # pre-claim gate uses the smallest backoff so p1 isn't blocked here;
-                # real priority-specific threshold is enforced post-claim below
-                min_gate = _backoff_for_priority(1) + _additional_idle_for_job_type(job_type)
+                # pre-claim gate uses p1 + strict idle floor; per-job priority/additional
+                # checks are enforced again post-claim.
+                min_gate = max(_backoff_for_priority(1), _strict_chat_idle_floor_s()) + _additional_idle_for_job_type(job_type)
                 if idle < min_gate:
                     if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
                         _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
@@ -477,7 +523,7 @@ class ToolJobQueue:
             # wake.wait(timeout=POLL_INTERVAL) and potentially idle 300s even
             # though the higher-priority job already claimed.
             my_priority = config.priority_default
-            if my_priority > 1:
+            if my_priority > 1 and not head_is_interactive:
                 yielded = False
                 while self._higher_priority_queued(my_priority):
                     if not yielded:
@@ -495,10 +541,25 @@ class ToolJobQueue:
             if not job:
                 continue
 
-            # per-job backoff: unclaim and sleep if priority threshold not met
-            if job_type != "scrape":
+            job_is_interactive = _is_interactive_source(job.source)
+
+            # per-job strict backoff: unclaim and sleep if startup/chat thresholds
+            # are not met at the exact moment before execution.
+            if not job_is_interactive:
+                startup_elapsed = (time.time() - self._started_at) if self._started_at else 0.0
+                startup_gate = _startup_grace_s()
+                if startup_elapsed < startup_gate:
+                    wait_secs = min(startup_gate - startup_elapsed, 60)
+                    _log.info(
+                        "queue %s: job %s blocked by startup cooldown (elapsed=%.0fs, gate=%.0fs) — sleeping %.0fs",
+                        worker_id, job.job_id[:12], startup_elapsed, startup_gate, wait_secs,
+                    )
+                    self._unclaim(job)
+                    self._stop.wait(timeout=wait_secs)
+                    continue
+
                 idle = seconds_since_chat()
-                required = _backoff_for_priority(job.priority) + _additional_idle_for_job_type(job_type)
+                required = max(_backoff_for_priority(job.priority), _strict_chat_idle_floor_s()) + _additional_idle_for_job_type(job_type)
                 if idle < required:
                     wait_secs = min(required - idle, 60)
                     _log.info("queue %s: job %s (priority=%d) needs %.0fs idle, currently %.0fs — sleeping %.0fs",
@@ -688,6 +749,22 @@ class ToolJobQueue:
 
         except Exception:
             _log.error("claim_next failed type=%s", job_type, exc_info=True)
+            return None
+
+    def _peek_next_queued(self, job_type: str) -> ToolJob | None:
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return None
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(type,eq,{job_type})~and(status,eq,queued)",
+                "sort": "priority,CreatedAt",
+                "limit": 1,
+            }).get("list", [])
+            if not rows:
+                return None
+            return ToolJob.from_row(rows[0])
+        except Exception:
             return None
 
     def _unclaim(self, job: ToolJob):

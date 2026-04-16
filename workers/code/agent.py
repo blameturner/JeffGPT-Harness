@@ -595,8 +595,17 @@ class CodeAgent(BaseAgent):
                 except Exception:
                     _log.error("code conv=%s  [5/5] plan checklist FAILED", conversation_id, exc_info=True)
 
+            # Reset the idle clock now that the full turn window (including summarising)
+            # is closed.  The backoff timer only starts from this point — not from when
+            # the LLM finished streaming.  planned_search jobs are submitted to the
+            # tool_queue and run outside this window, so they are not affected.
+            from workers.tool_queue import touch_chat_activity
+            touch_chat_activity()
             _log.info("code conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
+        # Re-arm the idle clock just before handing off to the post-turn thread
+        # (same rationale as chat agent — long model calls advance the clock).
+        touch_chat_activity()
         threading.Thread(target=_post_turn_work, daemon=True).start()
 
     def run_streaming(

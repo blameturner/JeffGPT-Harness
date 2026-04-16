@@ -87,7 +87,9 @@ async def lifespan(app: FastAPI):
         from tools.enrichment.dispatcher import jumpstart_scraper, jumpstart_pathfinder
         from apscheduler.triggers.interval import IntervalTrigger
         scrape_interval = int(get_feature("scraper", "dispatch_interval_minutes", 5))
-        first_run = datetime.now(timezone.utc) + timedelta(seconds=15)
+        # Hold dispatchers for 10 minutes after startup so background queue work
+        # cannot flood immediately on boot.
+        first_run = datetime.now(timezone.utc) + timedelta(minutes=10)
         sched.add_job(
             jumpstart_scraper,
             IntervalTrigger(minutes=scrape_interval),

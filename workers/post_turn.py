@@ -239,6 +239,16 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
         except Exception:
             _log.error("%s conv=%s  [5/%d] extra phase FAILED", config.source, cid, n, exc_info=True)
 
+    # Reset the idle clock now that the full turn window (including summarising) is
+    # closed.  The backoff timer only starts from this point — not from when the LLM
+    # finished streaming.  planned_search jobs are submitted to the tool_queue and run
+    # outside this window, so they are correctly unaffected.
+    try:
+        from workers.tool_queue import touch_chat_activity
+        touch_chat_activity()
+    except Exception:
+        pass
+
     _log.info(
         "%s conv=%s  post-turn complete  total=%.2fs",
         config.source, cid, time.perf_counter() - _t_bg,

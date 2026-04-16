@@ -54,6 +54,7 @@ def _run_search_inner(
     org_id: int,
     intent_dict: dict,
     budget: dict,
+    extraction_function_name: str = "search_extraction",
 ) -> tuple[str, list[dict], str]:
     from tools.search.config import search_context_for
 
@@ -121,6 +122,7 @@ def _run_search_inner(
         intent_dict,
         org_id=org_id,
         fire_graph_writes=True,
+        function_name=extraction_function_name,
     )
 
     results: list[dict] = []
@@ -224,13 +226,18 @@ def run_web_search(
     org_id: int,
     intent_dict: dict | None = None,
     history: list[dict] | None = None,
+    extraction_function_name: str = "search_extraction",
 ) -> tuple[str, list[dict], str]:
     _log.debug("search start  query=%s org=%d", query[:100], org_id)
 
     if intent_dict is None:
         intent_dict = classify_message_intent(query, history=history)
+    if not isinstance(intent_dict, dict):
+        _log.warning("search intent resolution returned non-dict: %r", type(intent_dict).__name__)
+        return "", [], "failed"
+    resolved_intent = intent_dict
 
-    policy = intent_dict.get("search_policy") or SEARCH_POLICY_NONE
+    policy = resolved_intent.get("search_policy") or SEARCH_POLICY_NONE
     if policy == SEARCH_POLICY_NONE:
         return "", [], "none"
 
@@ -244,7 +251,7 @@ def run_web_search(
         import concurrent.futures as _futures
         ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="contextual-search")
         try:
-            fut = ex.submit(_run_search_inner, query, org_id, intent_dict, budget)
+            fut = ex.submit(_run_search_inner, query, org_id, resolved_intent, budget, extraction_function_name)
             try:
                 return fut.result(timeout=budget["hard_cap_s"])
             except _futures.TimeoutError:
@@ -256,6 +263,6 @@ def run_web_search(
         finally:
             ex.shutdown(wait=False)
 
-    return _run_search_inner(query, org_id, intent_dict, budget)
+    return _run_search_inner(query, org_id, resolved_intent, budget, extraction_function_name)
 
 

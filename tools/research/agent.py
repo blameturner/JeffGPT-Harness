@@ -60,7 +60,17 @@ def _run_web_search_with_timeout(query: str, org_id: int, intent: dict) -> tuple
     )
     ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-ws")
     try:
-        fut = ex.submit(run_web_search, query, org_id=org_id, intent_dict=intent)
+        extraction_function_name = str(
+            get_feature("research", "search_extraction_model", "research_search_extraction")
+            or "research_search_extraction"
+        )
+        fut = ex.submit(
+            run_web_search,
+            query,
+            org_id=org_id,
+            intent_dict=intent,
+            extraction_function_name=extraction_function_name,
+        )
         try:
             return fut.result(timeout=timeout_s)
         except _futures.TimeoutError:

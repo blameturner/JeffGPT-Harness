@@ -1,22 +1,46 @@
 {
-  "models": {
-    "chat":                       { "role": "t1_primary" },
-    "code":                       { "role": "t1_primary" },
-    "tool_planner":               { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 200,  "max_input_chars": 1000 },
-    "intent_classifier":          { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 300,  "max_input_chars": 2000 },
-    "search_extraction":          { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500,  "max_input_chars": 12000, "frequency_penalty": 0.2 },
-    "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 400,  "max_input_chars": 12000, "frequency_penalty": 0.2 },
-    "web_search_summarise_batch": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500,  "max_input_chars": 10000, "frequency_penalty": 0.2 },
-    "chat_summarise":             { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 16000, "frequency_penalty": 0.2 },
-    "content_quality":            { "role": "t3_tool",    "temperature": 0.0, "max_tokens": 6,    "max_input_chars": 1500 },
-    "relationships":              { "role": "t1_secondary", "temperature": 0.1, "max_tokens": 800,  "max_input_chars": 8000, "frequency_penalty": 0.3 }
-  },
+  "models": {},
   "features": {
-    "web_search": true,
+    "chat": {
+      "enabled": true,
+      "models": {
+        "chat":           { "role": "t1_primary" },
+        "chat_summarise": { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500, "max_input_chars": 16000, "frequency_penalty": 0.2 }
+      }
+    },
+    "code": {
+      "enabled": true,
+      "models": {
+        "code": { "role": "t1_primary" }
+      }
+    },
+    "web_search": {
+      "enabled": true,
+      "models": {
+        "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 150, "max_input_chars": 3000, "frequency_penalty": 0.2 },
+        "web_search_summarise_batch": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 250, "max_input_chars": 4000, "frequency_penalty": 0.2 }
+      }
+    },
     "rag_lookup": true,
-    "tools_framework": true,
-    "search_extraction": true,
-    "intent_classifier": true,
+    "tools_framework": {
+      "enabled": true,
+      "models": {
+        "tool_planner": { "role": "t3_tool", "temperature": 0.1, "max_tokens": 200, "max_input_chars": 1000 }
+      }
+    },
+    "search_extraction": {
+      "enabled": true,
+      "models": {
+        "search_extraction": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 350, "max_input_chars": 4000, "frequency_penalty": 0.2 },
+        "content_quality":   { "role": "t3_tool",    "temperature": 0.0, "max_tokens": 6,   "max_input_chars": 1500 }
+      }
+    },
+    "intent_classifier": {
+      "enabled": true,
+      "models": {
+        "intent_classifier": { "role": "t3_tool", "temperature": 0.1, "max_tokens": 300, "max_input_chars": 2000 }
+      }
+    },
     "url_scraper": {
       "enabled": true,
       "max_urls_per_turn": 3,
@@ -36,6 +60,7 @@
       "min_run_interval_seconds": 120,
       "rag_collection": "discovery",
       "summary_collection": "discovery_summaries",
+      "_comment_models": "scrape_summariser/classifier are for background enrichment queue jobs only. chat/code web search uses features.web_search.models.*. research uses features.research.models.research_search_extraction.",
       "models": {
         "scrape_summariser": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500, "max_input_chars": 12000, "frequency_penalty": 0.2 },
         "scrape_classifier": { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 200, "max_input_chars": 8000 }
@@ -51,9 +76,11 @@
       "synthesis_timeout_s": 3600,
       "critic_timeout_s": 1800,
       "confidence_threshold": 80,
+      "search_extraction_model": "research_search_extraction",
       "models": {
-        "research_planner": { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
-        "research_agent":   { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 }
+        "research_planner":          { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
+        "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 },
+        "research_search_extraction": { "role": "exp_rwkv_r",   "temperature": 0.2, "max_tokens": 500,   "max_input_chars": 12000, "frequency_penalty": 0.2 }
       }
     },
     "planned_search": {
@@ -64,6 +91,12 @@
       "models": {
         "planned_search":        { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
         "planned_search_answer": { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 }
+      }
+    },
+    "graph_extract": {
+      "enabled": true,
+      "models": {
+        "relationships": { "role": "t1_secondary", "temperature": 0.1, "max_tokens": 800, "max_input_chars": 8000, "frequency_penalty": 0.3 }
       }
     },
     "pathfinder": {
@@ -86,14 +119,16 @@
       "min_run_interval_seconds": 120
     },
     "tool_queue": {
+      "startup_grace_seconds": 600,
+      "strict_chat_idle_seconds": 600,
       "priority_backoff_seconds": {
-        "1": 120,
-        "2": 120,
-        "3": 120,
-        "4": 120,
-        "5": 120
+        "1": 600,
+        "2": 600,
+        "3": 600,
+        "4": 600,
+        "5": 600
       },
-      "default_backoff_seconds": 120,
+      "default_backoff_seconds": 600,
       "job_type_additional_idle_seconds": {
         "summarise_page": 180,
         "pathfinder_crawl": 1080

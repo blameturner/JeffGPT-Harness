@@ -206,6 +206,7 @@ def extract_from_pages(
     intent_dict: dict,
     org_id: int | None = None,
     fire_graph_writes: bool = True,
+    function_name: str = "search_extraction",
 ) -> list[dict | None]:
     if not pages:
         return []
@@ -238,7 +239,7 @@ def extract_from_pages(
         _log.warning("extraction helpers import failed: %s", e)
         return [None] * len(pages)
 
-    cfg = get_function_config("search_extraction")
+    cfg = get_function_config(function_name)
 
     results: list[dict | None] = [None] * len(pages)
     candidates: list[tuple[int, str, str]] = []
@@ -288,7 +289,7 @@ def extract_from_pages(
     )
 
     raw, tokens = model_call(
-        "search_extraction",
+        function_name,
         prompt,
         max_tokens=cfg.get("max_tokens", 500) * len(candidates),
     )

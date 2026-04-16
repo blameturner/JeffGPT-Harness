@@ -654,8 +654,19 @@ class ChatAgent(BaseAgent):
             finally:
                 summary_ev.set()  # must set even on failure or next turn blocks forever
 
+            # Reset the idle clock now that the full turn window (including summarising)
+            # is closed.  The backoff timer only starts from this point — not from when
+            # the LLM finished streaming.  planned_search jobs are submitted to the
+            # tool_queue and run outside this window, so they are not affected.
+            from workers.tool_queue import touch_chat_activity
+            touch_chat_activity()
             _log.info("chat conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
 
+        # Re-arm the idle clock just before handing off to the post-turn thread.
+        # If the model call took a long time the clock started at turn-start would
+        # have ticked past the backoff gate. This ensures the full window (LLM +
+        # post-turn summarising) is treated as one continuous active period.
+        touch_chat_activity()
         threading.Thread(target=_post_turn_work, daemon=True).start()
 
     def send_streaming(
