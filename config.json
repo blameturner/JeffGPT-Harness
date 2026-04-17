@@ -71,6 +71,8 @@
       "agent_enabled": true,
       "max_queries": 20,
       "max_iterations": 3,
+      "planner_retry_attempts": 5,
+      "planner_retry_backoff_s": 8,
       "planner_timeout_s": 1800,
       "web_search_per_query_timeout_s": 600,
       "synthesis_timeout_s": 3600,
@@ -121,6 +123,8 @@
     "tool_queue": {
       "startup_grace_seconds": 600,
       "strict_chat_idle_seconds": 600,
+      "default_max_attempts": 3,
+      "default_retry_backoff_seconds": 5,
       "priority_backoff_seconds": {
         "1": 600,
         "2": 600,
@@ -129,9 +133,26 @@
         "5": 600
       },
       "default_backoff_seconds": 600,
+      "job_type_min_idle_seconds": {
+        "summarise_page": 300,
+        "pathfinder_crawl": 1200,
+        "discover_agent_run": 1200
+      },
+      "job_type_max_attempts": {
+        "summarise_page": 3,
+        "classify_relevance": 3,
+        "scrape_target": 2,
+        "pathfinder_crawl": 2,
+        "discover_agent_run": 2,
+        "research_planner": 2,
+        "research_agent": 2,
+        "planned_search_execute": 2,
+        "planned_search_scrape": 2
+      },
       "job_type_additional_idle_seconds": {
-        "summarise_page": 180,
-        "pathfinder_crawl": 1080
+        "summarise_page": 0,
+        "pathfinder_crawl": 0,
+        "discover_agent_run": 0
       }
     }
   }

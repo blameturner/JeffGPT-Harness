@@ -16,7 +16,7 @@ def summarise_page_job(payload: dict) -> dict:
     """Tool-queue handler: takes scraped page text, runs the summariser model, persists the summary."""
     url = payload.get("url") or ""
     text = payload.get("text") or ""
-    org_id = int(payload.get("org_id") or 0)
+    org_id = int(payload.get("org_id") or 0) or 1  # never write to org-0 collection
     source = payload.get("source") or "scrape"
     scrape_target_id = payload.get("scrape_target_id")
     discovery_id = payload.get("discovery_id")
@@ -67,16 +67,18 @@ def summarise_page_job(payload: dict) -> dict:
     except Exception:
         _log.warning("summary embed failed  url=%s", url[:80], exc_info=True)
 
-    # surface the summary back onto the originating row (if a column exists; nocodb
-    # silently drops unknown fields, so this is best-effort).
-    if scrape_target_id:
+    # Surface the summary back onto the originating row (best-effort; NocoDB
+    # silently drops unknown columns, so this never fails the job).
+    # Reuse one client for both patches to avoid an extra _load_tables() call.
+    _client = NocodbClient()
+    if scrape_target_id is not None:
         try:
-            NocodbClient()._patch("scrape_targets", int(scrape_target_id), {"summary": summary[:2000]})
+            _client._patch("scrape_targets", int(str(scrape_target_id)), {"summary": summary[:2000]})
         except Exception:
             pass
-    if discovery_id:
+    if discovery_id is not None:
         try:
-            NocodbClient()._patch("discovery", int(discovery_id), {"summary": summary[:2000]})
+            _client._patch("discovery", int(str(discovery_id)), {"summary": summary[:2000]})
         except Exception:
             pass
 

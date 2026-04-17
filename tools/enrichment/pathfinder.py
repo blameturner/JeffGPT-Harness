@@ -237,11 +237,34 @@ def upsert_discovery_root(
     url: str,
     org_id: int,
     score: float = 100.0,
+    reset_status: bool = False,
 ) -> int | None:
-    """Ensure the seed URL is recorded in the discovery table; return its row Id."""
+    """Ensure the seed URL is recorded in the discovery table; return its row Id.
+
+    The URL is always normalized before hashing so that a raw URL from the API
+    and the normalized URL produced inside ``discover()`` resolve to the same row
+    and don't create duplicates.
+
+    If the row already exists and ``reset_status`` is True (set by the API
+    endpoint on explicit re-submission), the status is reset to 'discovered' so
+    the scheduler can pick it up on the next cycle even if the in-memory queue
+    job was lost due to a restart.
+    """
+    url = _normalize(url) or url  # always hash the canonical form
+    if not url:
+        return None
     uh = _url_hash(url)
     existing_id = _discovery_url_exists(client, uh, org_id)
     if existing_id:
+        if reset_status:
+            try:
+                client._patch("discovery", existing_id, {
+                    "status": "discovered",
+                    "error_message": "",
+                })
+                _log.info("upsert_discovery_root reset status=discovered  id=%d  url=%s", existing_id, url[:80])
+            except Exception:
+                _log.warning("upsert_discovery_root status reset failed  id=%d", existing_id, exc_info=True)
         return existing_id
     try:
         row = client._post("discovery", {
@@ -564,21 +587,63 @@ def discover(
 
 
 def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
-    """Pick the next NEVER-crawled discovery root (status='discovered'), oldest
-    by CreatedAt. Returns None once every discovery row has been crawled at
-    least once — caller then falls through to scrape_targets (per the product
-    rule: each discovery URL is crawled ONCE, then pathfinder rotates through
-    scrape_targets by oldest UpdatedAt)."""
+    """Pick the next discovery root to crawl.
+
+    Priority order:
+    1. Never-crawled roots (status='discovered'), oldest first.
+    2. Stale roots (status='scraped'/'failed') whose UpdatedAt is older than
+       ``pathfinder.stale_after_minutes`` (default 60), rotated by UpdatedAt asc.
+
+    Returns None when nothing is due — caller falls through to scrape_targets.
+    """
+    # 1. Never-crawled first.
     try:
         never = client._get("discovery", params={
             "where": "(depth,eq,0)~and(status,eq,discovered)",
             "limit": 1,
             "sort": "CreatedAt",
         }).get("list", [])
-        return never[0] if never else None
+        if never:
+            return never[0]
     except Exception:
         _log.warning("pathfinder picker never-crawled query failed", exc_info=True)
+
+    # 2. Stale re-crawl: find the oldest previously-crawled root whose UpdatedAt
+    #    pre-dates the stale window. We can't do date-arithmetic inside NocoDB's
+    #    filter syntax, so we pull the oldest-UpdatedAt row and check client-side.
+    #    Failed roots use a 3× longer window to avoid hammering broken URLs.
+    stale_minutes = float(_cfg("stale_after_minutes", 60))
+    if stale_minutes <= 0:
         return None
+    try:
+        from datetime import datetime, timezone
+        rows = client._get("discovery", params={
+            "where": "(depth,eq,0)~and(status,neq,discovered)",
+            "limit": 1,
+            "sort": "UpdatedAt,CreatedAt",
+        }).get("list", [])
+        if not rows:
+            return None
+        row = rows[0]
+        row_status = row.get("status") or ""
+        effective_stale = stale_minutes * 3 if row_status == "failed" else stale_minutes
+        updated_str = row.get("UpdatedAt") or row.get("updated_at") or ""
+        if not updated_str:
+            # No timestamp — treat as stale only for non-failed rows to be safe
+            return row if row_status != "failed" else None
+        ts = datetime.fromisoformat(str(updated_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        if age_minutes >= effective_stale:
+            _log.info(
+                "pathfinder stale re-crawl  id=%s url=%s status=%s age_min=%.1f threshold=%.0f",
+                row.get("Id"), str(row.get("url") or "")[:80], row_status, age_minutes, effective_stale,
+            )
+            return row
+    except Exception:
+        _log.warning("pathfinder picker stale query failed", exc_info=True)
+    return None
 
 
 def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
@@ -759,7 +824,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
             return {"status": "not_found", "discovery_id": direct_discovery_id}
         row = rows[0]
-        chain_org_id = int(row.get("org_id") or 0)
+        chain_org_id = int(row.get("org_id") or 0) or 1
         res = _process_one_seed(
             client,
             seed_url=row.get("url") or "",
@@ -773,7 +838,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
     # Scheduled/chained path: pick ONE seed. Stale discovery first, then oldest scrape_target.
     seed = _pick_next_discovery_root(client)
     if seed:
-        chain_org_id = int(seed.get("org_id") or 0)
+        chain_org_id = int(seed.get("org_id") or 0) or 1
         res = _process_one_seed(
             client,
             seed_url=seed.get("url") or "",
@@ -786,8 +851,8 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
 
     fallback = _pick_next_scrape_target_seed(client)
     if fallback:
-        chain_org_id = int(fallback.get("org_id") or 0)
-        fallback_url = fallback.get("url") or ""
+        chain_org_id = int(fallback.get("org_id") or 0) or 1
+        fallback_url = _normalize(fallback.get("url") or "") or (fallback.get("url") or "")
         fallback_target_id = int(fallback.get("Id") or 0) or None
 
         # Register into discovery so it is tracked and won't be re-picked

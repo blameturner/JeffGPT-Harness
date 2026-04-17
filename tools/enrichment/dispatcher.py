@@ -108,3 +108,34 @@ def enqueue_due_scrape_targets() -> dict:
 
 def enqueue_due_pathfinder_recrawls() -> dict:
     return jumpstart_pathfinder()
+
+
+def jumpstart_discover_agent() -> dict:
+    """Scheduler hook: every ``discover_agent.run_interval_minutes``, queue ONE
+    discover_agent_run job — but only if none is already inflight.  The agent
+    has its own cooldown gate inside the handler so double-triggers are safe."""
+    if not get_feature("discover_agent", "enabled", True):
+        return {"status": "disabled"}
+
+    from workers.tool_queue import get_tool_queue
+    tq = get_tool_queue()
+    if not tq:
+        return {"status": "no_queue"}
+
+    client = NocodbClient()
+    inflight = _count_inflight(client, "discover_agent_run")
+    if inflight > 0:
+        return {"status": "already_running", "inflight": inflight}
+
+    org_id = _default_org_id(client)
+    try:
+        job_id = tq.submit(
+            "discover_agent_run", {"org_id": org_id},
+            source="discover_agent_jumpstart", priority=5, org_id=org_id,
+        )
+    except Exception:
+        _log.warning("discover_agent jumpstart submit failed", exc_info=True)
+        return {"status": "submit_failed"}
+    _log.info("discover_agent jumpstart queued job=%s org_id=%d", job_id, org_id)
+    return {"status": "kicked", "queued": 1, "org_id": org_id}
+

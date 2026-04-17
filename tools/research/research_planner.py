@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 import concurrent.futures as _futures
 
 from infra.config import get_feature
@@ -10,6 +11,8 @@ _log = logging.getLogger("research_planner")
 
 DEFAULT_MAX_QUERIES = 20
 DEFAULT_PLANNER_TIMEOUT_S = 1200
+DEFAULT_PLANNER_RETRY_ATTEMPTS = 3
+DEFAULT_PLANNER_RETRY_BACKOFF_S = 4
 
 
 def _planner_timeout_s() -> int:
@@ -19,6 +22,24 @@ def _planner_timeout_s() -> int:
         return val if val > 0 else DEFAULT_PLANNER_TIMEOUT_S
     except Exception:
         return DEFAULT_PLANNER_TIMEOUT_S
+
+
+def _planner_retry_attempts() -> int:
+    raw = get_feature("research", "planner_retry_attempts", DEFAULT_PLANNER_RETRY_ATTEMPTS)
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_PLANNER_RETRY_ATTEMPTS
+    except Exception:
+        return DEFAULT_PLANNER_RETRY_ATTEMPTS
+
+
+def _planner_retry_backoff_s() -> float:
+    raw = get_feature("research", "planner_retry_backoff_s", DEFAULT_PLANNER_RETRY_BACKOFF_S)
+    try:
+        val = float(raw)
+        return val if val >= 0 else DEFAULT_PLANNER_RETRY_BACKOFF_S
+    except Exception:
+        return DEFAULT_PLANNER_RETRY_BACKOFF_S
 
 
 def _strip_fence(raw: str) -> str:
@@ -70,52 +91,147 @@ def _extract_json_object(raw: str) -> str:
     return tail
 
 
+def _as_string_list(value) -> list[str]:
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _normalize_plan_payload(data: dict, max_queries: int) -> dict:
+    hypotheses = _as_string_list(data.get("hypotheses") or [])
+    sub_topics = _as_string_list(data.get("sub_topics") or [])
+    queries = _as_string_list(data.get("queries") or [])[:max_queries]
+    schema = data.get("schema")
+    if not isinstance(schema, dict):
+        schema = {}
+    if not queries:
+        return {"error": "planner produced no queries"}
+    return {
+        "hypotheses": hypotheses,
+        "sub_topics": sub_topics,
+        "queries": queries,
+        "schema": schema,
+    }
+
+
 def _generate_plan(topic: str, max_queries: int = DEFAULT_MAX_QUERIES) -> dict:
-    prompt = f"""Given this research topic: "{topic}"
+    min_queries = 10 if max_queries >= 10 else max_queries
+    prompt = f"""You are a research planning engine.
 
-Generate a JSON research plan with:
-1. "hypotheses": 2-3 specific hypotheses to investigate
-2. "sub_topics": 4-6 specific sub-topics to research
-3. "queries": {max_queries} specific, search-engine-friendly queries (max {max_queries})
-4. "schema": JSON schema defining what data to extract (field name + type: numeric, text, date, percent)
+TOPIC:
+{topic}
 
-Respond with ONLY valid JSON, no explanation, no markdown."""
+Return ONLY one valid JSON object with EXACTLY these top-level keys:
+- "hypotheses"
+- "sub_topics"
+- "queries"
+- "schema"
+
+Required output contract:
+1) "hypotheses": array of 2-4 concise, testable hypotheses.
+2) "sub_topics": array of 4-8 specific research sub-topics.
+3) "queries": array of {min_queries}-{max_queries} unique, high-signal search queries.
+   - No generic queries; each should include concrete entities/metrics/angles.
+   - Prefer query phrasing that can find primary sources, statistics, and recent evidence.
+   - Never return an empty queries array.
+4) "schema": object where each key is a field to extract and each value is one of:
+   "numeric", "text", "date", "percent".
+   - Include 6-12 fields that are useful to evaluate the hypotheses.
+
+Formatting rules:
+- Output raw JSON only (no markdown, no backticks, no prose).
+- No trailing commas, comments, or extra keys.
+- If uncertain, still return best-effort concrete hypotheses, sub-topics, and queries.
+
+Example shape (structure only, not content):
+{{
+  "hypotheses": ["...", "..."],
+  "sub_topics": ["...", "..."],
+  "queries": ["...", "..."],
+  "schema": {{"field_name": "text"}}
+}}"""
 
     timeout_s = _planner_timeout_s()
+    attempts = _planner_retry_attempts()
+    backoff_s = _planner_retry_backoff_s()
 
     def _run():
         return model_call("research_planner", prompt)
 
-    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-plan")
-    try:
-        fut = ex.submit(_run)
+    last_error = "unknown planner error"
+    last_raw = ""
+
+    for attempt in range(1, attempts + 1):
+        ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-plan")
         try:
-            result, _ = fut.result(timeout=timeout_s)
-        except _futures.TimeoutError:
-            _log.warning("planner timeout after %ds  topic=%s", timeout_s, topic[:40])
-            return {"error": f"planner timeout after {timeout_s}s"}
-        except Exception as e:
-            _log.warning("plan generation failed  topic=%s  error=%s", topic[:40], e)
-            return {"error": str(e)[:200]}
-    finally:
-        ex.shutdown(wait=False)
+            fut = ex.submit(_run)
+            try:
+                result, _ = fut.result(timeout=timeout_s)
+            except _futures.TimeoutError:
+                last_error = f"planner timeout after {timeout_s}s"
+                _log.warning(
+                    "planner timeout  attempt=%d/%d  topic=%s",
+                    attempt, attempts, topic[:40],
+                )
+                continue
+            except Exception as e:
+                last_error = str(e)[:200]
+                _log.warning(
+                    "plan generation failed  attempt=%d/%d  topic=%s  error=%s",
+                    attempt, attempts, topic[:40], e,
+                )
+                continue
+        finally:
+            ex.shutdown(wait=False)
 
-    if not result:
-        return {"error": "empty model response"}
+        if not result:
+            last_error = "empty model response"
+            _log.warning(
+                "planner empty response  attempt=%d/%d  topic=%s",
+                attempt, attempts, topic[:40],
+            )
+        else:
+            candidate = _extract_json_object(result)
+            last_raw = result[:500]
+            if not candidate:
+                last_error = "no JSON object in response"
+                _log.warning(
+                    "planner parse failed (no JSON object)  attempt=%d/%d  topic=%s",
+                    attempt, attempts, topic[:40],
+                )
+            else:
+                try:
+                    parsed = json.loads(candidate)
+                    normalized = _normalize_plan_payload(parsed, max_queries)
+                    if "error" not in normalized:
+                        return normalized
+                    last_error = str(normalized.get("error") or "invalid planner payload")
+                    _log.warning(
+                        "planner payload invalid  attempt=%d/%d  topic=%s  error=%s",
+                        attempt, attempts, topic[:40], last_error,
+                    )
+                except json.JSONDecodeError as e:
+                    last_error = f"invalid JSON: {str(e)[:160]}"
+                    _log.warning(
+                        "plan parse failed  attempt=%d/%d  topic=%s  error=%s  chars=%d",
+                        attempt, attempts, topic[:40], e, len(result),
+                    )
 
-    candidate = _extract_json_object(result)
-    if not candidate:
-        _log.warning("plan parse failed  topic=%s  no JSON object", topic[:40])
-        return {"error": "no JSON object in response", "raw": result[:500]}
+        if attempt < attempts and backoff_s > 0:
+            time.sleep(backoff_s)
 
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError as e:
-        _log.warning(
-            "plan parse failed  topic=%s  error=%s  chars=%d",
-            topic[:40], e, len(result),
-        )
-        return {"error": str(e)[:200], "raw": result[:500]}
+    out = {"error": f"planner failed after {attempts} attempts: {last_error}"}
+    if last_raw:
+        out["raw"] = last_raw
+    return out
 
 
 def create_research_plan(topic: str, org_id: int = 0) -> dict:

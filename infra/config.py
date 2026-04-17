@@ -267,6 +267,20 @@ NOCODB_URL = os.getenv("DB_NOCODB_URL")
 NOCODB_TOKEN = os.getenv("DB_NOCODB_TOKEN")
 NOCODB_BASE_ID = os.getenv("DB_NOCODB_BASE_ID")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+HUEY_ENABLED = _env_bool("HUEY_ENABLED", True)
+HUEY_SQLITE_PATH = os.getenv("HUEY_SQLITE_PATH", "/app/data/huey_queue.db")
+HUEY_CONSUMER_WORKERS = int(os.getenv("HUEY_CONSUMER_WORKERS", "1"))
+HUEY_TASK_RETRIES = int(os.getenv("HUEY_TASK_RETRIES", "2"))
+HUEY_TASK_RETRY_DELAY_S = int(os.getenv("HUEY_TASK_RETRY_DELAY_S", "5"))
+
 NOCODB_TABLE_ORGANISATION = "organisation"
 NOCODB_TABLE_AGENT_RUNS = "agent_runs"
 NOCODB_TABLE_ENRICHMENT_AGENTS = "enrichment_agents"

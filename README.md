@@ -47,12 +47,22 @@ The Docker Compose config for this container is:
           - SVC_SEARXNG_URL=http://host.docker.internal:XXXX
           - ENRICHMENT_TOKEN_BUDGET=50000
           - ENRICHMENT_LOG_RETENTION_DAYS=30
+          - HUEY_ENABLED=true
+          - HUEY_SQLITE_PATH=/app/data/huey_queue.db
+          - HUEY_CONSUMER_WORKERS=1
+          - HUEY_TASK_RETRIES=2
+          - HUEY_TASK_RETRY_DELAY_S=5
         ports:
           - "{TAILSCALEIP}:XXXX:XXXX"
+        volumes:
+          - ./harness-data:/app/data
         restart: unless-stopped
         networks:
             - default
 ```
+
+The harness now creates a separate local SQLite file for Huey queue state at `HUEY_SQLITE_PATH`.
+Mount `/app/data` to persist this queue DB across container restarts.
 
 As with anything, the docker config is important. If you need more info just contact me.
 

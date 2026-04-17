@@ -36,11 +36,23 @@ class ResearchAgentRequest(BaseModel):
 @router.post("/pathfinder/discover")
 def pathfinder_discover(req: PathfinderRequest):
     """UI submits a seed URL: upsert as a discovery root and queue a pathfinder_crawl
-    job. The handler chains itself so pathfinder keeps walking through discovery rows."""
-    from tools.enrichment.pathfinder import upsert_discovery_root
+    job. Resets status to 'discovered' on re-submission so the scheduler can pick it
+    up on the next cycle even if the in-memory job is lost to a restart."""
+    from tools.enrichment.pathfinder import upsert_discovery_root, _normalize
+
+    # Normalize and validate the URL before touching the DB.
+    # _normalize strips tracking params, www, trailing slashes and returns ""
+    # for non-HTTP(S) schemes — matching exactly what discover() does internally.
+    norm_url = _normalize(req.seed_url)
+    if not norm_url:
+        return {"status": "failed", "error": "invalid_url", "raw": req.seed_url}
+    if req.org_id <= 0:
+        return {"status": "failed", "error": "invalid_org_id"}
 
     client = NocodbClient()
-    discovery_id = upsert_discovery_root(client, req.seed_url, req.org_id)
+    # reset_status=True: if the URL was previously crawled, mark it 'discovered'
+    # again so both the direct job AND the scheduler fallback can process it.
+    discovery_id = upsert_discovery_root(client, norm_url, req.org_id, reset_status=True)
     if not discovery_id:
         return {"status": "failed", "error": "discovery_upsert_failed"}
 
@@ -48,16 +60,18 @@ def pathfinder_discover(req: PathfinderRequest):
     if not tq:
         # fallback: run synchronously (degraded)
         from tools.enrichment.pathfinder import discover
-        return {"status": "ok", **discover(req.seed_url, req.org_id)}
+        return {"status": "ok", **discover(norm_url, req.org_id)}
 
+    # Priority 3: user-initiated crawls run ahead of background enrichment (4/5)
+    # but after interactive planned_search/research (2/3).
     job_id = tq.submit(
         "pathfinder_crawl",
         {"discovery_id": discovery_id},
         source="pathfinder_api",
-        priority=5,
+        priority=3,
         org_id=req.org_id,
     )
-    return {"status": "queued", "discovery_id": discovery_id, "job_id": job_id}
+    return {"status": "queued", "discovery_id": discovery_id, "job_id": job_id, "url": norm_url}
 
 
 @router.post("/scraper/start")
@@ -72,6 +86,14 @@ def pathfinder_start():
     """UI button: jumpstart the pathfinder chain if it's idle."""
     from tools.enrichment.dispatcher import jumpstart_pathfinder
     return jumpstart_pathfinder()
+
+
+@router.post("/discover-agent/start")
+def discover_agent_start():
+    """UI button: immediately queue one discover_agent_run (bypasses scheduler interval,
+    still subject to the handler's cooldown gate)."""
+    from tools.enrichment.dispatcher import jumpstart_discover_agent
+    return jumpstart_discover_agent()
 
 
 @router.post("/pathfinder/fetch-next")
@@ -194,9 +216,9 @@ _SCRAPE_TARGET_LIST_FIELDS = (
 
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
-    # No `fields=` — see research-plans/list for rationale.
+    limit = min(max(1, limit), 500)
     client = NocodbClient()
-    params: dict = {"limit": limit}
+    params: dict = {"limit": limit, "sort": "-CreatedAt"}
     if status:
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
@@ -208,9 +230,7 @@ def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
 
 @router.get("/research-plans/list")
 def research_plans_list(org_id: int, status: str | None = None, limit: int = 50):
-    # No `fields=` on research_plans — NocoDB v1 returns 404 for the whole request if
-    # any listed column doesn't exist, and the schema's been in flux. research_plans
-    # has no m2m links so returning all columns has no perf cost.
+    limit = min(max(1, limit), 500)
     client = NocodbClient()
     params: dict = {"limit": limit}
     if status:
@@ -238,10 +258,7 @@ def research_plan_get(plan_id: int):
 
 @router.get("/scrape-targets/list")
 def scrape_targets_list(org_id: int, status: str | None = None, active_only: bool = True, limit: int = 100):
-    # No `fields=` — NocoDB v1 returns 404 for the whole request if any listed
-    # column doesn't match the live schema, and the schema's been evolving
-    # (relevance_score/relevance_label just added). The m2m link to knowledge_sources
-    # was dropped, so there's no perf reason to restrict columns anyway.
+    limit = min(max(1, limit), 500)
     client = NocodbClient()
     parts = [f"(org_id,eq,{org_id})"]
     if active_only:

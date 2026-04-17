@@ -104,8 +104,8 @@ def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
         _log.warning("scrape_target patch failed  id=%d", target_id, exc_info=True)
 
 
-def _scrape_one_target(target_id: int) -> dict:
-    client = NocodbClient()
+def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> dict:
+    client = client or NocodbClient()
 
     try:
         rows = client._get("scrape_targets", params={
@@ -213,21 +213,22 @@ def _scrape_one_target(target_id: int) -> dict:
         from workers.tool_queue import get_tool_queue
         tq = get_tool_queue()
         if tq:
-            classifier_text = text[:20000]
-            tq.submit(
-                "classify_relevance",
-                {
-                    "target_id": target_id,
-                    "url": result.get("final_url") or url,
-                    "text": classifier_text,
-                    "org_id": org_id,
-                },
-                source="scrape_target",
-                priority=4,
-                org_id=org_id,
-            )
-
+            # Only re-classify and re-summarise when content has actually changed.
+            # On unchanged pages the existing relevance label is still valid — no
+            # need to burn an LLM call to confirm what we already know.
             if not unchanged:
+                tq.submit(
+                    "classify_relevance",
+                    {
+                        "target_id": target_id,
+                        "url": result.get("final_url") or url,
+                        "text": text[:20000],
+                        "org_id": org_id,
+                    },
+                    source="scrape_target",
+                    priority=4,
+                    org_id=org_id,
+                )
                 tq.submit(
                     "summarise_page",
                     {
@@ -290,10 +291,13 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
     if isinstance(payload, dict) and payload.get("target_id"):
         return _scrape_one_target(int(payload["target_id"]))
 
+    # Reuse a single client for all batch-level DB calls so we pay _load_tables()
+    # once per invocation instead of once per target.
+    client = NocodbClient()
+
     min_interval = float(get_feature("scraper", "min_run_interval_seconds", 60))
     if min_interval > 0:
-        client_cooldown = NocodbClient()
-        elapsed = _seconds_since_last_scrape_target_completion(client_cooldown)
+        elapsed = _seconds_since_last_scrape_target_completion(client)
         if elapsed < min_interval:
             _log.info(
                 "scraper batch skip: last completion %.1fs ago, gate=%.0fs",
@@ -302,7 +306,6 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
             return {"status": "skipped_cooldown", "elapsed_s": round(elapsed, 1)}
 
     batch_size = int(get_feature("scraper", "batch_size", DEFAULT_BATCH_SIZE))
-    client = NocodbClient()
     targets = fetch_due_targets(client, limit=batch_size)
     if not targets:
         _log.info("scraper batch: no due targets — idle")
@@ -313,7 +316,7 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         tid = int(t.get("Id") or 0)
         if not tid:
             continue
-        out = _scrape_one_target(tid)
+        out = _scrape_one_target(tid, client=client)
         processed.append(out)
 
     successful = sum(1 for p in processed if p.get("status") == "ok")
@@ -349,7 +352,7 @@ def run_scraper(batch_size: int | None = None) -> dict:
     failed = 0
     chunks = 0
     for t in targets[:batch_size]:
-        out = _scrape_one_target(int(t.get("Id") or 0))
+        out = _scrape_one_target(int(t.get("Id") or 0), client=client)
         if out.get("status") == "ok":
             successful += 1
             chunks += int(out.get("chunks") or 0)

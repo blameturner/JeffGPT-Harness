@@ -11,6 +11,14 @@ _log = log.get("harness")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _log.info("mstag-harness starting")
+    from infra.huey_runtime import init_huey, shutdown_huey, start_huey_consumer
+
+    huey = init_huey()
+    app.state.huey = huey
+    if huey:
+        started = start_huey_consumer()
+        _log.info("huey runtime ready  consumer_started=%s", started)
+
     from scheduler import start_scheduler
     sched = start_scheduler()
     app.state.scheduler = sched
@@ -109,7 +117,20 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             next_run_time=first_run,
         )
-        _log.info("enrichment dispatchers scheduled  scrape=%dm  recrawl=%dm", scrape_interval, recrawl_interval)
+        discover_interval = int(get_feature("discover_agent", "run_interval_minutes", 20))
+        sched.add_job(
+            jumpstart_discover_agent,
+            IntervalTrigger(minutes=discover_interval),
+            id="discover_agent_dispatcher",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            next_run_time=first_run,
+        )
+        _log.info(
+            "enrichment dispatchers scheduled  scrape=%dm  recrawl=%dm  discover=%dm",
+            scrape_interval, recrawl_interval, discover_interval,
+        )
     except Exception:
         _log.error("enrichment dispatcher registration failed", exc_info=True)
 
@@ -118,5 +139,6 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tool_queue.stop()
+        shutdown_huey()
         sched.shutdown(wait=False)
         _log.info("shutdown complete")

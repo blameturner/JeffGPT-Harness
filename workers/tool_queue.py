@@ -23,6 +23,8 @@ _DEFAULT_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 60, 3: 60, 4: 120, 5: 1
 _DEFAULT_BACKOFF = 300.0
 _DEFAULT_STRICT_CHAT_IDLE_S = 600.0
 _DEFAULT_STARTUP_GRACE_S = 600.0
+_DEFAULT_MAX_ATTEMPTS = 1
+_DEFAULT_RETRY_BACKOFF_S = 5.0
 
 _last_chat_activity: float = 0.0
 _activity_lock = threading.Lock()
@@ -71,6 +73,60 @@ def _additional_idle_for_job_type(job_type: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _min_idle_for_job_type(job_type: str) -> float | None:
+    """Optional absolute min-idle override for a job type.
+    When set, effective gate is max(base_gate, per_type_min_idle)."""
+    try:
+        from infra.config import get_feature
+        per_type = get_feature("tool_queue", "job_type_min_idle_seconds", None)
+        if isinstance(per_type, dict):
+            val = per_type.get(job_type)
+            if val is not None:
+                return max(0.0, float(val))
+    except Exception:
+        pass
+    return None
+
+
+def _effective_idle_gate(priority: int, job_type: str) -> float:
+    base = max(_backoff_for_priority(priority), _strict_chat_idle_floor_s())
+    per_type_min = _min_idle_for_job_type(job_type)
+    if per_type_min is not None:
+        return max(base, per_type_min)
+    # Back-compat path for older config shape.
+    return base + _additional_idle_for_job_type(job_type)
+
+
+def _max_attempts_for_job_type(job_type: str) -> int:
+    try:
+        from infra.config import get_feature
+        per_type = get_feature("tool_queue", "job_type_max_attempts", None)
+        if isinstance(per_type, dict):
+            val = per_type.get(job_type)
+            if val is not None:
+                return max(1, int(val))
+        raw = get_feature("tool_queue", "default_max_attempts", _DEFAULT_MAX_ATTEMPTS)
+        return max(1, int(raw))
+    except Exception:
+        return _DEFAULT_MAX_ATTEMPTS
+
+
+def _retry_backoff_s(job_type: str, attempt: int) -> float:
+    try:
+        from infra.config import get_feature
+        per_type = get_feature("tool_queue", "job_type_retry_backoff_seconds", None)
+        if isinstance(per_type, dict):
+            val = per_type.get(job_type)
+            if val is not None:
+                base = max(0.0, float(val))
+                return min(base * max(1, attempt), 300.0)
+        raw = get_feature("tool_queue", "default_retry_backoff_seconds", _DEFAULT_RETRY_BACKOFF_S)
+        base = max(0.0, float(raw))
+        return min(base * max(1, attempt), 300.0)
+    except Exception:
+        return _DEFAULT_RETRY_BACKOFF_S
 
 
 def _strict_chat_idle_floor_s() -> float:
@@ -296,7 +352,8 @@ class ToolJobQueue:
             payload=payload,
             depends_on=depends_on,
         )
-        self._persist_new(job)
+        if not self._persist_new(job):
+            raise RuntimeError(f"failed to persist job {job.job_id}")
         self._emit_event({
             "type": "job_queued",
             "job_id": job.job_id,
@@ -506,7 +563,7 @@ class ToolJobQueue:
                 idle = seconds_since_chat()
                 # pre-claim gate uses p1 + strict idle floor; per-job priority/additional
                 # checks are enforced again post-claim.
-                min_gate = max(_backoff_for_priority(1), _strict_chat_idle_floor_s()) + _additional_idle_for_job_type(job_type)
+                min_gate = _effective_idle_gate(1, job_type)
                 if idle < min_gate:
                     if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
                         _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
@@ -559,7 +616,7 @@ class ToolJobQueue:
                     continue
 
                 idle = seconds_since_chat()
-                required = max(_backoff_for_priority(job.priority), _strict_chat_idle_floor_s()) + _additional_idle_for_job_type(job_type)
+                required = _effective_idle_gate(job.priority, job.type)
                 if idle < required:
                     wait_secs = min(required - idle, 60)
                     _log.info("queue %s: job %s (priority=%d) needs %.0fs idle, currently %.0fs — sleeping %.0fs",
@@ -587,38 +644,127 @@ class ToolJobQueue:
 
             _log.info("queue %s: RUNNING  job=%s  type=%s  priority=%d  source=%s  org=%d",
                        worker_id, job.job_id[:12], job_type, job.priority, job.source or "-", job.org_id)
-            t0 = time.time()
+            if self._dispatch_to_huey(job, worker_id):
+                continue
 
+            # Fallback path when Huey is disabled/unavailable.
+            self._execute_job(job, config, worker_id)
+
+    def _dispatch_to_huey(self, job: ToolJob, worker_id: str) -> bool:
+        try:
+            from infra.huey_runtime import enqueue_tool_job, is_huey_consumer_running
+            if not is_huey_consumer_running():
+                return False
+            ok = enqueue_tool_job(job.job_id)
+            if ok:
+                _log.info(
+                    "queue %s: DISPATCHED  job=%s  type=%s  org=%d",
+                    worker_id, job.job_id[:12], job.type, job.org_id,
+                )
+                self._emit_event({
+                    "type": "job_dispatched",
+                    "job_id": job.job_id,
+                    "job_type": job.type,
+                })
+                return True
+        except Exception:
+            _log.error("queue %s: huey dispatch failed  job=%s", worker_id, job.job_id[:12], exc_info=True)
+        return False
+
+    def execute_claimed_job(self, job_id: str) -> dict:
+        """Execute a previously-claimed running job. Called by Huey worker tasks."""
+        job = self.get_job(job_id)
+        if not job:
+            return {"status": "not_found", "job_id": job_id}
+        if job.status != "running":
+            return {"status": "skipped", "reason": f"status_{job.status}", "job_id": job_id}
+        config = self._handlers.get(job.type)
+        if not config:
+            job.status = "failed"
+            job.error = f"no handler for job type {job.type}"[:500]
+            job.completed_at = datetime.now(timezone.utc).isoformat()
+            self._persist_update(job)
+            return {"status": "failed", "job_id": job_id, "error": job.error}
+        return self._execute_job(job, config, threading.current_thread().name)
+
+    def _execute_job(self, job: ToolJob, config: HandlerConfig, worker_id: str) -> dict:
+        t0 = time.time()
+        max_attempts = _max_attempts_for_job_type(job.type)
+        attempts = 0
+        last_result: dict = {}
+        while attempts < max_attempts:
+            attempts += 1
             try:
                 result = config.handler(job.payload)
-                job.status = "completed"
-                job.result = result or {}
-                job.completed_at = datetime.now(timezone.utc).isoformat()
-                elapsed = round(time.time() - t0, 1)
-                _log.info("queue %s: COMPLETED  job=%s  type=%s  %.1fs",
-                           worker_id, job.job_id[:12], job_type, elapsed)
-                self._emit_event({
-                    "type": "job_completed",
-                    "job_id": job.job_id,
-                    "job_type": job_type,
-                    "duration_s": elapsed,
-                })
+                result = result or {}
+                status_val = str((result.get("status") if isinstance(result, dict) else "") or "").lower()
+                if status_val in {"failed", "error"}:
+                    last_result = result if isinstance(result, dict) else {}
+                    job.error = str(last_result.get("reason") or last_result.get("error") or status_val)[:500]
+                    if attempts < max_attempts:
+                        delay = _retry_backoff_s(job.type, attempts)
+                        _log.warning(
+                            "queue %s: RETRYING  job=%s  type=%s  attempt=%d/%d  error=%s  delay=%.1fs",
+                            worker_id, job.job_id[:12], job.type, attempts, max_attempts, job.error, delay,
+                        )
+                        if self._stop.wait(timeout=delay):
+                            break
+                        continue
+                    job.status = "failed"
+                    job.result = last_result
+                else:
+                    job.status = "completed"
+                    job.result = result if isinstance(result, dict) else {}
+                    break
             except Exception as e:
-                job.status = "failed"
                 job.error = str(e)[:500]
-                job.completed_at = datetime.now(timezone.utc).isoformat()
-                elapsed = round(time.time() - t0, 1)
-                _log.error("queue %s: FAILED  job=%s  type=%s  error=%s  %.1fs",
-                           worker_id, job.job_id[:12], job_type, e, elapsed)
-                self._emit_event({
-                    "type": "job_failed",
-                    "job_id": job.job_id,
-                    "job_type": job_type,
-                    "error": str(e)[:200],
-                })
+                if attempts < max_attempts:
+                    delay = _retry_backoff_s(job.type, attempts)
+                    _log.warning(
+                        "queue %s: RETRYING  job=%s  type=%s  attempt=%d/%d  error=%s  delay=%.1fs",
+                        worker_id, job.job_id[:12], job.type, attempts, max_attempts, e, delay,
+                    )
+                    if self._stop.wait(timeout=delay):
+                        break
+                    continue
+                job.status = "failed"
 
-            self._persist_update(job)
-            self._wake_dependents(job.job_id)
+        if job.status not in {"completed", "failed"}:
+            job.status = "failed"
+        if not isinstance(job.result, dict):
+            job.result = {}
+        job.result.setdefault("attempt_count", attempts)
+        job.completed_at = datetime.now(timezone.utc).isoformat()
+        elapsed = round(time.time() - t0, 1)
+
+        if job.status == "completed":
+            _log.info("queue %s: COMPLETED  job=%s  type=%s  %.1fs attempts=%d",
+                      worker_id, job.job_id[:12], job.type, elapsed, attempts)
+            self._emit_event({
+                "type": "job_completed",
+                "job_id": job.job_id,
+                "job_type": job.type,
+                "duration_s": elapsed,
+            })
+        else:
+            _log.error("queue %s: FAILED  job=%s  type=%s  error=%s  %.1fs attempts=%d",
+                       worker_id, job.job_id[:12], job.type, job.error, elapsed, attempts)
+            self._emit_event({
+                "type": "job_failed",
+                "job_id": job.job_id,
+                "job_type": job.type,
+                "error": job.error[:200],
+            })
+
+        self._persist_update(job)
+        self._wake_dependents(job.job_id)
+        return {
+            "status": job.status,
+            "job_id": job.job_id,
+            "job_type": job.type,
+            "error": job.error,
+            "result": job.result,
+        }
 
     def _stale_checker_loop(self):
         while not self._stop.is_set():
@@ -661,6 +807,7 @@ class ToolJobQueue:
                     "scrape_target": 3,          # 15m — Playwright fallback + embed
                     "summarise_page": 3,         # 15m — summariser LLM
                     "classify_relevance": 3,     # 15m — classifier LLM
+                    "discover_agent_run": 3,     # 15m — Chroma sample + LLM + N SearXNG queries
                 }
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
@@ -682,16 +829,18 @@ class ToolJobQueue:
         from infra.nocodb_client import NocodbClient
         return NocodbClient()
 
-    def _persist_new(self, job: ToolJob):
+    def _persist_new(self, job: ToolJob) -> bool:
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
                 _log.warning("table %s not found — job %s not persisted", NOCODB_TABLE, job.job_id)
-                return
+                return False
             row = db._post(NOCODB_TABLE, job.to_row())
             job.nocodb_id = row.get("Id")
+            return True
         except Exception:
             _log.error("persist_new failed job=%s", job.job_id, exc_info=True)
+            return False
 
     def _persist_update(self, job: ToolJob):
         try:
