@@ -1,12 +1,139 @@
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
+from infra.config import HUEY_CONSUMER_WORKERS, HUEY_ENABLED, HUEY_SQLITE_PATH
+from infra.huey_runtime import get_huey, is_huey_consumer_running
 from infra.nocodb_client import NocodbClient
+from workers.tool_queue import ToolJob
 
 _log = logging.getLogger("main.stats")
 
 router = APIRouter()
+
+
+def _huey_status() -> dict:
+    return {
+        "enabled": bool(HUEY_ENABLED),
+        "consumer_running": is_huey_consumer_running(),
+        "workers": int(HUEY_CONSUMER_WORKERS or 1),
+        "sqlite_path": HUEY_SQLITE_PATH,
+        "queue_ready": bool(get_huey() is not None),
+    }
+
+
+def _scheduler_status(request: Request) -> dict:
+    sched = getattr(request.app.state, "scheduler", None)
+    running = bool(sched and sched.running)
+    agent_jobs: list[dict] = []
+    enrichment_jobs: list[dict] = []
+    if sched:
+        for job in sched.get_jobs():
+            payload = {
+                "id": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            }
+            if job.id.startswith("agent_schedule_"):
+                agent_jobs.append(payload)
+            elif job.id in {
+                "enrichment_scrape_dispatcher",
+                "pathfinder_recrawl_dispatcher",
+                "discover_agent_dispatcher",
+            }:
+                enrichment_jobs.append(payload)
+    next_run = None
+    for ej in agent_jobs:
+        if ej["next_run"] and (next_run is None or ej["next_run"] < next_run):
+            next_run = ej["next_run"]
+    next_enrichment_run = None
+    for ej in enrichment_jobs:
+        if ej["next_run"] and (next_enrichment_run is None or ej["next_run"] < next_enrichment_run):
+            next_enrichment_run = ej["next_run"]
+    return {
+        "running": running,
+        "next_run": next_run,
+        "next_enrichment_run": next_enrichment_run,
+        "agent_schedules": agent_jobs,
+        "enrichment_schedules": enrichment_jobs,
+    }
+
+
+@router.get("/ops/dashboard")
+def ops_dashboard(request: Request, org_id: int, limit: int = 20):
+    """Merged operational dashboard for frontend polling.
+
+    Combines queue status, Huey runtime, scheduler state, and recent org-scoped
+    enrichment rows/jobs in one response.
+    """
+    limit = min(max(1, limit), 100)
+    db = NocodbClient()
+
+    q = getattr(request.app.state, "tool_queue", None)
+    queue_status = q.status() if q is not None else {"error": "Tool queue not initialised"}
+    recent_jobs: list[dict] = []
+    if q is not None:
+        recent_jobs = q.list_jobs(limit=limit, org_id=org_id, verbose=True)
+    else:
+        try:
+            rows = db._get("tool_jobs", params={
+                "where": f"(org_id,eq,{org_id})",
+                "sort": "-CreatedAt",
+                "limit": limit,
+            }).get("list", [])
+            recent_jobs = [ToolJob.from_row(r).to_api(verbose=True) for r in rows]
+        except Exception:
+            _log.warning("ops/dashboard tool_jobs query failed  org_id=%d", org_id, exc_info=True)
+
+    try:
+        discovery_rows = db._get_paginated("discovery", params={
+            "where": f"(org_id,eq,{org_id})",
+            "sort": "-CreatedAt",
+            "limit": limit,
+        })
+    except Exception:
+        _log.warning("ops/dashboard discovery query failed  org_id=%d", org_id, exc_info=True)
+        discovery_rows = []
+
+    try:
+        scrape_target_rows = db._get_paginated("scrape_targets", params={
+            "where": f"(org_id,eq,{org_id})",
+            "sort": "-CreatedAt",
+            "limit": limit,
+        })
+    except Exception:
+        _log.warning("ops/dashboard scrape_targets query failed  org_id=%d", org_id, exc_info=True)
+        scrape_target_rows = []
+
+    active_jobs = [j for j in recent_jobs if j.get("status") in ("queued", "running")]
+
+    return {
+        "status": "ok",
+        "org_id": org_id,
+        "queue": queue_status,
+        "runtime": {
+            "tool_queue_ready": q is not None,
+            "huey": _huey_status(),
+        },
+        "scheduler": _scheduler_status(request),
+        "discovery": {
+            "count": len(discovery_rows),
+            "rows": discovery_rows,
+        },
+        "scrape_targets": {
+            "count": len(scrape_target_rows),
+            "rows": scrape_target_rows,
+        },
+        "queue_jobs": {
+            "count": len(recent_jobs),
+            "rows": recent_jobs,
+        },
+        "active_summary": {
+            "active": len(active_jobs),
+            "queued": sum(1 for j in active_jobs if j.get("status") == "queued"),
+            "running": sum(1 for j in active_jobs if j.get("status") == "running"),
+            "org_id": org_id,
+        },
+    }
 
 
 @router.get("/stats/usage")

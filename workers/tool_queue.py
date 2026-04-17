@@ -205,7 +205,26 @@ class ToolJob:
             "depends_on": self.depends_on,
         }
 
-    def to_api(self) -> dict:
+    def _task_summary(self) -> str:
+        meta = self.payload.get("metadata") or {}
+        for candidate in (
+            meta.get("title"),
+            meta.get("name"),
+            self.payload.get("task"),
+            self.payload.get("topic"),
+            self.payload.get("url"),
+            self.payload.get("seed_url"),
+            self.payload.get("query"),
+            self.payload.get("message_id"),
+            self.payload.get("plan_id"),
+            self.payload.get("target_id"),
+            self.payload.get("discovery_id"),
+        ):
+            if candidate not in (None, ""):
+                return str(candidate)
+        return ""
+
+    def to_api(self, verbose: bool = False) -> dict:
         meta = self.payload.get("metadata") or {}
         d = {
             "job_id": self.job_id,
@@ -218,13 +237,24 @@ class ToolJob:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "depends_on": self.depends_on,
+            "task": self._task_summary() or None,
         }
-        if meta.get("conversation_id"):
-            d["conversation_id"] = meta["conversation_id"]
-        if meta.get("url"):
-            d["url"] = meta["url"]
-        if meta.get("title") or meta.get("name"):
-            d["title"] = meta.get("title") or meta.get("name")
+        conversation_id = meta.get("conversation_id") or self.payload.get("conversation_id")
+        url = meta.get("url") or self.payload.get("url") or self.payload.get("seed_url")
+        title = meta.get("title") or meta.get("name")
+        if conversation_id:
+            d["conversation_id"] = conversation_id
+        if url:
+            d["url"] = url
+        if title:
+            d["title"] = title
+        if self.result:
+            d["result_status"] = self.result.get("status")
+        if verbose:
+            d["claimed_by"] = self.claimed_by or None
+            d["nocodb_id"] = self.nocodb_id
+            d["payload"] = self.payload
+            d["result"] = self.result
         return d
 
     @staticmethod
@@ -443,7 +473,15 @@ class ToolJobQueue:
             pass
         return None
 
-    def list_jobs(self, job_type: str = "", status: str = "", source: str = "", limit: int = 50) -> list[dict]:
+    def list_jobs(
+        self,
+        job_type: str = "",
+        status: str = "",
+        source: str = "",
+        limit: int = 50,
+        org_id: int | None = None,
+        verbose: bool = False,
+    ) -> list[dict]:
         try:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
@@ -455,6 +493,8 @@ class ToolJobQueue:
                 where_parts.append(f"(status,eq,{status})")
             if source:
                 where_parts.append(f"(source,eq,{source})")
+            if org_id is not None:
+                where_parts.append(f"(org_id,eq,{int(org_id)})")
             params: dict[str, Any] = {
                 "sort": "-CreatedAt",
                 "limit": limit,
@@ -462,7 +502,7 @@ class ToolJobQueue:
             if where_parts:
                 params["where"] = "~and".join(where_parts)
             rows = db._get(NOCODB_TABLE, params=params).get("list", [])
-            return [ToolJob.from_row(r).to_api() for r in rows]
+            return [ToolJob.from_row(r).to_api(verbose=verbose) for r in rows]
         except Exception:
             return []
 

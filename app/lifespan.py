@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
     from tools.enrichment.summariser import summarise_page_job
     from tools.enrichment.pathfinder import pathfinder_crawl_job
     from tools.enrichment.classifier import classify_relevance_job
+    from tools.enrichment.discover_agent import discover_agent_job
     tool_queue = ToolJobQueue()
     # Priority tiers (lower number = picked first, shorter chat-idle needed):
     #   2 = user-facing planned_search (runs first when user approves queries)
@@ -80,6 +81,12 @@ async def lifespan(app: FastAPI):
         handler=scrape_target_job,
         max_workers=2, priority_default=4, source="scraper",
     ))
+    tool_queue.register("discover_agent_run", HandlerConfig(
+        # autonomous discovery worker: samples Chroma, generates web queries,
+        # and feeds new root URLs into discovery for pathfinder to expand.
+        handler=discover_agent_job,
+        max_workers=1, priority_default=5, source="discover_agent",
+    ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue
     tool_queue.start()
@@ -92,7 +99,7 @@ async def lifespan(app: FastAPI):
     try:
         from datetime import datetime, timedelta, timezone
         from infra.config import get_feature
-        from tools.enrichment.dispatcher import jumpstart_scraper, jumpstart_pathfinder
+        from tools.enrichment.dispatcher import jumpstart_scraper, jumpstart_pathfinder, jumpstart_discover_agent
         from apscheduler.triggers.interval import IntervalTrigger
         scrape_interval = int(get_feature("scraper", "dispatch_interval_minutes", 5))
         # Hold dispatchers for 10 minutes after startup so background queue work

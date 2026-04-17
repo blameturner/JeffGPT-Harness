@@ -102,21 +102,36 @@ def scheduler_status(request: Request):
     running = bool(sched and sched.running)
 
     agent_jobs: list[dict] = []
+    enrichment_jobs: list[dict] = []
     if sched:
         for job in sched.get_jobs():
+            payload = {
+                "id": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            }
             if job.id.startswith("agent_schedule_"):
-                agent_jobs.append({
-                    "id": job.id,
-                    "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
-                })
+                agent_jobs.append(payload)
+            elif job.id in {
+                "enrichment_scrape_dispatcher",
+                "pathfinder_recrawl_dispatcher",
+                "discover_agent_dispatcher",
+            }:
+                enrichment_jobs.append(payload)
 
     next_run = None
     for ej in agent_jobs:
         if ej["next_run"] and (next_run is None or ej["next_run"] < next_run):
             next_run = ej["next_run"]
 
+    next_enrichment_run = None
+    for ej in enrichment_jobs:
+        if ej["next_run"] and (next_enrichment_run is None or ej["next_run"] < next_enrichment_run):
+            next_enrichment_run = ej["next_run"]
+
     return {
         "running": running,
         "next_run": next_run,
+        "next_enrichment_run": next_enrichment_run,
         "agent_schedules": agent_jobs,
+        "enrichment_schedules": enrichment_jobs,
     }

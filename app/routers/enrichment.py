@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from infra.nocodb_client import NocodbClient
-from workers.tool_queue import get_tool_queue
+from workers.tool_queue import ToolJob, get_tool_queue
 
 _log = logging.getLogger("main.enrichment")
 
@@ -214,6 +214,30 @@ _SCRAPE_TARGET_LIST_FIELDS = (
 )
 
 
+def _get_single_row(client: NocodbClient, table: str, row_id: int) -> dict | None:
+    try:
+        rows = client._get(table, params={
+            "where": f"(Id,eq,{row_id})",
+            "limit": 1,
+        }).get("list", [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _recent_tool_jobs_for_org(client: NocodbClient, org_id: int, limit: int = 20) -> list[dict]:
+    try:
+        rows = client._get("tool_jobs", params={
+            "where": f"(org_id,eq,{org_id})",
+            "sort": "-CreatedAt",
+            "limit": limit,
+        }).get("list", [])
+        return [ToolJob.from_row(r).to_api(verbose=True) for r in rows]
+    except Exception:
+        _log.warning("recent tool_jobs query failed  org_id=%d", org_id, exc_info=True)
+        return []
+
+
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
     limit = min(max(1, limit), 500)
@@ -272,3 +296,59 @@ def scrape_targets_list(org_id: int, status: str | None = None, active_only: boo
     }
     rows = client._get_paginated("scrape_targets", params=params)
     return {"status": "ok", "rows": rows}
+
+
+@router.get("/discovery/{row_id}")
+def discovery_get(row_id: int):
+    client = NocodbClient()
+    row = _get_single_row(client, "discovery", row_id)
+    if not row:
+        return {"status": "not_found", "row": None}
+    return {"status": "ok", "row": row}
+
+
+@router.get("/scrape-targets/{target_id}")
+def scrape_target_get(target_id: int):
+    client = NocodbClient()
+    row = _get_single_row(client, "scrape_targets", target_id)
+    if not row:
+        return {"status": "not_found", "row": None}
+    return {"status": "ok", "row": row}
+
+
+@router.get("/dashboard")
+def enrichment_dashboard(org_id: int, limit: int = 20):
+    """Combined enrichment view for frontend dashboards.
+
+    Returns recent discovery rows, scrape targets, and verbose tool_jobs for the
+    org without using `fields=` filters that previously caused NocoDB errors.
+    """
+    limit = min(max(1, limit), 100)
+    client = NocodbClient()
+    discovery_rows = client._get_paginated("discovery", params={
+        "where": f"(org_id,eq,{org_id})",
+        "sort": "-CreatedAt",
+        "limit": limit,
+    })
+    scrape_target_rows = client._get_paginated("scrape_targets", params={
+        "where": f"(org_id,eq,{org_id})",
+        "sort": "-CreatedAt",
+        "limit": limit,
+    })
+    queue_jobs = _recent_tool_jobs_for_org(client, org_id, limit=limit)
+    return {
+        "status": "ok",
+        "org_id": org_id,
+        "discovery": {
+            "count": len(discovery_rows),
+            "rows": discovery_rows,
+        },
+        "scrape_targets": {
+            "count": len(scrape_target_rows),
+            "rows": scrape_target_rows,
+        },
+        "queue_jobs": {
+            "count": len(queue_jobs),
+            "rows": queue_jobs,
+        },
+    }
