@@ -18,6 +18,17 @@ from infra.config import (
 
 _log = logging.getLogger("huey.runtime")
 
+# Suppress Huey's internal scheduler/worker heartbeat DEBUG spam.
+# These loggers emit a "Sleeping for ~1 s" line every second which is
+# expected behaviour but very noisy in aggregated logs.
+for _noisy in (
+    "huey.consumer",
+    "huey.consumer.Scheduler",
+    "huey.consumer.Worker",
+    "huey.consumer.Monitor",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 _huey: SqliteHuey | None = None
 _run_tool_job_task: Callable[[str], Any] | None = None
 _consumer = None
@@ -111,7 +122,7 @@ def start_huey_consumer() -> bool:
             return
 
     workers = max(1, int(HUEY_CONSUMER_WORKERS or 1))
-    _consumer = _ThreadedConsumer(_huey, workers=workers)
+    _consumer = _ThreadedConsumer(_huey, workers=workers, scheduler_interval=5)
     _consumer_thread = threading.Thread(target=_consumer.run, daemon=True, name="huey-consumer")
     _consumer_thread.start()
     _log.info("huey consumer started  workers=%d", workers)
