@@ -19,7 +19,8 @@ async def lifespan(app: FastAPI):
 
     huey = init_huey()
     app.state.huey = huey
-    if not huey:
+    # SqliteHuey is falsy when the queue is empty; only treat None as init failure.
+    if huey is None:
         raise RuntimeError("Huey initialisation failed; refusing startup in Huey-only mode")
     started = start_huey_consumer()
     if not started:
