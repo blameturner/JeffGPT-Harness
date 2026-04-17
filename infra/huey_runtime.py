@@ -103,8 +103,15 @@ def start_huey_consumer() -> bool:
 
     from huey.consumer import Consumer
 
+    class _ThreadedConsumer(Consumer):
+        # We run the consumer loop in a background thread from FastAPI lifespan.
+        # Huey's default signal wiring only works in the main interpreter thread.
+        # Overriding this avoids `ValueError: signal only works in main thread`.
+        def _set_signal_handlers(self):  # type: ignore[override]
+            return
+
     workers = max(1, int(HUEY_CONSUMER_WORKERS or 1))
-    _consumer = Consumer(_huey, workers=workers)
+    _consumer = _ThreadedConsumer(_huey, workers=workers)
     _consumer_thread = threading.Thread(target=_consumer.run, daemon=True, name="huey-consumer")
     _consumer_thread.start()
     _log.info("huey consumer started  workers=%d", workers)
@@ -124,6 +131,11 @@ def shutdown_huey() -> None:
                 stop(graceful=True)
             except TypeError:
                 stop()
+            except RuntimeError as e:
+                # Huey may raise this on very fast start->stop cycles when
+                # internal worker threads have not fully started yet.
+                if "before it is started" not in str(e):
+                    _log.warning("huey consumer stop runtime error", exc_info=True)
             except Exception:
                 _log.warning("huey consumer stop failed", exc_info=True)
     if _consumer_thread is not None and _consumer_thread.is_alive():

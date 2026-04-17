@@ -451,8 +451,12 @@ def _run_research_agent_inner(
             )
             _log.info("Re-queued research agent job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
         else:
-            _log.warning("Tool queue not available, continuing synchronously for plan_id %d", plan_id)
-            return run_research_agent(plan_id)
+            _log.error("Tool queue unavailable during research iteration  plan_id=%d", plan_id)
+            client._patch("research_plans", plan_id, {
+                "status": "failed",
+                "error_message": "tool_queue_unavailable",
+            })
+            return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
 
         return {"status": "needs_more_research", "confidence": confidence, "new_queries": new_queries, "plan_id": plan_id}
     else:
@@ -486,8 +490,12 @@ def _run_research_agent_inner(
                         "plan_id": plan_id,
                         "note": "fallback_queries_generated",
                     }
-                _log.warning("Tool queue unavailable for fallback iteration; continuing synchronously  plan_id=%d", plan_id)
-                return run_research_agent(plan_id)
+                _log.error("Tool queue unavailable for fallback iteration  plan_id=%d", plan_id)
+                client._patch("research_plans", plan_id, {
+                    "status": "failed",
+                    "error_message": "tool_queue_unavailable",
+                })
+                return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
 
         # Final fallback: preserve synthesized markdown as best-effort completion
         # instead of failing hard with an unusable row.

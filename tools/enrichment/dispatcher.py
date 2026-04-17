@@ -25,9 +25,12 @@ def _count_inflight(client: NocodbClient, job_type: str) -> int:
     return total
 
 
-def _default_org_id(client: NocodbClient) -> int:
-    """Pick an active org_id for jumpstart tool_jobs so they're filterable in the
-    UI. Falls back to 1 (the default tenant) if no data exists yet."""
+def _default_org_id(client: NocodbClient) -> int | None:
+    """Pick an active org_id for jumpstart tool_jobs so they're filterable in the UI.
+
+    Returns None when no tenant context exists yet; callers should skip dispatch
+    instead of submitting jobs with synthetic org ids.
+    """
     for table in ("discovery", "scrape_targets"):
         try:
             rows = client._get(table, params={
@@ -41,7 +44,7 @@ def _default_org_id(client: NocodbClient) -> int:
                     return org
         except Exception:
             continue
-    return 1
+    return None
 
 
 def jumpstart_scraper() -> dict:
@@ -63,6 +66,8 @@ def jumpstart_scraper() -> dict:
         return {"status": "already_running", "inflight": inflight}
 
     org_id = _default_org_id(client)
+    if not org_id:
+        return {"status": "no_org_context"}
     try:
         job_id = tq.submit("scrape_target", {}, source="scraper_jumpstart", priority=4, org_id=org_id)
     except Exception:
@@ -92,6 +97,8 @@ def jumpstart_pathfinder() -> dict:
         return {"status": "already_running", "inflight": inflight}
 
     org_id = _default_org_id(client)
+    if not org_id:
+        return {"status": "no_org_context"}
     try:
         job_id = tq.submit("pathfinder_crawl", {}, source="pathfinder_jumpstart", priority=5, org_id=org_id)
     except Exception:
@@ -128,6 +135,8 @@ def jumpstart_discover_agent() -> dict:
         return {"status": "already_running", "inflight": inflight}
 
     org_id = _default_org_id(client)
+    if not org_id:
+        return {"status": "no_org_context"}
     try:
         job_id = tq.submit(
             "discover_agent_run", {"org_id": org_id},

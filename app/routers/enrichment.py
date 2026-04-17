@@ -58,9 +58,7 @@ def pathfinder_discover(req: PathfinderRequest):
 
     tq = get_tool_queue()
     if not tq:
-        # fallback: run synchronously (degraded)
-        from tools.enrichment.pathfinder import discover
-        return {"status": "ok", **discover(norm_url, req.org_id)}
+        return {"status": "failed", "error": "tool_queue_unavailable"}
 
     # Priority 3: user-initiated crawls run ahead of background enrichment (4/5)
     # but after interactive planned_search/research (2/3).
@@ -162,9 +160,7 @@ def research_complete(plan_id: int):
 def research_agent_run(req: ResearchAgentRequest):
     tq = get_tool_queue()
     if not tq:
-        from tools.research.agent import run_research_agent
-        result = run_research_agent(req.plan_id)
-        return {"status": result.get("status"), **result}
+        return {"status": "failed", "error": "tool_queue_unavailable"}
 
     org_id = 0
     try:

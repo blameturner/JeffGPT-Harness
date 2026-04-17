@@ -273,8 +273,12 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
         _log.info("Queued research planner job %s for plan_id %d", job_id, plan_id)
         return {"status": "queued", "plan_id": plan_id, "job_id": job_id}
 
-    _log.warning("Tool queue not available, running planner synchronously for plan_id %d", plan_id)
-    return run_research_planner_job(plan_id)
+    _log.error("Tool queue unavailable for research planner plan_id=%d", plan_id)
+    client._patch("research_plans", plan_id, {
+        "status": "failed",
+        "error_message": "tool_queue_unavailable",
+    })
+    return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
 
 
 def run_research_planner_job(plan_id: int) -> dict:
@@ -333,17 +337,12 @@ def run_research_planner_job(plan_id: int) -> dict:
         )
         _log.info("Queued research agent job %s for plan_id %d", job_id, plan_id)
     else:
-        _log.warning("Tool queue not available, running research agent synchronously for plan_id %d", plan_id)
-        try:
-            from tools.research.agent import run_research_agent
-            return run_research_agent(plan_id)
-        except Exception as e:
-            _log.warning("synchronous research agent fallback failed  id=%d  error=%s", plan_id, e)
-            client._patch("research_plans", plan_id, {
-                "status": "failed",
-                "error_message": f"fallback run failed: {str(e)[:300]}",
-            })
-            return {"status": "failed", "error": str(e)[:200], "plan_id": plan_id}
+        _log.error("Tool queue unavailable for research agent enqueue plan_id=%d", plan_id)
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": "tool_queue_unavailable",
+        })
+        return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
 
     return {"status": "generating", "plan_id": plan_id, "query_count": len(queries)}
 

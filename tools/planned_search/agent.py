@@ -269,8 +269,8 @@ async def approve_searches(message_id: int, org_id: int) -> dict:
         _log.info("Queued planned_search job %s for message_id %s", job_id, message_id)
         return {"status": "queued", "message_id": message_id, "job_id": job_id}
 
-    _log.warning("Tool queue not available, running planned_search synchronously for message_id %s", message_id)
-    return await _run_planned_search_async(message_id, row_org_id)
+    _log.error("Tool queue unavailable for planned_search message_id=%s", message_id)
+    return {"status": "error", "message": "tool_queue_unavailable"}
 
 
 def run_planned_search_job(message_id: int, org_id: int) -> dict:

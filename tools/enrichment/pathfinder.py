@@ -792,7 +792,7 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
         direct_discovery_id = None
 
     client = NocodbClient()
-    chain_org_id = 1  # default tenant if we can't derive from a picked row
+    chain_org_id = 0
 
     # Cooldown guard: bail if another pathfinder_crawl completed recently. Applies
     # only to scheduled/background runs (direct_discovery_id paths are user-initiated
@@ -824,7 +824,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
             return {"status": "not_found", "discovery_id": direct_discovery_id}
         row = rows[0]
-        chain_org_id = int(row.get("org_id") or 0) or 1
+        chain_org_id = int(row.get("org_id") or 0)
+        if chain_org_id <= 0:
+            _log.warning("pathfinder direct row missing org_id  id=%s", row.get("Id"))
+            return {"status": "error", "reason": "missing_org_id", "discovery_id": direct_discovery_id}
         res = _process_one_seed(
             client,
             seed_url=row.get("url") or "",
@@ -838,7 +841,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
     # Scheduled/chained path: pick ONE seed. Stale discovery first, then oldest scrape_target.
     seed = _pick_next_discovery_root(client)
     if seed:
-        chain_org_id = int(seed.get("org_id") or 0) or 1
+        chain_org_id = int(seed.get("org_id") or 0)
+        if chain_org_id <= 0:
+            _log.warning("pathfinder scheduled seed missing org_id  id=%s", seed.get("Id"))
+            return {"status": "error", "reason": "missing_org_id", "discovery_id": int(seed.get("Id") or 0) or None}
         res = _process_one_seed(
             client,
             seed_url=seed.get("url") or "",
@@ -851,7 +857,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
 
     fallback = _pick_next_scrape_target_seed(client)
     if fallback:
-        chain_org_id = int(fallback.get("org_id") or 0) or 1
+        chain_org_id = int(fallback.get("org_id") or 0)
+        if chain_org_id <= 0:
+            _log.warning("pathfinder fallback target missing org_id  id=%s", fallback.get("Id"))
+            return {"status": "error", "reason": "missing_org_id", "scrape_target_id": int(fallback.get("Id") or 0) or None}
         fallback_url = _normalize(fallback.get("url") or "") or (fallback.get("url") or "")
         fallback_target_id = int(fallback.get("Id") or 0) or None
 

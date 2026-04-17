@@ -11,13 +11,20 @@ _log = log.get("harness")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _log.info("mstag-harness starting")
+    from infra.config import HUEY_ENABLED
     from infra.huey_runtime import init_huey, shutdown_huey, start_huey_consumer
+
+    if not HUEY_ENABLED:
+        raise RuntimeError("HUEY_ENABLED is false; tool queue is configured for Huey-only execution")
 
     huey = init_huey()
     app.state.huey = huey
-    if huey:
-        started = start_huey_consumer()
-        _log.info("huey runtime ready  consumer_started=%s", started)
+    if not huey:
+        raise RuntimeError("Huey initialisation failed; refusing startup in Huey-only mode")
+    started = start_huey_consumer()
+    if not started:
+        raise RuntimeError("Huey consumer failed to start; refusing startup in Huey-only mode")
+    _log.info("huey runtime ready  consumer_started=%s", started)
 
     from scheduler import start_scheduler
     sched = start_scheduler()

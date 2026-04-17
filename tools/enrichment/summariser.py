@@ -16,13 +16,15 @@ def summarise_page_job(payload: dict) -> dict:
     """Tool-queue handler: takes scraped page text, runs the summariser model, persists the summary."""
     url = payload.get("url") or ""
     text = payload.get("text") or ""
-    org_id = int(payload.get("org_id") or 0) or 1  # never write to org-0 collection
+    org_id = int(payload.get("org_id") or 0)
     source = payload.get("source") or "scrape"
     scrape_target_id = payload.get("scrape_target_id")
     discovery_id = payload.get("discovery_id")
 
     if not url or not text:
         return {"status": "error", "reason": "missing_url_or_text"}
+    if org_id <= 0:
+        return {"status": "error", "reason": "missing_org_id"}
 
     function_name = get_feature("scraper", "summariser_model", DEFAULT_SUMMARY_FUNCTION)
     try:

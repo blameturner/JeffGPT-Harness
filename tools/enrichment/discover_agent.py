@@ -237,7 +237,8 @@ def discover_agent_job(payload: dict | None = None) -> dict:
         except Exception:
             pass
     if not org_id:
-        org_id = 1  # last-resort default tenant
+        _log.info("discover_agent: no org context available, skipping run")
+        return {"status": "no_org_context"}
 
     n_samples = int(_cfg("sample_chunks", 12))
     n_queries = int(_cfg("queries_per_run", 6))

@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 import uuid
+from math import ceil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -687,8 +688,17 @@ class ToolJobQueue:
             if self._dispatch_to_huey(job, worker_id):
                 continue
 
-            # Fallback path when Huey is disabled/unavailable.
-            self._execute_job(job, config, worker_id)
+            # Huey-only execution path: if dispatch fails, put the job back and retry.
+            # This prevents split execution implementations (inline + Huey).
+            _log.error(
+                "queue %s: huey dispatch unavailable, re-queueing job=%s type=%s",
+                worker_id, job.job_id[:12], job.type,
+            )
+            self._unclaim(job)
+            # Wake this worker type immediately once we re-queue so recovery does
+            # not wait up to JOB_QUEUE_POLL_INTERVAL (default 300s).
+            wake.set()
+            self._stop.wait(timeout=2)
 
     def _dispatch_to_huey(self, job: ToolJob, worker_id: str) -> bool:
         try:
@@ -821,6 +831,45 @@ class ToolJobQueue:
             db = self._db()
             if NOCODB_TABLE not in db.tables:
                 return
+            # Dynamic stale sizing for long fan-out jobs.
+            # planned_search_execute runtime can legitimately approach
+            # scrape_timeout_s + synthesis_timeout_s.
+            planned_dynamic_mult = 14
+            research_agent_dynamic_mult = 8
+            research_planner_dynamic_mult = 4
+            try:
+                from infra.config import get_feature
+                scrape_s = int(get_feature("planned_search", "scrape_timeout_s", 1800) or 1800)
+                synth_s = int(get_feature("planned_search", "synthesis_timeout_s", 1800) or 1800)
+                # Add a 5-minute buffer for queue bookkeeping/DB writes.
+                required_s = max(300, scrape_s + synth_s + 300)
+                planned_dynamic_mult = max(14, int(ceil(required_s / max(1, JOB_QUEUE_STALE_TIMEOUT))))
+
+                # research_agent can run multiple web-search calls (one per query)
+                # then synthesis + critic in the same handler invocation.
+                rq_timeout = int(get_feature("research", "web_search_per_query_timeout_s", 180) or 180)
+                rq_max = int(get_feature("research", "max_queries", 20) or 20)
+                rs_timeout = int(get_feature("research", "synthesis_timeout_s", 1200) or 1200)
+                rc_timeout = int(get_feature("research", "critic_timeout_s", 480) or 480)
+                research_required_s = max(600, rq_timeout * max(1, rq_max) + rs_timeout + rc_timeout + 300)
+                # Cap at 6h so stale reset still recovers truly wedged jobs.
+                research_agent_dynamic_mult = min(
+                    72,
+                    max(8, int(ceil(research_required_s / max(1, JOB_QUEUE_STALE_TIMEOUT)))),
+                )
+
+                # research_planner performs one bounded planner LLM call.
+                rp_timeout = int(get_feature("research", "planner_timeout_s", 1800) or 1800)
+                planner_required_s = max(600, rp_timeout + 300)
+                research_planner_dynamic_mult = min(
+                    24,
+                    max(4, int(ceil(planner_required_s / max(1, JOB_QUEUE_STALE_TIMEOUT)))),
+                )
+            except Exception:
+                planned_dynamic_mult = 14
+                research_agent_dynamic_mult = 8
+                research_planner_dynamic_mult = 4
+
             rows = db._get_paginated(NOCODB_TABLE, params={
                 "where": "(status,eq,running)",
                 "limit": 100,
@@ -840,9 +889,11 @@ class ToolJobQueue:
                 job_type = row.get("type") or ""
                 _STALE_MULTIPLIERS = {
                     "graph_extract": 4,          # 20m — LLM inference 7-16min
-                    "research_planner": 4,       # 20m — plan generation LLM
-                    "research_agent": 8,         # 40m — N web_search calls + synth LLM + critic LLM per iteration
-                    "planned_search_execute": 8, # 40m — up to 10 scrapes + synthesis LLM
+                    "research_planner": research_planner_dynamic_mult,
+                    "research_agent": research_agent_dynamic_mult,
+                    # Dynamic: scales with configured planned_search timeouts.
+                    "planned_search_execute": planned_dynamic_mult,
+                    "planned_search_scrape": 3,   # 15m — scrape worker with network variance
                     "pathfinder_crawl": 3,       # 15m — one scrape + link writes, but Playwright can stall
                     "scrape_target": 3,          # 15m — Playwright fallback + embed
                     "summarise_page": 3,         # 15m — summariser LLM
