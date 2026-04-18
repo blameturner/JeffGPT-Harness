@@ -61,6 +61,29 @@ def _parse_iso(value) -> datetime | None:
     return dt
 
 
+def _is_truthy_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _created_at_key(row: dict) -> tuple[datetime, int]:
+    return (
+        _parse_iso(row.get("CreatedAt") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        int(row.get("Id") or 0),
+    )
+
+
+def _due_at_key(row: dict) -> tuple[datetime, datetime, int]:
+    return (
+        _parse_iso(row.get("next_crawl_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        _parse_iso(row.get("CreatedAt") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        int(row.get("Id") or 0),
+    )
+
+
 def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
     rows: list[dict] = []
     try:
@@ -74,27 +97,32 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
         return []
 
     now = datetime.now(timezone.utc)
-    never: list[dict] = []
-    due: list[dict] = []
+    manual_never: list[dict] = []
+    manual_due: list[dict] = []
+    auto_due: list[dict] = []
+    auto_never: list[dict] = []
     for r in rows:
+        is_auto = _is_truthy_flag(r.get("auto_crawled"))
         if r.get("last_scraped_at") in (None, ""):
-            never.append(r)
+            bucket = auto_never if is_auto else manual_never
+            bucket.append({**r, "_selection_bucket": "auto_never" if is_auto else "manual_never"})
             continue
         nca = _parse_iso(r.get("next_crawl_at"))
         if nca is None or nca <= now:
-            due.append(r)
+            bucket = auto_due if is_auto else manual_due
+            bucket.append({**r, "_selection_bucket": "auto_due" if is_auto else "manual_due"})
 
-    # Manual/operator-added targets (auto_crawled=0 or NULL) always go before
-    # pathfinder-discovered ones (auto_crawled=1). Within each group the existing
-    # CreatedAt ordering is preserved (oldest first).
-    def _auto_key(r: dict) -> int:
-        return 1 if r.get("auto_crawled") else 0
+    manual_never.sort(key=_created_at_key)
+    manual_due.sort(key=_due_at_key)
+    auto_due.sort(key=_due_at_key)
+    auto_never.sort(key=_created_at_key)
 
-    never.sort(key=_auto_key)
-    due.sort(key=_auto_key)
-
-    _log.debug("fetch_due_targets  total=%d never=%d due=%d", len(rows), len(never), len(due))
-    return (never + due)[:limit]
+    ordered = manual_never + manual_due + auto_due + auto_never
+    _log.debug(
+        "fetch_due_targets total=%d manual_never=%d manual_due=%d auto_due=%d auto_never=%d",
+        len(rows), len(manual_never), len(manual_due), len(auto_due), len(auto_never),
+    )
+    return ordered[:limit]
 
 
 def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
@@ -105,10 +133,10 @@ def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
 
 
 def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> dict:
-    client = client or NocodbClient()
+    db: NocodbClient = client if client is not None else NocodbClient()
 
     try:
-        rows = client._get("scrape_targets", params={
+        rows = db._get("scrape_targets", params={
             "where": f"(Id,eq,{target_id})",
             "limit": 1,
         }).get("list", [])
@@ -126,7 +154,7 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
     consecutive_unchanged = int(row.get("consecutive_unchanged") or 0)
     prior_hash = row.get("content_hash") or ""
     if not url:
-        _patch_target(client, target_id, {"status": "error", "last_scrape_error": "no_url"})
+        _patch_target(db, target_id, {"status": "error", "last_scrape_error": "no_url"})
         return {"status": "error", "reason": "no_url", "target_id": target_id}
 
     scraper = PathfinderScraper(timeout=30)
@@ -134,7 +162,7 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
         result = scraper.scrape(url)
     except Exception as e:
         new_failures = consecutive_failures + 1
-        _patch_target(client, target_id, {
+        _patch_target(db, target_id, {
             "status": "error",
             "last_scrape_error": str(e)[:500],
             "consecutive_failures": new_failures,
@@ -156,7 +184,7 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
             patch["active"] = 0
             _log.warning("scrape_target deactivated after %d failures  id=%d url=%s",
                          new_failures, target_id, url[:100])
-        _patch_target(client, target_id, patch)
+        _patch_target(db, target_id, patch)
         _log.info("scrape_target failed  id=%d url=%s reason=%s failures=%d",
                   target_id, url[:100], err, new_failures)
         return {"status": "failed", "target_id": target_id, "url": url, "reason": err}
@@ -164,7 +192,7 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
     text = (result.get("text") or "").strip()
     if not text:
         new_failures = consecutive_failures + 1
-        _patch_target(client, target_id, {
+        _patch_target(db, target_id, {
             "status": "error",
             "last_scrape_error": "empty_text",
             "consecutive_failures": new_failures,
@@ -198,7 +226,7 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
             chunks_added = 0
 
     total_chunks = int(row.get("chunk_count") or 0) + chunks_added
-    _patch_target(client, target_id, {
+    _patch_target(db, target_id, {
         "status": "ok",
         "last_scraped_at": _now_iso(),
         "next_crawl_at": _next_crawl_at(frequency_hours, 0),
@@ -310,6 +338,15 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
     if not targets:
         _log.info("scraper batch: no due targets — idle")
         return {"status": "idle", "processed": 0}
+
+    bucket_counts: dict[str, int] = {}
+    for t in targets:
+        bucket = str(t.get("_selection_bucket") or "unknown")
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+    _log.info(
+        "scraper batch selected  count=%d buckets=%s first_ids=%s",
+        len(targets), bucket_counts, [int(t.get("Id") or 0) for t in targets[:5]],
+    )
 
     processed: list[dict] = []
     for t in targets:

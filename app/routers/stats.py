@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from infra.config import HUEY_CONSUMER_WORKERS, HUEY_ENABLED, HUEY_SQLITE_PATH
 from infra.huey_runtime import get_huey, is_huey_consumer_running
 from infra.nocodb_client import NocodbClient
+from app.routers.enrichment import build_enrichment_runtime_snapshot
 from workers.tool_queue import ToolJob
 
 _log = logging.getLogger("main.stats")
@@ -115,6 +116,7 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "huey": _huey_status(),
         },
         "scheduler": _scheduler_status(request),
+        "pipeline": build_enrichment_runtime_snapshot(request, org_id, client=db),
         "discovery": {
             "count": len(discovery_rows),
             "rows": discovery_rows,

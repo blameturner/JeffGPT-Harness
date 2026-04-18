@@ -1,8 +1,10 @@
 import logging
+from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
+from infra.config import get_feature
 from infra.nocodb_client import NocodbClient
 from workers.tool_queue import ToolJob, get_tool_queue
 
@@ -79,6 +81,31 @@ def scraper_start():
     return jumpstart_scraper()
 
 
+@router.post("/scrape-targets/{target_id}/run-now")
+def scrape_target_run_now(target_id: int):
+    """UI action: queue a specific scrape_target immediately."""
+    tq = get_tool_queue()
+    if not tq:
+        return {"status": "failed", "error": "tool_queue_unavailable"}
+
+    row = _get_single_row(NocodbClient(), "scrape_targets", target_id)
+    if not row:
+        return {"status": "not_found", "target_id": target_id}
+
+    org_id = int(row.get("org_id") or 0)
+    if org_id <= 0:
+        return {"status": "failed", "error": "missing_org_id", "target_id": target_id}
+
+    job_id = tq.submit(
+        "scrape_target",
+        {"target_id": target_id, "org_id": org_id},
+        source="scrape_target_api",
+        priority=3,
+        org_id=org_id,
+    )
+    return {"status": "queued", "target_id": target_id, "job_id": job_id, "org_id": org_id}
+
+
 @router.post("/pathfinder/start")
 def pathfinder_start():
     """UI button: jumpstart the pathfinder chain if it's idle."""
@@ -96,12 +123,12 @@ def discover_agent_start():
 
 @router.post("/pathfinder/fetch-next")
 def pathfinder_fetch_next():
-    from tools.enrichment.pathfinder import fetch_next
-    
-    row = fetch_next()
-    if not row:
-        return {"status": "empty", "row": None}
-    return {"status": "ok", "row": row}
+    from tools.enrichment.pathfinder import preview_next_seed
+
+    pick = preview_next_seed()
+    if not pick:
+        return {"status": "empty", "source": None, "row": None}
+    return {"status": "ok", "source": pick.get("source"), "row": pick.get("row")}
 
 
 @router.post("/pathfinder/mark-processed")
@@ -234,6 +261,83 @@ def _recent_tool_jobs_for_org(client: NocodbClient, org_id: int, limit: int = 20
         return []
 
 
+def _scheduler_next_run(request: Request | None, job_id: str) -> str | None:
+    if request is None:
+        return None
+    sched = getattr(request.app.state, "scheduler", None)
+    if sched is None:
+        return None
+    try:
+        job = sched.get_job(job_id)
+        return job.next_run_time.isoformat() if job and job.next_run_time else None
+    except Exception:
+        return None
+
+
+def _last_tool_job_snapshot(client: NocodbClient, org_id: int, job_type: str) -> dict | None:
+    try:
+        rows = client._get("tool_jobs", params={
+            "where": f"(org_id,eq,{org_id})~and(type,eq,{job_type})",
+            "sort": "-CreatedAt",
+            "limit": 1,
+        }).get("list", [])
+        return ToolJob.from_row(rows[0]).to_api(verbose=True) if rows else None
+    except Exception:
+        _log.warning("last tool_jobs query failed  org_id=%d type=%s", org_id, job_type, exc_info=True)
+        return None
+
+
+def build_enrichment_runtime_snapshot(request: Request | None, org_id: int, client: NocodbClient | None = None) -> dict:
+    client = client or NocodbClient()
+    from tools.enrichment.pathfinder import preview_next_seed
+    from tools.enrichment.scraper import fetch_due_targets
+
+    try:
+        next_scrape_rows = fetch_due_targets(client, limit=1)
+        next_scrape = next_scrape_rows[0] if next_scrape_rows else None
+    except Exception:
+        _log.warning("next scrape target preview failed  org_id=%d", org_id, exc_info=True)
+        next_scrape = None
+
+    try:
+        next_pathfinder = preview_next_seed()
+    except Exception:
+        _log.warning("next pathfinder preview failed  org_id=%d", org_id, exc_info=True)
+        next_pathfinder = None
+
+    return {
+        "config": {
+            "startup_grace_seconds": int(get_feature("tool_queue", "startup_grace_seconds", 600) or 600),
+            "strict_chat_idle_seconds": int(get_feature("tool_queue", "strict_chat_idle_seconds", 600) or 600),
+            "scraper_dispatch_interval_minutes": int(get_feature("scraper", "dispatch_interval_minutes", 10) or 10),
+            "scraper_batch_size": int(get_feature("scraper", "batch_size", 10) or 10),
+            "scraper_min_run_interval_seconds": int(get_feature("scraper", "min_run_interval_seconds", 120) or 120),
+            "pathfinder_dispatch_interval_minutes": int(get_feature("pathfinder", "recrawl_interval_minutes", 10) or 10),
+            "pathfinder_stale_after_minutes": int(get_feature("pathfinder", "stale_after_minutes", 60) or 60),
+            "pathfinder_min_run_interval_seconds": int(get_feature("pathfinder", "min_run_interval_seconds", 120) or 120),
+            "discover_agent_dispatch_interval_minutes": int(get_feature("discover_agent", "run_interval_minutes", 20) or 20),
+            "discover_agent_min_run_interval_seconds": int(get_feature("discover_agent", "min_run_interval_seconds", 1080) or 1080),
+        },
+        "schedule": {
+            "next_scraper_dispatch": _scheduler_next_run(request, "enrichment_scrape_dispatcher"),
+            "next_pathfinder_dispatch": _scheduler_next_run(request, "pathfinder_recrawl_dispatcher"),
+            "next_discover_agent_dispatch": _scheduler_next_run(request, "discover_agent_dispatcher"),
+        },
+        "last_jobs": {
+            "pathfinder_crawl": _last_tool_job_snapshot(client, org_id, "pathfinder_crawl"),
+            "scrape_target": _last_tool_job_snapshot(client, org_id, "scrape_target"),
+            "discover_agent_run": _last_tool_job_snapshot(client, org_id, "discover_agent_run"),
+            "summarise_page": _last_tool_job_snapshot(client, org_id, "summarise_page"),
+            "classify_relevance": _last_tool_job_snapshot(client, org_id, "classify_relevance"),
+        },
+        "next_candidates": {
+            "pathfinder": next_pathfinder,
+            "scraper": next_scrape,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+
+
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
     limit = min(max(1, limit), 500)
@@ -313,7 +417,7 @@ def scrape_target_get(target_id: int):
 
 
 @router.get("/dashboard")
-def enrichment_dashboard(org_id: int, limit: int = 20):
+def enrichment_dashboard(request: Request, org_id: int, limit: int = 20):
     """Combined enrichment view for frontend dashboards.
 
     Returns recent discovery rows, scrape targets, and verbose tool_jobs for the
@@ -335,6 +439,7 @@ def enrichment_dashboard(org_id: int, limit: int = 20):
     return {
         "status": "ok",
         "org_id": org_id,
+        "pipeline": build_enrichment_runtime_snapshot(request, org_id, client=client),
         "discovery": {
             "count": len(discovery_rows),
             "rows": discovery_rows,

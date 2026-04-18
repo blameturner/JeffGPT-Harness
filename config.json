@@ -116,6 +116,18 @@
       "fallback_to_scrape_targets": true,
       "min_run_interval_seconds": 120
     },
+    "discover_agent": {
+      "enabled": true,
+      "run_interval_minutes": 20,
+      "min_run_interval_seconds": 1080,
+      "sample_collection": "discovery",
+      "sample_chunks": 12,
+      "sample_max_chars_per_chunk": 400,
+      "queries_per_run": 6,
+      "results_per_query": 8,
+      "max_roots_per_run": 10,
+      "query_model": "tool_planner"
+    },
     "scraper_runtime": {
       "_comment": "scraper feature config lives in features.scraper — this key is unused; the scraper handler reads scraper.min_run_interval_seconds",
       "min_run_interval_seconds": 120

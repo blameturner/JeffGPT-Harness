@@ -8,6 +8,7 @@ import time
 import urllib.robotparser as robotparser
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
@@ -113,6 +114,35 @@ def _host(url: str) -> str:
         return h[4:] if h.startswith("www.") else h
     except Exception:
         return ""
+
+
+def _parse_dt(value) -> datetime | None:
+    if value in (None, ""):
+        return None
+    s = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_truthy_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value or "").strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _path_segment_count(url: str) -> int:
+    try:
+        return len([s for s in urlparse(url).path.split("/") if s])
+    except Exception:
+        return 99
 
 
 def _score(url: str, seed_host: str, seed_path: str, depth: int) -> float:
@@ -616,7 +646,6 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
     if stale_minutes <= 0:
         return None
     try:
-        from datetime import datetime, timezone
         rows = client._get("discovery", params={
             "where": "(depth,eq,0)~and(status,neq,discovered)",
             "limit": 1,
@@ -647,24 +676,112 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
 
 
 def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
-    """Fallback picker: grab any active scrape_target to crawl as a new seed. Used
-    when every discovery root is fresh. Sorted by UpdatedAt asc so we rotate through
-    rows naturally — pathfinder touching a row bumps its UpdatedAt and it falls to
-    the back of the queue until every other active target has also been tried."""
+    """Fallback picker for non-discovery-root expansion.
+
+    Ordering policy:
+    1. Manual never-scraped targets, oldest first.
+    2. Manual due-for-recrawl targets, oldest due first.
+    3. Auto-discovered *shallow/root-like* targets due for crawl.
+    4. Auto-discovered *shallow/root-like* never-scraped targets.
+
+    This restores the useful "find new pathfindings from scrape targets" behaviour
+    without reintroducing the old loop where deep article/doc URLs kept getting
+    promoted back into discovery. For auto-crawled rows we only allow root-ish
+    candidates (depth <= 1 and URL path depth <= 1, with no query string).
+    """
     if not _cfg("fallback_to_scrape_targets", True):
         return None
     try:
-        rows = client._get("scrape_targets", params={
+        rows = client._get_paginated("scrape_targets", params={
             "where": "(active,eq,1)",
-            "limit": 1,
-            "sort": "UpdatedAt,CreatedAt",
+            "limit": 500,
+            "sort": "CreatedAt",
             # limit the payload so a big m2m expansion can't choke this call
-            "fields": "Id,org_id,url,depth",
-        }).get("list", [])
-        return rows[0] if rows else None
+            "fields": "Id,org_id,url,depth,auto_crawled,last_scraped_at,next_crawl_at,CreatedAt,UpdatedAt",
+        })
+        manual_rows = [r for r in rows if not _is_truthy_flag(r.get("auto_crawled"))]
+        auto_rows = [r for r in rows if _is_truthy_flag(r.get("auto_crawled"))]
+        now = datetime.now(timezone.utc)
+        never = [r for r in manual_rows if r.get("last_scraped_at") in (None, "")]
+        due = []
+        for row in manual_rows:
+            if row.get("last_scraped_at") in (None, ""):
+                continue
+            nca = _parse_dt(row.get("next_crawl_at"))
+            if nca is None or nca <= now:
+                due.append(row)
+
+        def _is_safe_auto_seed(row: dict) -> bool:
+            url = str(row.get("url") or "")
+            if not url or _is_binary(url) or _is_junk(url):
+                return False
+            try:
+                parts = urlparse(url)
+            except Exception:
+                return False
+            if parts.query:
+                return False
+            if int(row.get("depth") or 0) > 1:
+                return False
+            if _path_segment_count(url) > 1:
+                return False
+            return True
+
+        eligible_auto = [r for r in auto_rows if _is_safe_auto_seed(r)]
+        auto_never = [r for r in eligible_auto if r.get("last_scraped_at") in (None, "")]
+        auto_due = []
+        for row in eligible_auto:
+            if row.get("last_scraped_at") in (None, ""):
+                continue
+            nca = _parse_dt(row.get("next_crawl_at"))
+            if nca is None or nca <= now:
+                auto_due.append(row)
+
+        never.sort(key=lambda r: (_parse_dt(r.get("CreatedAt")) or datetime.min.replace(tzinfo=timezone.utc), int(r.get("Id") or 0)))
+        due.sort(key=lambda r: (
+            _parse_dt(r.get("next_crawl_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            _parse_dt(r.get("CreatedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+            int(r.get("Id") or 0),
+        ))
+        auto_due.sort(key=lambda r: (
+            _parse_dt(r.get("next_crawl_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            _parse_dt(r.get("CreatedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+            int(r.get("Id") or 0),
+        ))
+        auto_never.sort(key=lambda r: (_parse_dt(r.get("CreatedAt")) or datetime.min.replace(tzinfo=timezone.utc), int(r.get("Id") or 0)))
+
+        if never:
+            candidate = dict(never[0])
+            candidate["_selection_bucket"] = "manual_never"
+            return candidate
+        if due:
+            candidate = dict(due[0])
+            candidate["_selection_bucket"] = "manual_due"
+            return candidate
+        if auto_due:
+            candidate = dict(auto_due[0])
+            candidate["_selection_bucket"] = "auto_shallow_due"
+            return candidate
+        if auto_never:
+            candidate = dict(auto_never[0])
+            candidate["_selection_bucket"] = "auto_shallow_never"
+            return candidate
+        return None
     except Exception:
         _log.debug("pathfinder fallback scrape_targets query failed", exc_info=True)
         return None
+
+
+def preview_next_seed() -> dict | None:
+    """Preview the actual next seed pathfinder would select right now."""
+    client = NocodbClient()
+    seed = _pick_next_discovery_root(client)
+    if seed:
+        return {"source": "discovery", "row": seed}
+    fallback = _pick_next_scrape_target_seed(client)
+    if fallback:
+        return {"source": "scrape_target_fallback", "row": fallback}
+    return None
 
 
 # NOTE: `_chain_next_pathfinder` and `_count_queued_pathfinder` previously lived
@@ -845,6 +962,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
         if chain_org_id <= 0:
             _log.warning("pathfinder scheduled seed missing org_id  id=%s", seed.get("Id"))
             return {"status": "error", "reason": "missing_org_id", "discovery_id": int(seed.get("Id") or 0) or None}
+        _log.info(
+            "pathfinder selected discovery seed  id=%s url=%s status=%s",
+            seed.get("Id"), str(seed.get("url") or "")[:100], seed.get("status") or "",
+        )
         res = _process_one_seed(
             client,
             seed_url=seed.get("url") or "",
@@ -863,6 +984,10 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             return {"status": "error", "reason": "missing_org_id", "scrape_target_id": int(fallback.get("Id") or 0) or None}
         fallback_url = _normalize(fallback.get("url") or "") or (fallback.get("url") or "")
         fallback_target_id = int(fallback.get("Id") or 0) or None
+        _log.info(
+            "pathfinder selected fallback manual target  target_id=%s bucket=%s url=%s",
+            fallback_target_id, fallback.get("_selection_bucket") or "manual", fallback_url[:100],
+        )
 
         # Register into discovery so it is tracked and won't be re-picked
         # as a blind fallback indefinitely. upsert_discovery_root is a no-op
@@ -901,18 +1026,12 @@ def _wait_any(futures: set) -> tuple[list, set]:
 
 
 def fetch_next() -> dict | None:
-    client = NocodbClient()
-    try:
-        data = client._get("discovery", params={
-            "where": "(status,eq,discovered)",
-            "sort": "-score,depth",
-            "limit": 1,
-        })
-        rows = data.get("list", [])
-        return rows[0] if rows else None
-    except Exception:
-        _log.warning("fetch_next failed")
+    pick = preview_next_seed()
+    if not pick:
         return None
+    row = dict(pick.get("row") or {})
+    row["_seed_source"] = pick.get("source")
+    return row
 
 
 def mark_processed(url_id: int) -> None:

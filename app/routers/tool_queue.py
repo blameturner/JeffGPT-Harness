@@ -195,6 +195,33 @@ def update_priority(job_id: str, body: PriorityUpdate, request: Request):
     raise HTTPException(status_code=500, detail="Failed to update priority")
 
 
+@router.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, request: Request):
+    q = _get_queue(request)
+    job = q.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Job is already active")
+    try:
+        new_job_id = q.submit(
+            job.type,
+            dict(job.payload or {}),
+            source=f"{job.source or job.type}_retry",
+            org_id=job.org_id,
+            priority=job.priority,
+            depends_on=job.depends_on,
+        )
+        return {
+            "status": "queued",
+            "previous_job_id": job_id,
+            "job_id": new_job_id,
+            "type": job.type,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retry failed: {e}")
+
+
 @router.delete("/jobs/{job_id}")
 def cancel_job(job_id: str, request: Request):
     q = _get_queue(request)
