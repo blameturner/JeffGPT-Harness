@@ -75,10 +75,10 @@ def pathfinder_discover(req: PathfinderRequest):
 
 
 @router.post("/scraper/start")
-def scraper_start():
+def scraper_start(org_id: int | None = None):
     """UI button: jumpstart the scraper chain if it's idle."""
     from tools.enrichment.dispatcher import jumpstart_scraper
-    return jumpstart_scraper()
+    return jumpstart_scraper(org_id=org_id)
 
 
 @router.post("/scrape-targets/{target_id}/run-now")
@@ -98,7 +98,12 @@ def scrape_target_run_now(target_id: int):
 
     job_id = tq.submit(
         "scrape_target",
-        {"target_id": target_id, "org_id": org_id},
+        {
+            "target_id": target_id,
+            "org_id": org_id,
+            "selection_bucket": "manual_run_now",
+            "selection_reason": "queued by user from scrape-targets UI",
+        },
         source="scrape_target_api",
         priority=3,
         org_id=org_id,
@@ -107,25 +112,25 @@ def scrape_target_run_now(target_id: int):
 
 
 @router.post("/pathfinder/start")
-def pathfinder_start():
+def pathfinder_start(org_id: int | None = None):
     """UI button: jumpstart the pathfinder chain if it's idle."""
     from tools.enrichment.dispatcher import jumpstart_pathfinder
-    return jumpstart_pathfinder()
+    return jumpstart_pathfinder(org_id=org_id)
 
 
 @router.post("/discover-agent/start")
-def discover_agent_start():
+def discover_agent_start(org_id: int | None = None):
     """UI button: immediately queue one discover_agent_run (bypasses scheduler interval,
     still subject to the handler's cooldown gate)."""
     from tools.enrichment.dispatcher import jumpstart_discover_agent
-    return jumpstart_discover_agent()
+    return jumpstart_discover_agent(org_id=org_id)
 
 
 @router.post("/pathfinder/fetch-next")
-def pathfinder_fetch_next():
+def pathfinder_fetch_next(org_id: int | None = None):
     from tools.enrichment.pathfinder import preview_next_seed
 
-    pick = preview_next_seed()
+    pick = preview_next_seed(org_id=org_id)
     if not pick:
         return {"status": "empty", "source": None, "row": None}
     return {"status": "ok", "source": pick.get("source"), "row": pick.get("row")}
@@ -148,10 +153,10 @@ def scraper_run(req: ScraperRequest):
 
 
 @router.post("/scraper/scrape-next")
-def scraper_scrape_next():
+def scraper_scrape_next(org_id: int | None = None):
     from tools.enrichment.scraper import scrape_next
     
-    row = scrape_next()
+    row = scrape_next(org_id=org_id)
     if not row:
         return {"status": "empty", "row": None}
     return {"status": "ok", "row": row}
@@ -196,6 +201,9 @@ def research_agent_run(req: ResearchAgentRequest):
         org_id = int((plan or {}).get("org_id") or 0)
     except Exception:
         _log.warning("research_agent_run org lookup failed  plan_id=%d", req.plan_id, exc_info=True)
+
+    if org_id <= 0:
+        return {"status": "failed", "error": "missing_org_id", "plan_id": req.plan_id}
 
     job_id = tq.submit(
         "research_agent",
@@ -293,14 +301,14 @@ def build_enrichment_runtime_snapshot(request: Request | None, org_id: int, clie
     from tools.enrichment.scraper import fetch_due_targets
 
     try:
-        next_scrape_rows = fetch_due_targets(client, limit=1)
+        next_scrape_rows = fetch_due_targets(client, limit=1, org_id=org_id)
         next_scrape = next_scrape_rows[0] if next_scrape_rows else None
     except Exception:
         _log.warning("next scrape target preview failed  org_id=%d", org_id, exc_info=True)
         next_scrape = None
 
     try:
-        next_pathfinder = preview_next_seed()
+        next_pathfinder = preview_next_seed(org_id=org_id)
     except Exception:
         _log.warning("next pathfinder preview failed  org_id=%d", org_id, exc_info=True)
         next_pathfinder = None

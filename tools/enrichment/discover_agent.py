@@ -153,12 +153,13 @@ def _existing_hosts(client: NocodbClient, org_id: int) -> set[str]:
     knowledge bases while keeping the query fast.
     """
     hosts: set[str] = set()
+    scan_limit = int(_cfg("existing_host_scan_limit", 10000))
     for table in ("discovery", "scrape_targets"):
         try:
             rows = client._get_paginated(table, params={
                 "where": f"(org_id,eq,{org_id})",
                 "fields": "url",
-                "limit": 2000,
+                "limit": scan_limit,
             })
             for row in rows:
                 h = _host_only(row.get("url") or "")

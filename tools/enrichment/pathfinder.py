@@ -616,7 +616,7 @@ def discover(
     }
 
 
-def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
+def _pick_next_discovery_root(client: NocodbClient, org_id: int | None = None) -> dict | None:
     """Pick the next discovery root to crawl.
 
     Priority order:
@@ -628,13 +628,20 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
     """
     # 1. Never-crawled first.
     try:
+        where = "(depth,eq,0)~and(status,eq,discovered)"
+        if org_id and int(org_id) > 0:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         never = client._get("discovery", params={
-            "where": "(depth,eq,0)~and(status,eq,discovered)",
+            "where": where,
             "limit": 1,
             "sort": "CreatedAt",
         }).get("list", [])
         if never:
-            return never[0]
+            row = dict(never[0])
+            row["_selection_bucket"] = "discovery_never"
+            row["_selection_reason"] = "new discovery root never crawled"
+            row["_eligible_at"] = row.get("CreatedAt") or row.get("created_at") or None
+            return row
     except Exception:
         _log.warning("pathfinder picker never-crawled query failed", exc_info=True)
 
@@ -646,8 +653,11 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
     if stale_minutes <= 0:
         return None
     try:
+        where = "(depth,eq,0)~and(status,neq,discovered)"
+        if org_id and int(org_id) > 0:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         rows = client._get("discovery", params={
-            "where": "(depth,eq,0)~and(status,neq,discovered)",
+            "where": where,
             "limit": 1,
             "sort": "UpdatedAt,CreatedAt",
         }).get("list", [])
@@ -669,13 +679,17 @@ def _pick_next_discovery_root(client: NocodbClient) -> dict | None:
                 "pathfinder stale re-crawl  id=%s url=%s status=%s age_min=%.1f threshold=%.0f",
                 row.get("Id"), str(row.get("url") or "")[:80], row_status, age_minutes, effective_stale,
             )
-            return row
+            out = dict(row)
+            out["_selection_bucket"] = "discovery_stale"
+            out["_selection_reason"] = f"stale discovery root ({row_status or 'unknown'})"
+            out["_eligible_at"] = updated_str
+            return out
     except Exception:
         _log.warning("pathfinder picker stale query failed", exc_info=True)
     return None
 
 
-def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
+def _pick_next_scrape_target_seed(client: NocodbClient, org_id: int | None = None) -> dict | None:
     """Fallback picker for non-discovery-root expansion.
 
     Ordering policy:
@@ -692,8 +706,11 @@ def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
     if not _cfg("fallback_to_scrape_targets", True):
         return None
     try:
+        where = "(active,eq,1)"
+        if org_id and int(org_id) > 0:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         rows = client._get_paginated("scrape_targets", params={
-            "where": "(active,eq,1)",
+            "where": where,
             "limit": 500,
             "sort": "CreatedAt",
             # limit the payload so a big m2m expansion can't choke this call
@@ -721,9 +738,11 @@ def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
                 return False
             if parts.query:
                 return False
-            if int(row.get("depth") or 0) > 1:
+            max_depth = int(_cfg("fallback_auto_max_depth", 2))
+            max_segments = int(_cfg("fallback_auto_max_path_segments", 2))
+            if int(row.get("depth") or 0) > max_depth:
                 return False
-            if _path_segment_count(url) > 1:
+            if _path_segment_count(url) > max_segments:
                 return False
             return True
 
@@ -753,18 +772,26 @@ def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
         if never:
             candidate = dict(never[0])
             candidate["_selection_bucket"] = "manual_never"
+            candidate["_selection_reason"] = "manual scrape target never scraped"
+            candidate["_eligible_at"] = candidate.get("CreatedAt") or candidate.get("created_at") or None
             return candidate
         if due:
             candidate = dict(due[0])
             candidate["_selection_bucket"] = "manual_due"
+            candidate["_selection_reason"] = "manual scrape target due for recrawl"
+            candidate["_eligible_at"] = candidate.get("next_crawl_at") or None
             return candidate
         if auto_due:
             candidate = dict(auto_due[0])
             candidate["_selection_bucket"] = "auto_shallow_due"
+            candidate["_selection_reason"] = "auto-discovered shallow target due for recrawl"
+            candidate["_eligible_at"] = candidate.get("next_crawl_at") or None
             return candidate
         if auto_never:
             candidate = dict(auto_never[0])
             candidate["_selection_bucket"] = "auto_shallow_never"
+            candidate["_selection_reason"] = "auto-discovered shallow target never scraped"
+            candidate["_eligible_at"] = candidate.get("CreatedAt") or candidate.get("created_at") or None
             return candidate
         return None
     except Exception:
@@ -772,13 +799,13 @@ def _pick_next_scrape_target_seed(client: NocodbClient) -> dict | None:
         return None
 
 
-def preview_next_seed() -> dict | None:
+def preview_next_seed(org_id: int | None = None) -> dict | None:
     """Preview the actual next seed pathfinder would select right now."""
     client = NocodbClient()
-    seed = _pick_next_discovery_root(client)
+    seed = _pick_next_discovery_root(client, org_id=org_id)
     if seed:
         return {"source": "discovery", "row": seed}
-    fallback = _pick_next_scrape_target_seed(client)
+    fallback = _pick_next_scrape_target_seed(client, org_id=org_id)
     if fallback:
         return {"source": "scrape_target_fallback", "row": fallback}
     return None
@@ -811,6 +838,29 @@ def _queue_classifier(target_id: int | None, url: str, text: str, org_id: int) -
             )
     except Exception:
         _log.warning("classifier queue failed  target_id=%s", target_id, exc_info=True)
+
+
+def _mark_selection(client: NocodbClient, table: str, row_id: int | None, bucket: str, reason: str) -> None:
+    if not row_id:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    row = None
+    try:
+        rows = client._get(table, params={"where": f"(Id,eq,{row_id})", "limit": 1}).get("list", [])
+        row = rows[0] if rows else None
+    except Exception:
+        row = None
+    count = int((row or {}).get("selection_count") or 0) + 1
+    payload = {
+        "last_selected_at": now,
+        "last_selection_bucket": bucket,
+        "last_selection_reason": reason[:255],
+        "selection_count": count,
+    }
+    try:
+        client._patch(table, int(row_id), {"Id": int(row_id), **payload})
+    except Exception:
+        _log.debug("pathfinder selection mark failed table=%s id=%s", table, row_id, exc_info=True)
 
 
 def _process_one_seed(
@@ -910,6 +960,12 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
 
     client = NocodbClient()
     chain_org_id = 0
+    scheduled_org_id = 0
+    if isinstance(payload, dict):
+        try:
+            scheduled_org_id = int(payload.get("org_id") or 0)
+        except Exception:
+            scheduled_org_id = 0
 
     # Cooldown guard: bail if another pathfinder_crawl completed recently. Applies
     # only to scheduled/background runs (direct_discovery_id paths are user-initiated
@@ -952,11 +1008,21 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             seed_source="discovery",
             discovery_id=int(row.get("Id") or 0) or None,
         )
+        _mark_selection(
+            client,
+            "discovery",
+            int(row.get("Id") or 0) or None,
+            str(row.get("_selection_bucket") or "direct_discovery"),
+            str(row.get("_selection_reason") or "explicit discovery run-now"),
+        )
+        if isinstance(res, dict):
+            res["selection_bucket"] = row.get("_selection_bucket") or "direct_discovery"
+            res["selection_reason"] = row.get("_selection_reason") or "explicit discovery run-now"
         # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 
     # Scheduled/chained path: pick ONE seed. Stale discovery first, then oldest scrape_target.
-    seed = _pick_next_discovery_root(client)
+    seed = _pick_next_discovery_root(client, org_id=scheduled_org_id or None)
     if seed:
         chain_org_id = int(seed.get("org_id") or 0)
         if chain_org_id <= 0:
@@ -973,10 +1039,20 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             seed_source="discovery",
             discovery_id=int(seed.get("Id") or 0) or None,
         )
+        _mark_selection(
+            client,
+            "discovery",
+            int(seed.get("Id") or 0) or None,
+            str(seed.get("_selection_bucket") or "discovery"),
+            str(seed.get("_selection_reason") or "discovery candidate selected"),
+        )
+        if isinstance(res, dict):
+            res["selection_bucket"] = seed.get("_selection_bucket") or "discovery"
+            res["selection_reason"] = seed.get("_selection_reason") or "discovery candidate selected"
         # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 
-    fallback = _pick_next_scrape_target_seed(client)
+    fallback = _pick_next_scrape_target_seed(client, org_id=scheduled_org_id or None)
     if fallback:
         chain_org_id = int(fallback.get("org_id") or 0)
         if chain_org_id <= 0:
@@ -1007,6 +1083,16 @@ def pathfinder_crawl_job(payload: dict | int | None = None) -> dict:
             discovery_id=discovery_id,
             scrape_target_id=fallback_target_id,
         )
+        _mark_selection(
+            client,
+            "scrape_targets",
+            fallback_target_id,
+            str(fallback.get("_selection_bucket") or "scrape_target_fallback"),
+            str(fallback.get("_selection_reason") or "fallback scrape target selected for pathfinder"),
+        )
+        if isinstance(res, dict):
+            res["selection_bucket"] = fallback.get("_selection_bucket") or "scrape_target_fallback"
+            res["selection_reason"] = fallback.get("_selection_reason") or "fallback scrape target selected for pathfinder"
         # no chain — cron (every pathfinder.recrawl_interval_minutes) drives the next run
         return res
 

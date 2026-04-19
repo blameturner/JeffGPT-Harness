@@ -106,6 +106,27 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
         scrape_target_rows = []
 
     active_jobs = [j for j in recent_jobs if j.get("status") in ("queued", "running")]
+    queue_center = {
+        "preferred_endpoint": "/ops/dashboard",
+        "actions": {
+            "list_jobs": "/tool-queue/jobs",
+            "get_job": "/tool-queue/jobs/{job_id}",
+            "retry": "/tool-queue/jobs/{job_id}/retry",
+            "cancel": "/tool-queue/jobs/{job_id}",
+            "update_priority": "/tool-queue/jobs/{job_id}/priority",
+            "events": "/tool-queue/events",
+            "run_scraper": "/scraper/start?org_id={org_id}",
+            "run_pathfinder": "/pathfinder/start?org_id={org_id}",
+            "run_discover_agent": "/discover-agent/start?org_id={org_id}",
+        },
+        "huey": _huey_status(),
+        "active_summary": {
+            "active": len(active_jobs),
+            "queued": sum(1 for j in active_jobs if j.get("status") == "queued"),
+            "running": sum(1 for j in active_jobs if j.get("status") == "running"),
+        },
+        "backoff": (queue_status.get("backoff") if isinstance(queue_status, dict) else None),
+    }
 
     return {
         "status": "ok",
@@ -129,6 +150,7 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "count": len(recent_jobs),
             "rows": recent_jobs,
         },
+        "queue_center": queue_center,
         "active_summary": {
             "active": len(active_jobs),
             "queued": sum(1 for j in active_jobs if j.get("status") == "queued"),

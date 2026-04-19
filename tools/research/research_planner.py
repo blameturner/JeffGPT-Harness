@@ -243,6 +243,8 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
 
     if not get_feature("research", "planner_enabled", True):
         return {"status": "disabled", "error": "research_planner feature disabled"}
+    if int(org_id or 0) <= 0:
+        return {"status": "failed", "error": "invalid_org_id"}
 
     client = NocodbClient()
     try:

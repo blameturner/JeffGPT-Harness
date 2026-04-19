@@ -47,7 +47,7 @@ def _default_org_id(client: NocodbClient) -> int | None:
     return None
 
 
-def jumpstart_scraper() -> dict:
+def jumpstart_scraper(org_id: int | None = None) -> dict:
     """Scheduler hook: every `scraper.dispatch_interval_minutes`, queue ONE
     scrape_target batch job — but only if the previous one has finished. The
     inflight check ensures the scheduler can't pile up runs if the scrape takes
@@ -65,7 +65,10 @@ def jumpstart_scraper() -> dict:
     if inflight > 0:
         return {"status": "already_running", "inflight": inflight}
 
-    org_id = _default_org_id(client)
+    if org_id is not None:
+        org_id = int(org_id)
+    if not org_id:
+        org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
     try:
@@ -77,7 +80,7 @@ def jumpstart_scraper() -> dict:
     return {"status": "kicked", "queued": 1, "org_id": org_id}
 
 
-def jumpstart_pathfinder() -> dict:
+def jumpstart_pathfinder(org_id: int | None = None) -> dict:
     """Scheduler hook: every `pathfinder.recrawl_interval_minutes`, ensure there is
     exactly ONE pathfinder_crawl in the queue. Skip if one is already inflight.
     This cron is now the SOLE driver of pathfinder_crawl — self-chaining was
@@ -96,7 +99,10 @@ def jumpstart_pathfinder() -> dict:
     if inflight > 0:
         return {"status": "already_running", "inflight": inflight}
 
-    org_id = _default_org_id(client)
+    if org_id is not None:
+        org_id = int(org_id)
+    if not org_id:
+        org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
     try:
@@ -117,7 +123,7 @@ def enqueue_due_pathfinder_recrawls() -> dict:
     return jumpstart_pathfinder()
 
 
-def jumpstart_discover_agent() -> dict:
+def jumpstart_discover_agent(org_id: int | None = None) -> dict:
     """Scheduler hook: every ``discover_agent.run_interval_minutes``, queue ONE
     discover_agent_run job — but only if none is already inflight.  The agent
     has its own cooldown gate inside the handler so double-triggers are safe."""
@@ -134,7 +140,10 @@ def jumpstart_discover_agent() -> dict:
     if inflight > 0:
         return {"status": "already_running", "inflight": inflight}
 
-    org_id = _default_org_id(client)
+    if org_id is not None:
+        org_id = int(org_id)
+    if not org_id:
+        org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
     try:

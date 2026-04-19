@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from infra.config import get_feature, is_feature_enabled
 from infra.memory import remember
@@ -84,11 +85,49 @@ def _due_at_key(row: dict) -> tuple[datetime, datetime, int]:
     )
 
 
-def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
+def _target_host(row: dict) -> str:
+    try:
+        host = urlparse(str(row.get("url") or "")).netloc.lower()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+
+def _scrape_lock_ttl_seconds() -> int:
+    raw = get_feature("scraper", "in_progress_lock_ttl_seconds", 1800)
+    try:
+        val = int(raw)
+        return val if val > 0 else 1800
+    except Exception:
+        return 1800
+
+
+def _max_per_domain_per_batch() -> int:
+    raw = get_feature("scraper", "max_per_domain_per_batch", 2)
+    try:
+        val = int(raw)
+        return val if val > 0 else 2
+    except Exception:
+        return 2
+
+
+def _bucket_reason(bucket: str) -> str:
+    return {
+        "manual_never": "manual target never scraped",
+        "manual_due": "manual target due for recrawl",
+        "auto_due": "auto-discovered target due for recrawl",
+        "auto_never": "auto-discovered target never scraped",
+    }.get(bucket, "eligible scrape target")
+
+
+def fetch_due_targets(client: NocodbClient, limit: int = 50, org_id: int | None = None) -> list[dict]:
     rows: list[dict] = []
     try:
+        where = "(active,eq,1)"
+        if org_id and int(org_id) > 0:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         rows = client._get_paginated("scrape_targets", params={
-            "where": "(active,eq,1)",
+            "where": where,
             "limit": 1000,
             "sort": "CreatedAt",
         })
@@ -101,16 +140,37 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
     manual_due: list[dict] = []
     auto_due: list[dict] = []
     auto_never: list[dict] = []
+    lock_ttl = _scrape_lock_ttl_seconds()
     for r in rows:
+        if org_id and int(org_id) > 0 and int(r.get("org_id") or 0) != int(org_id):
+            continue
+        # Avoid repeatedly selecting rows that are currently being processed.
+        # If the lock is stale, allow re-selection so wedged rows recover.
+        if str(r.get("status") or "").strip().lower() == "scraping":
+            updated = _parse_iso(r.get("UpdatedAt") or r.get("updated_at"))
+            if updated and (now - updated).total_seconds() < lock_ttl:
+                continue
         is_auto = _is_truthy_flag(r.get("auto_crawled"))
         if r.get("last_scraped_at") in (None, ""):
             bucket = auto_never if is_auto else manual_never
-            bucket.append({**r, "_selection_bucket": "auto_never" if is_auto else "manual_never"})
+            bucket_name = "auto_never" if is_auto else "manual_never"
+            bucket.append({
+                **r,
+                "_selection_bucket": bucket_name,
+                "_selection_reason": _bucket_reason(bucket_name),
+                "_eligible_at": r.get("CreatedAt") or r.get("created_at") or None,
+            })
             continue
         nca = _parse_iso(r.get("next_crawl_at"))
         if nca is None or nca <= now:
             bucket = auto_due if is_auto else manual_due
-            bucket.append({**r, "_selection_bucket": "auto_due" if is_auto else "manual_due"})
+            bucket_name = "auto_due" if is_auto else "manual_due"
+            bucket.append({
+                **r,
+                "_selection_bucket": bucket_name,
+                "_selection_reason": _bucket_reason(bucket_name),
+                "_eligible_at": (nca.isoformat() if nca else None),
+            })
 
     manual_never.sort(key=_created_at_key)
     manual_due.sort(key=_due_at_key)
@@ -118,11 +178,23 @@ def fetch_due_targets(client: NocodbClient, limit: int = 50) -> list[dict]:
     auto_never.sort(key=_created_at_key)
 
     ordered = manual_never + manual_due + auto_due + auto_never
+    per_domain_cap = _max_per_domain_per_batch()
+    domain_counts: dict[str, int] = {}
+    selected: list[dict] = []
+    for row in ordered:
+        if len(selected) >= limit:
+            break
+        host = _target_host(row)
+        if host:
+            if domain_counts.get(host, 0) >= per_domain_cap:
+                continue
+            domain_counts[host] = domain_counts.get(host, 0) + 1
+        selected.append(row)
     _log.debug(
         "fetch_due_targets total=%d manual_never=%d manual_due=%d auto_due=%d auto_never=%d",
         len(rows), len(manual_never), len(manual_due), len(auto_due), len(auto_never),
     )
-    return ordered[:limit]
+    return selected
 
 
 def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
@@ -132,7 +204,7 @@ def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:
         _log.warning("scrape_target patch failed  id=%d", target_id, exc_info=True)
 
 
-def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> dict:
+def _scrape_one_target(target_id: int, client: NocodbClient | None = None, selection: dict | None = None) -> dict:
     db: NocodbClient = client if client is not None else NocodbClient()
 
     try:
@@ -156,6 +228,18 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
     if not url:
         _patch_target(db, target_id, {"status": "error", "last_scrape_error": "no_url"})
         return {"status": "error", "reason": "no_url", "target_id": target_id}
+
+    # Lightweight lease so parallel workers don't repeatedly select the same row.
+    selection_bucket = str((selection or {}).get("selection_bucket") or (selection or {}).get("_selection_bucket") or "")
+    selection_reason = str((selection or {}).get("selection_reason") or (selection or {}).get("_selection_reason") or "")
+    _patch_target(db, target_id, {
+        "status": "scraping",
+        "last_scrape_error": "",
+        "last_selected_at": _now_iso(),
+        "last_selection_bucket": selection_bucket,
+        "last_selection_reason": selection_reason,
+        "selection_count": int(row.get("selection_count") or 0) + 1,
+    })
 
     scraper = PathfinderScraper(timeout=30)
     try:
@@ -281,6 +365,8 @@ def _scrape_one_target(target_id: int, client: NocodbClient | None = None) -> di
         "url": url,
         "chunks": chunks_added,
         "unchanged": unchanged,
+        "selection_bucket": selection_bucket or None,
+        "selection_reason": selection_reason or None,
     }
 
 
@@ -315,9 +401,22 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         return {"status": "disabled"}
 
     if isinstance(payload, int):
-        return _scrape_one_target(payload)
+        return _scrape_one_target(payload, selection={"selection_bucket": "direct", "selection_reason": "explicit target run"})
     if isinstance(payload, dict) and payload.get("target_id"):
-        return _scrape_one_target(int(payload["target_id"]))
+        return _scrape_one_target(
+            int(payload["target_id"]),
+            selection={
+                "selection_bucket": payload.get("selection_bucket") or "direct",
+                "selection_reason": payload.get("selection_reason") or "explicit target run",
+            },
+        )
+
+    requested_org_id = 0
+    if isinstance(payload, dict):
+        try:
+            requested_org_id = int(payload.get("org_id") or 0)
+        except Exception:
+            requested_org_id = 0
 
     # Reuse a single client for all batch-level DB calls so we pay _load_tables()
     # once per invocation instead of once per target.
@@ -334,10 +433,10 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
             return {"status": "skipped_cooldown", "elapsed_s": round(elapsed, 1)}
 
     batch_size = int(get_feature("scraper", "batch_size", DEFAULT_BATCH_SIZE))
-    targets = fetch_due_targets(client, limit=batch_size)
+    targets = fetch_due_targets(client, limit=batch_size, org_id=requested_org_id or None)
     if not targets:
         _log.info("scraper batch: no due targets — idle")
-        return {"status": "idle", "processed": 0}
+        return {"status": "idle", "processed": 0, "org_id": requested_org_id or None}
 
     bucket_counts: dict[str, int] = {}
     for t in targets:
@@ -353,7 +452,14 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         tid = int(t.get("Id") or 0)
         if not tid:
             continue
-        out = _scrape_one_target(tid, client=client)
+        out = _scrape_one_target(
+            tid,
+            client=client,
+            selection={
+                "selection_bucket": t.get("_selection_bucket") or "",
+                "selection_reason": t.get("_selection_reason") or "",
+            },
+        )
         processed.append(out)
 
     successful = sum(1 for p in processed if p.get("status") == "ok")
@@ -367,13 +473,14 @@ def scrape_target_job(payload: dict | int | None = None) -> dict:
         "processed": len(processed),
         "successful": successful,
         "chunks": chunks,
+        "org_id": requested_org_id or None,
     }
 
 # legacy
 
-def scrape_next() -> dict | None:
+def scrape_next(org_id: int | None = None) -> dict | None:
     client = NocodbClient()
-    rows = fetch_due_targets(client, limit=1)
+    rows = fetch_due_targets(client, limit=1, org_id=org_id)
     return rows[0] if rows else None
 
 

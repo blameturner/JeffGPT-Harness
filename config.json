@@ -53,6 +53,8 @@
     "scraper": {
       "enabled": true,
       "batch_size": 10,
+      "max_per_domain_per_batch": 2,
+      "in_progress_lock_ttl_seconds": 1800,
       "summariser_model": "scrape_summariser",
       "classifier_model": "scrape_classifier",
       "dispatch_interval_minutes": 10,
@@ -114,6 +116,8 @@
       "max_links_per_seed": 100,
       "stale_after_minutes": 60,
       "fallback_to_scrape_targets": true,
+      "fallback_auto_max_depth": 2,
+      "fallback_auto_max_path_segments": 2,
       "min_run_interval_seconds": 120
     },
     "discover_agent": {
@@ -126,6 +130,7 @@
       "queries_per_run": 6,
       "results_per_query": 8,
       "max_roots_per_run": 10,
+      "existing_host_scan_limit": 10000,
       "query_model": "tool_planner"
     },
     "scraper_runtime": {
