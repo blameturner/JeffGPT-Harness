@@ -43,8 +43,8 @@ async def lifespan(app: FastAPI):
     from tools.enrichment.relationships_extractor import extract_relationships_job
     tool_queue = ToolJobQueue()
     # Priority tiers (lower = picked first):
-    #   3 = research planner + agent
-    #   4 = scrape_page, pathfinder_extract, summarise_page, graph_extract
+    #   3 = graph_extract, research planner + agent
+    #   4 = scrape_page, pathfinder_extract, summarise_page
     #   5 = discover_agent_run, extract_relationships (background)
     tool_queue.register("research_planner", HandlerConfig(
         handler=lambda p: run_research_planner_job(p["plan_id"]),
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
         max_workers=1, priority_default=4, source="summariser",
     ))
     tool_queue.register("graph_extract", HandlerConfig(
-        handler=_handle_graph_extract, max_workers=1, priority_default=4,
+        handler=_handle_graph_extract, max_workers=1, priority_default=3,
     ))
     tool_queue.register("scrape_page", HandlerConfig(
         handler=scrape_page_job,

@@ -23,6 +23,11 @@
       "enabled": true,
       "standard_query_count_min": 10,
       "standard_query_count_max": 20,
+      "basic_max_urls": 8,
+      "standard_max_urls": 25,
+      "relevance_keyword_threshold": 0.16,
+      "relevance_min_abs_hits": 2,
+      "relevance_min_keep": 4,
       "models": {
         "web_search_query_generator": { "role": "t3_tool",    "temperature": 0.2, "max_tokens": 600, "max_input_chars": 4000 },
         "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 150, "max_input_chars": 3000, "frequency_penalty": 0.2 },

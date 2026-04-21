@@ -5,19 +5,21 @@ import logging
 import re
 import time
 
-from infra.config import get_function_config
+from infra.config import get_feature, get_function_config
 from tools.contract import ToolName, ToolResult
 from tools.dispatcher import register_executor
 from tools.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
-BASIC_MAX_URLS = 5
-STANDARD_MAX_URLS = 10
+BASIC_MAX_URLS = 8
+STANDARD_MAX_URLS = 25
 MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
 BATCH_TARGET = 5
-RELEVANCE_KEYWORD_THRESHOLD = 0.25
+RELEVANCE_KEYWORD_THRESHOLD = 0.16
+RELEVANCE_MIN_ABS_HITS = 2
+RELEVANCE_MIN_KEEP = 4
 
 
 
@@ -55,34 +57,62 @@ def _filter_results_by_relevance(
         return results
 
     from tools.search.queries import _extract_keywords
-    query_keywords: set[str] = set()
+    keyword_sets: list[set[str]] = []
     for q in queries:
-        for kw in _extract_keywords(q):
-            query_keywords.add(kw.lower())
+        kws = {
+            kw.lower() for kw in _extract_keywords(q)
+            if len(kw) > 2 and not kw.isdigit()
+        }
+        if kws:
+            keyword_sets.append(kws)
 
-    if not query_keywords:
+    if not keyword_sets:
         return results
 
+    threshold = float(get_feature("web_search", "relevance_keyword_threshold", RELEVANCE_KEYWORD_THRESHOLD) or RELEVANCE_KEYWORD_THRESHOLD)
+    min_abs_hits = int(get_feature("web_search", "relevance_min_abs_hits", RELEVANCE_MIN_ABS_HITS) or RELEVANCE_MIN_ABS_HITS)
+    min_keep_cfg = int(get_feature("web_search", "relevance_min_keep", RELEVANCE_MIN_KEEP) or RELEVANCE_MIN_KEEP)
+
     kept: list[dict] = []
+    scored: list[tuple[dict, float, int]] = []
     dropped = 0
     for r in results:
         haystack = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
-        hits = sum(1 for kw in query_keywords if kw in haystack)
-        ratio = hits / len(query_keywords)
+        best_ratio = 0.0
+        best_hits = 0
+        for kws in keyword_sets:
+            hits = sum(1 for kw in kws if kw in haystack)
+            ratio = hits / max(1, len(kws))
+            if ratio > best_ratio or (ratio == best_ratio and hits > best_hits):
+                best_ratio = ratio
+                best_hits = hits
 
-        if ratio >= RELEVANCE_KEYWORD_THRESHOLD:
+        scored.append((r, best_ratio, best_hits))
+
+        if best_ratio >= threshold or best_hits >= min_abs_hits:
             kept.append(r)
         else:
             dropped += 1
             _log.debug(
-                "relevance_filter drop  url=%s ratio=%.2f hits=%d/%d",
-                (r.get("url") or "")[:80], ratio, hits, len(query_keywords),
+                "relevance_filter drop  url=%s ratio=%.2f hits=%d",
+                (r.get("url") or "")[:80], best_ratio, best_hits,
             )
+
+    min_keep = max(1, min(min_keep_cfg, len(results)))
+    if len(kept) < min_keep and scored:
+        scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        fallback = [row for row, _ratio, _hits in scored[:min_keep]]
+        kept_map = {(r.get("url") or ""): r for r in kept}
+        for r in fallback:
+            u = r.get("url") or ""
+            if u not in kept_map:
+                kept.append(r)
+                kept_map[u] = r
 
     if dropped:
         _log.info(
-            "relevance_filter  kept=%d dropped=%d keywords=%d threshold=%.2f",
-            len(kept), dropped, len(query_keywords), RELEVANCE_KEYWORD_THRESHOLD,
+            "relevance_filter  kept=%d dropped=%d query_sets=%d threshold=%.2f min_hits=%d min_keep=%d",
+            len(kept), dropped, len(keyword_sets), threshold, min_abs_hits, min_keep,
         )
     return kept
 
@@ -295,7 +325,14 @@ async def execute(params: dict, emit) -> ToolResult:
     if mode not in ("basic", "standard"):
         mode = "basic"
     query_cap = 20 if mode == "standard" else 5
-    url_cap = STANDARD_MAX_URLS if mode == "standard" else BASIC_MAX_URLS
+    default_url_cap = STANDARD_MAX_URLS if mode == "standard" else BASIC_MAX_URLS
+    cfg_key = "standard_max_urls" if mode == "standard" else "basic_max_urls"
+    cfg_cap = int(get_feature("web_search", cfg_key, default_url_cap) or default_url_cap)
+    # Standard mode should not collapse to tiny caps when many queries are generated.
+    if mode == "standard":
+        url_cap = max(cfg_cap, len(raw_queries) if isinstance(raw_queries, list) else 0)
+    else:
+        url_cap = cfg_cap
     queries = [str(q).strip() for q in raw_queries if str(q).strip()][:query_cap]
     if not queries:
         return ToolResult(

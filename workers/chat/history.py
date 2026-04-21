@@ -10,7 +10,7 @@ MAX_HISTORY_CHARS = 8_000
 KEEP_RECENT_EXCHANGES = 3
 MAX_SINGLE_MESSAGE_CHARS = 2_000
 SUMMARISE_THRESHOLD_CHARS = 5_000
-SUMMARISE_THRESHOLD_MESSAGES = 3
+SUMMARISE_THRESHOLD_MESSAGES = 6
 
 
 def _truncate_message(msg: dict) -> dict:
@@ -28,17 +28,49 @@ def _total_chars(history: list[dict]) -> int:
 
 def extract_conversation_topics(history: list[dict]) -> list[str]:
     import re
+    from tools.search.queries import _extract_keywords
+
+    summary_topics: list[str] = []
     for m in history:
         if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
             content = m["content"]
             for line in content.split("\n"):
                 if line.strip().upper().startswith("TOPICS:"):
                     topic_str = line.split(":", 1)[1].strip()
-                    topics = [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
-                    _log.debug("extract_topics: found %d topics from summary: %s", len(topics), topics)
-                    return topics
-    _log.debug("extract_topics: no summary with TOPICS found in %d messages", len(history))
-    return []
+                    summary_topics = [t.strip().lower() for t in re.split(r"[,;]", topic_str) if t.strip()]
+                    break
+            break
+
+    scores: dict[str, float] = {}
+
+    # Summary topics are useful long-tail memory, but lower weight than recent turns.
+    for t in summary_topics:
+        scores[t] = scores.get(t, 0.0) + 0.6
+
+    # Recency-weighted terms from the last N non-system messages.
+    recent_msgs = [m for m in history if m.get("role") in ("user", "assistant")][-12:]
+    n = len(recent_msgs)
+    for i, m in enumerate(recent_msgs):
+        content = str(m.get("content") or "")[:1200]
+        kws = _extract_keywords(content)
+        if not kws:
+            continue
+        # newer messages score higher (linear recency weighting)
+        weight = 0.6 + ((i + 1) / max(1, n))
+        for kw in kws:
+            k = kw.strip().lower()
+            if len(k) < 3 or k.isdigit():
+                continue
+            scores[k] = scores.get(k, 0.0) + weight
+
+    if not scores:
+        _log.debug("extract_topics: no summary/topics extracted from %d messages", len(history))
+        return []
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    topics = [k for k, _ in ranked[:10]]
+    _log.debug("extract_topics: summary=%d recent_msgs=%d resolved=%s", len(summary_topics), n, topics)
+    return topics
 
 
 def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[list[dict], dict | None]:

@@ -524,7 +524,7 @@ class CodeAgent(BaseAgent):
                             },
                             source="code",
                             org_id=self.org_id,
-                            priority=4,
+                            priority=3,
                         )
                         _log.info("code conv=%s  [3/5] graph extraction queued  job=%s", conversation_id, job_id)
                 except Exception:

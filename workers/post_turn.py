@@ -82,7 +82,7 @@ def ingest_output(
                     },
                     source=source,
                     org_id=org_id,
-                    priority=4,
+                    priority=3,
                 )
                 _log.info("%s conv=%s  ingest graph_extract queued  job=%s", source, conversation_id, job_id)
         except Exception:
@@ -183,7 +183,7 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
                     },
                     source=config.source,
                     org_id=config.org_id,
-                    priority=4,
+                    priority=3,
                 )
                 _log.info(
                     "%s conv=%s  [3/%d] graph extraction queued  job=%s",

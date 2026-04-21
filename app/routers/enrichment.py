@@ -148,6 +148,7 @@ def pathfinder_discover(req: PathfinderRequest):
 
 # ── Scraper control ───────────────────────────────────────────────────────────
 
+@router.get("/scraper/start")
 @router.post("/scraper/start")
 def scraper_start(org_id: int | None = None):
     from tools.enrichment.dispatcher import jumpstart_scraper
@@ -178,12 +179,14 @@ def scrape_target_run_now(target_id: int):
     return {"status": "queued", "target_id": target_id, "job_id": job_id, "org_id": org_id}
 
 
+@router.get("/pathfinder/start")
 @router.post("/pathfinder/start")
 def pathfinder_start(org_id: int | None = None):
     from tools.enrichment.dispatcher import jumpstart_pathfinder
     return jumpstart_pathfinder(org_id=org_id)
 
 
+@router.get("/discover-agent/start")
 @router.post("/discover-agent/start")
 def discover_agent_start(org_id: int | None = None):
     from tools.enrichment.dispatcher import jumpstart_discover_agent

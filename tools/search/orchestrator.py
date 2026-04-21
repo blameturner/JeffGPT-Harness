@@ -40,9 +40,9 @@ _POLICY_BUDGETS = {
         "hard_cap_s": 30.0,
     },
     SEARCH_POLICY_FULL: {
-        "max_candidates": 15,
-        "rerank_max": 15,
-        "max_scrape": 8,
+        "max_candidates": 30,
+        "rerank_max": 20,
+        "max_scrape": 12,
         "rerank_drop_threshold": 2,
         "hard_cap_s": 60.0,
     },
@@ -75,6 +75,11 @@ def _run_search_inner(
     if raw_results:
         ranked = rerank_candidates(raw_results, intent_dict, max_candidates=budget["rerank_max"])
         kept = [c for c, score in ranked if score >= budget["rerank_drop_threshold"]]
+        if not kept and ranked:
+            # Do not hard-fail when reranker is overly strict/noisy; keep a small
+            # best-effort head so downstream scrape+extraction can decide quality.
+            fallback_keep = min(3, len(ranked))
+            kept = [c for c, _score in ranked[:fallback_keep]]
     else:
         kept = []
 
@@ -87,6 +92,9 @@ def _run_search_inner(
             if raw_results:
                 ranked = rerank_candidates(raw_results, intent_dict, max_candidates=budget["rerank_max"])
                 kept = [c for c, score in ranked if score >= budget["rerank_drop_threshold"]]
+                if not kept and ranked:
+                    fallback_keep = min(3, len(ranked))
+                    kept = [c for c, _score in ranked[:fallback_keep]]
 
     if not raw_results:
         _log.info("searxng returned nothing — attempting reformulation")
@@ -97,6 +105,9 @@ def _run_search_inner(
             if raw_results:
                 ranked = rerank_candidates(raw_results, intent_dict, max_candidates=budget["rerank_max"])
                 kept = [c for c, score in ranked if score >= budget["rerank_drop_threshold"]]
+                if not kept and ranked:
+                    fallback_keep = min(3, len(ranked))
+                    kept = [c for c, _score in ranked[:fallback_keep]]
 
     if not kept:
         _log.warning("search failed  queries_tried=%s", queries_tried)
@@ -264,5 +275,4 @@ def run_web_search(
             ex.shutdown(wait=False)
 
     return _run_search_inner(query, org_id, resolved_intent, budget, extraction_function_name)
-
 

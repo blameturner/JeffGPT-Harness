@@ -115,9 +115,10 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "cancel": "/tool-queue/jobs/{job_id}",
             "update_priority": "/tool-queue/jobs/{job_id}/priority",
             "events": "/tool-queue/events",
-            "run_scraper": "/scraper/start?org_id={org_id}",
-            "run_pathfinder": "/pathfinder/start?org_id={org_id}",
-            "run_discover_agent": "/discover-agent/start?org_id={org_id}",
+            # Enrichment routes are mounted under `/enrichment`.
+            "run_scraper": "/enrichment/scraper/start?org_id={org_id}",
+            "run_pathfinder": "/enrichment/pathfinder/start?org_id={org_id}",
+            "run_discover_agent": "/enrichment/discover-agent/start?org_id={org_id}",
         },
         "huey": _huey_status(),
         "active_summary": {
