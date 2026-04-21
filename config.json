@@ -175,6 +175,9 @@
       "background_chat_idle_seconds": 30,
       "default_max_attempts": 3,
       "default_retry_backoff_seconds": 5,
+      "fairness_cadence_claims": 2,
+      "fairness_scan_limit": 200,
+      "type_starvation_override_seconds": 180,
       "job_type_max_attempts": {
         "summarise_page": 3,
         "scrape_page": 2,

@@ -25,6 +25,9 @@ NOCODB_TABLE = "tool_jobs"
 _DEFAULT_BACKGROUND_CHAT_IDLE_S = 30.0
 _DEFAULT_MAX_ATTEMPTS = 1
 _DEFAULT_RETRY_BACKOFF_S = 5.0
+_DEFAULT_TYPE_STARVATION_OVERRIDE_S = 180.0
+_DEFAULT_FAIRNESS_CADENCE_CLAIMS = 2
+_DEFAULT_FAIRNESS_SCAN_LIMIT = 200
 
 _last_chat_activity: float = 0.0
 _activity_lock = threading.Lock()
@@ -262,6 +265,157 @@ class ToolJobQueue:
         self._subscribers: list[list[dict]] = []
         self._sub_lock = threading.Lock()
         self._started_at: float = 0.0
+        self._last_served_at_by_type: dict[str, float] = {}
+        self._fairness_lock = threading.Lock()
+        self._fairness_claim_counter: int = 0
+        self._forced_type_once: str = ""
+
+    @staticmethod
+    def _type_starvation_override_s() -> float:
+        try:
+            from infra.config import get_feature
+
+            raw = get_feature(
+                "tool_queue",
+                "type_starvation_override_seconds",
+                _DEFAULT_TYPE_STARVATION_OVERRIDE_S,
+            )
+            val = float(raw)
+            return val if val > 0 else _DEFAULT_TYPE_STARVATION_OVERRIDE_S
+        except Exception:
+            return _DEFAULT_TYPE_STARVATION_OVERRIDE_S
+
+    @staticmethod
+    def _fairness_cadence_claims() -> int:
+        try:
+            from infra.config import get_feature
+
+            raw = get_feature(
+                "tool_queue",
+                "fairness_cadence_claims",
+                _DEFAULT_FAIRNESS_CADENCE_CLAIMS,
+            )
+            val = int(raw)
+            return val if val > 0 else _DEFAULT_FAIRNESS_CADENCE_CLAIMS
+        except Exception:
+            return _DEFAULT_FAIRNESS_CADENCE_CLAIMS
+
+    @staticmethod
+    def _fairness_scan_limit() -> int:
+        try:
+            from infra.config import get_feature
+
+            raw = get_feature(
+                "tool_queue",
+                "fairness_scan_limit",
+                _DEFAULT_FAIRNESS_SCAN_LIMIT,
+            )
+            val = int(raw)
+            return max(20, min(1000, val))
+        except Exception:
+            return _DEFAULT_FAIRNESS_SCAN_LIMIT
+
+    def _mark_type_served(self, job_type: str) -> None:
+        with self._fairness_lock:
+            self._last_served_at_by_type[job_type] = time.time()
+
+    def _type_starved(self, job_type: str) -> bool:
+        threshold = self._type_starvation_override_s()
+        if threshold <= 0:
+            return False
+        with self._fairness_lock:
+            last = self._last_served_at_by_type.get(job_type, self._started_at or 0.0)
+        if last <= 0:
+            return True
+        return (time.time() - last) >= threshold
+
+    def _forced_type_for(self, job_type: str) -> bool:
+        with self._fairness_lock:
+            return self._forced_type_once == job_type
+
+    def _clear_forced_type(self, job_type: str) -> None:
+        with self._fairness_lock:
+            if self._forced_type_once == job_type:
+                self._forced_type_once = ""
+
+    def _pick_stale_queued_type(self) -> str | None:
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return None
+            rows = db._get(NOCODB_TABLE, params={
+                "where": "(status,eq,queued)",
+                "sort": "CreatedAt",
+                "limit": self._fairness_scan_limit(),
+            }).get("list", [])
+            if not rows:
+                return None
+
+            oldest_by_type: dict[str, dict] = {}
+            for row in rows:
+                jt = str(row.get("type") or "").strip()
+                # Only consider currently-registered handlers; unknown legacy
+                # types cannot be served and would wedge forced fairness.
+                if jt and jt in self._handlers and jt not in oldest_by_type:
+                    oldest_by_type[jt] = row
+            if not oldest_by_type:
+                return None
+
+            now = time.time()
+            with self._fairness_lock:
+                served = dict(self._last_served_at_by_type)
+                started = self._started_at or now
+
+            best_type: str | None = None
+            best_score = -1.0
+            for jt in oldest_by_type:
+                last = served.get(jt, started)
+                score = now - last if last > 0 else now
+                if score > best_score:
+                    best_type = jt
+                    best_score = score
+            return best_type
+        except Exception:
+            return None
+
+    def _record_run_and_maybe_arm_fairness(self, run_type: str) -> None:
+        self._mark_type_served(run_type)
+
+        cadence = self._fairness_cadence_claims()
+        if cadence <= 0:
+            return
+
+        with self._fairness_lock:
+            self._fairness_claim_counter += 1
+            if self._forced_type_once == run_type:
+                self._forced_type_once = ""
+
+            if self._forced_type_once:
+                return
+            due = (self._fairness_claim_counter % cadence) == 0
+
+        if not due:
+            return
+
+        forced = self._pick_stale_queued_type()
+        if not forced or forced == run_type:
+            return
+
+        with self._fairness_lock:
+            if self._forced_type_once:
+                return
+            self._forced_type_once = forced
+
+        ev = self._wake_events.get(forced)
+        if not ev:
+            self._clear_forced_type(forced)
+            return
+        ev.set()
+        _log.info(
+            "queue fairness: armed forced_type=%s after %d claims",
+            forced,
+            self._fairness_claim_counter,
+        )
 
     def register(self, job_type: str, config: HandlerConfig):
         self._handlers[job_type] = config
@@ -530,7 +684,12 @@ class ToolJobQueue:
                 break
 
             queued_head = self._peek_next_queued(job_type)
+            forced_for_me = self._forced_type_for(job_type)
             head_bypass = bool(queued_head and _bypass_idle(queued_head))
+
+            if forced_for_me and queued_head is None:
+                self._clear_forced_type(job_type)
+                forced_for_me = False
 
             # Single chat-idle gate: non-bypass jobs wait until chat is quiet.
             if not head_bypass:
@@ -542,11 +701,18 @@ class ToolJobQueue:
             # Cross-type priority yield: if a higher-priority job is queued
             # anywhere, back off so its worker gets first claim.
             my_priority = config.priority_default
-            if my_priority > 1 and not head_bypass:
+            if my_priority > 1 and not head_bypass and not forced_for_me:
                 yielded = False
                 yield_started = time.time()
                 yield_cap_s = _priority_yield_max_seconds(job_type, my_priority)
                 while self._higher_priority_queued(my_priority):
+                    if queued_head and self._type_starved(job_type):
+                        _log.info(
+                            "queue %s: fairness override — %s idle too long; claiming queued work",
+                            worker_id,
+                            job_type,
+                        )
+                        break
                     if yield_cap_s > 0 and (time.time() - yield_started) >= yield_cap_s:
                         _log.info(
                             "queue %s: fairness override — yielded %.0fs; claiming %s work",
@@ -563,6 +729,12 @@ class ToolJobQueue:
                         return
                 if yielded:
                     _log.info("queue %s: resuming — higher-priority queue drained", worker_id)
+            elif forced_for_me and queued_head:
+                _log.info(
+                    "queue %s: cadence fairness — forcing type=%s claim before higher priority",
+                    worker_id,
+                    job_type,
+                )
 
             job = self._claim_next(job_type, worker_id)
             if not job:
@@ -602,6 +774,7 @@ class ToolJobQueue:
             _log.info("queue %s: RUNNING  job=%s  type=%s  priority=%d  source=%s  org=%d",
                        worker_id, job.job_id[:12], job_type, job.priority, job.source or "-", job.org_id)
             if self._dispatch_to_huey(job, worker_id):
+                self._record_run_and_maybe_arm_fairness(job.type)
                 continue
 
             # Huey-only execution path: if dispatch fails, put the job back and retry.
@@ -784,6 +957,7 @@ class ToolJobQueue:
                 "limit": 100,
             })
             now = time.time()
+            reset_types: set[str] = set()
             for row in rows:
                 started = row.get("started_at") or ""
                 if not started:
@@ -815,9 +989,17 @@ class ToolJobQueue:
                         "claimed_by": "",
                         "started_at": "",
                     })
+                    if job_type:
+                        reset_types.add(job_type)
                     _log.warning("reset stale job %s (type=%s, stuck %.0fs, timeout=%.0fs)",
                                  row.get("job_id"), row.get("type"),
                                  now - started_ts, timeout)
+            for jt in reset_types:
+                ev = self._wake_events.get(jt)
+                if ev:
+                    ev.set()
+            if reset_types:
+                _log.info("stale reset wake  types=%s", sorted(reset_types))
         except Exception:
             _log.error("stale job reset failed", exc_info=True)
 
