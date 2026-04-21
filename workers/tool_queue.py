@@ -17,13 +17,10 @@ _log = logging.getLogger("tool_queue")
 
 NOCODB_TABLE = "tool_jobs"
 
-# priority tiers gate jobs by seconds-since-last-chat-activity.
-# Defaults below are used only if `features.tool_queue` isn't in config.json;
-# the config-driven overrides are the source of truth at runtime.
-_DEFAULT_PRIORITY_BACKOFF: dict[int, float] = {1: 30, 2: 60, 3: 60, 4: 120, 5: 120}
-_DEFAULT_BACKOFF = 300.0
-_DEFAULT_STRICT_CHAT_IDLE_S = 600.0
-_DEFAULT_STARTUP_GRACE_S = 600.0
+# Single chat-idle threshold for all background jobs. Interactive/bypass jobs
+# skip the gate entirely. Local CPU infra: keep this low (seconds, not minutes)
+# so background work runs seamlessly between chat turns.
+_DEFAULT_BACKGROUND_CHAT_IDLE_S = 30.0
 _DEFAULT_MAX_ATTEMPTS = 1
 _DEFAULT_RETRY_BACKOFF_S = 5.0
 
@@ -44,60 +41,14 @@ def seconds_since_chat() -> float:
         return time.time() - _last_chat_activity
 
 
-def _backoff_for_priority(priority: int) -> float:
-    # Read config each time so edits to config.json take effect without restart-of-workers
+def _background_idle_gate() -> float:
     try:
         from infra.config import get_feature
-        per_pri = get_feature("tool_queue", "priority_backoff_seconds", None)
-        if isinstance(per_pri, dict):
-            val = per_pri.get(str(priority), per_pri.get(priority))
-            if val is not None:
-                return float(val)
-        default = get_feature("tool_queue", "default_backoff_seconds", None)
-        if default is not None:
-            return float(default)
+        raw = get_feature("tool_queue", "background_chat_idle_seconds", _DEFAULT_BACKGROUND_CHAT_IDLE_S)
+        val = float(raw)
+        return val if val >= 0 else _DEFAULT_BACKGROUND_CHAT_IDLE_S
     except Exception:
-        pass
-    return _DEFAULT_PRIORITY_BACKOFF.get(priority, _DEFAULT_BACKOFF)
-
-
-def _additional_idle_for_job_type(job_type: str) -> float:
-    """Per-job-type additive idle gate (seconds), layered on top of priority backoff.
-    Lets us keep one global chat-idle floor while slowing especially heavy types."""
-    try:
-        from infra.config import get_feature
-        per_type = get_feature("tool_queue", "job_type_additional_idle_seconds", None)
-        if isinstance(per_type, dict):
-            val = per_type.get(job_type)
-            if val is not None:
-                return max(0.0, float(val))
-    except Exception:
-        pass
-    return 0.0
-
-
-def _min_idle_for_job_type(job_type: str) -> float | None:
-    """Optional absolute min-idle override for a job type.
-    When set, effective gate is max(base_gate, per_type_min_idle)."""
-    try:
-        from infra.config import get_feature
-        per_type = get_feature("tool_queue", "job_type_min_idle_seconds", None)
-        if isinstance(per_type, dict):
-            val = per_type.get(job_type)
-            if val is not None:
-                return max(0.0, float(val))
-    except Exception:
-        pass
-    return None
-
-
-def _effective_idle_gate(priority: int, job_type: str) -> float:
-    base = max(_backoff_for_priority(priority), _strict_chat_idle_floor_s())
-    per_type_min = _min_idle_for_job_type(job_type)
-    if per_type_min is not None:
-        return max(base, per_type_min)
-    # Back-compat path for older config shape.
-    return base + _additional_idle_for_job_type(job_type)
+        return _DEFAULT_BACKGROUND_CHAT_IDLE_S
 
 
 def _max_attempts_for_job_type(job_type: str) -> int:
@@ -130,37 +81,19 @@ def _retry_backoff_s(job_type: str, attempt: int) -> float:
         return _DEFAULT_RETRY_BACKOFF_S
 
 
-def _strict_chat_idle_floor_s() -> float:
-    """Hard minimum idle time before ANY queued job can run.
-    This is layered on top of per-priority backoff and is intentionally strict
-    so chat/code traffic always gets first access to model slots."""
-    try:
-        from infra.config import get_feature
-        raw = get_feature("tool_queue", "strict_chat_idle_seconds", _DEFAULT_STRICT_CHAT_IDLE_S)
-        val = float(raw)
-        return val if val > 0 else _DEFAULT_STRICT_CHAT_IDLE_S
-    except Exception:
-        return _DEFAULT_STRICT_CHAT_IDLE_S
-
-
-def _startup_grace_s() -> float:
-    """Hard cooldown after process start before queue workers execute jobs."""
-    try:
-        from infra.config import get_feature
-        raw = get_feature("tool_queue", "startup_grace_seconds", _DEFAULT_STARTUP_GRACE_S)
-        val = float(raw)
-        return val if val > 0 else _DEFAULT_STARTUP_GRACE_S
-    except Exception:
-        return _DEFAULT_STARTUP_GRACE_S
-
-
 def _is_interactive_source(source: str) -> bool:
     s = (source or "").strip().lower()
     return s == "chat" or s == "code" or s.startswith("chat_") or s.startswith("code_")
 
 
-# legacy aliases used elsewhere in this module (kept for compatibility)
-_PRIORITY_BACKOFF = _DEFAULT_PRIORITY_BACKOFF
+def _bypass_idle(job: "ToolJob") -> bool:
+    """Jobs that skip the background chat-idle gate: interactive chat/code jobs,
+    user-initiated priority-1-3 jobs tagged with bypass_idle, and everything
+    explicitly requesting bypass via payload."""
+    if _is_interactive_source(job.source):
+        return True
+    payload = job.payload if isinstance(job.payload, dict) else {}
+    return bool(payload.get("bypass_idle"))
 
 
 @dataclass
@@ -434,16 +367,8 @@ class ToolJobQueue:
         if idle == float("inf"):
             idle = -1  # no chat activity yet
 
-        p1 = _backoff_for_priority(1)
-        p2 = _backoff_for_priority(2)
-        background = _backoff_for_priority(5)
-        backoff_state = "active"
-        if idle < 0 or idle >= background:
-            backoff_state = "clear"
-        elif idle >= p2:
-            backoff_state = "priority_1_2_only"
-        elif idle >= p1:
-            backoff_state = "priority_1_only"
+        gate = _background_idle_gate()
+        backoff_state = "clear" if (idle < 0 or idle >= gate) else "waiting_for_idle"
 
         return {
             "counts": counts,
@@ -451,11 +376,7 @@ class ToolJobQueue:
             "backoff": {
                 "state": backoff_state,
                 "idle_seconds": round(idle, 0),
-                "thresholds": {
-                    "priority_1": p1,
-                    "priority_2": p2,
-                    "background": background,
-                },
+                "threshold": gate,
             },
         }
 
@@ -587,41 +508,19 @@ class ToolJobQueue:
                 break
 
             queued_head = self._peek_next_queued(job_type)
-            head_is_interactive = bool(queued_head and _is_interactive_source(queued_head.source))
+            head_bypass = bool(queued_head and _bypass_idle(queued_head))
 
-            # strict startup/chat gate for all non-interactive jobs.
-            if not head_is_interactive:
-                startup_elapsed = (time.time() - self._started_at) if self._started_at else 0.0
-                startup_gate = _startup_grace_s()
-                if startup_elapsed < startup_gate:
-                    if int(startup_elapsed) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
-                        _log.info(
-                            "queue %s: startup cooldown — backing off (elapsed=%.0fs, gate=%.0fs)",
-                            worker_id, startup_elapsed, startup_gate,
-                        )
-                    continue
-
+            # Single chat-idle gate: non-bypass jobs wait until chat is quiet.
+            if not head_bypass:
                 idle = seconds_since_chat()
-                # pre-claim gate uses p1 + strict idle floor; per-job priority/additional
-                # checks are enforced again post-claim.
-                min_gate = _effective_idle_gate(1, job_type)
-                if idle < min_gate:
-                    if int(idle) % 60 < int(JOB_QUEUE_POLL_INTERVAL) + 1:
-                        _log.debug("queue %s: chat active — backing off (idle=%.0fs, gate=%.0fs)",
-                                   worker_id, idle, min_gate)
+                gate = _background_idle_gate()
+                if idle < gate:
                     continue
 
-            # Cross-type priority yield: before claiming MY job, check if anything
-            # higher-priority is waiting anywhere in the queue. If so, back off so
-            # the high-priority worker gets its turn. Without this, each job_type
-            # has its own thread and p5 runs in parallel with a queued p3.
-            #
-            # Polls in a loop so we pick up quickly once the higher-priority job
-            # claims. A single sleep-then-continue would dump us back into
-            # wake.wait(timeout=POLL_INTERVAL) and potentially idle 300s even
-            # though the higher-priority job already claimed.
+            # Cross-type priority yield: if a higher-priority job is queued
+            # anywhere, back off so its worker gets first claim.
             my_priority = config.priority_default
-            if my_priority > 1 and not head_is_interactive:
+            if my_priority > 1 and not head_bypass:
                 yielded = False
                 while self._higher_priority_queued(my_priority):
                     if not yielded:
@@ -639,29 +538,16 @@ class ToolJobQueue:
             if not job:
                 continue
 
-            job_is_interactive = _is_interactive_source(job.source)
-
-            # per-job strict backoff: unclaim and sleep if startup/chat thresholds
-            # are not met at the exact moment before execution.
-            if not job_is_interactive:
-                startup_elapsed = (time.time() - self._started_at) if self._started_at else 0.0
-                startup_gate = _startup_grace_s()
-                if startup_elapsed < startup_gate:
-                    wait_secs = min(startup_gate - startup_elapsed, 60)
-                    _log.info(
-                        "queue %s: job %s blocked by startup cooldown (elapsed=%.0fs, gate=%.0fs) — sleeping %.0fs",
-                        worker_id, job.job_id[:12], startup_elapsed, startup_gate, wait_secs,
-                    )
-                    self._unclaim(job)
-                    self._stop.wait(timeout=wait_secs)
-                    continue
-
+            # Re-check gate post-claim in case chat activity touched between peek and claim.
+            if not _bypass_idle(job):
                 idle = seconds_since_chat()
-                required = _effective_idle_gate(job.priority, job.type)
-                if idle < required:
-                    wait_secs = min(required - idle, 60)
-                    _log.info("queue %s: job %s (priority=%d) needs %.0fs idle, currently %.0fs — sleeping %.0fs",
-                              worker_id, job.job_id[:12], job.priority, required, idle, wait_secs)
+                gate = _background_idle_gate()
+                if idle < gate:
+                    wait_secs = min(gate - idle, 60)
+                    _log.info(
+                        "queue %s: job %s needs %.0fs idle, currently %.0fs — sleeping %.0fs",
+                        worker_id, job.job_id[:12], gate, idle, wait_secs,
+                    )
                     self._unclaim(job)
                     self._stop.wait(timeout=wait_secs)
                     continue
@@ -888,17 +774,16 @@ class ToolJobQueue:
                 # is still working.
                 job_type = row.get("type") or ""
                 _STALE_MULTIPLIERS = {
-                    "graph_extract": 4,          # 20m — LLM inference 7-16min
+                    "graph_extract": 4,               # 20m — LLM inference 7-16min
                     "research_planner": research_planner_dynamic_mult,
                     "research_agent": research_agent_dynamic_mult,
-                    # Dynamic: scales with configured planned_search timeouts.
                     "planned_search_execute": planned_dynamic_mult,
-                    "planned_search_scrape": 3,   # 15m — scrape worker with network variance
-                    "pathfinder_crawl": 3,       # 15m — one scrape + link writes, but Playwright can stall
-                    "scrape_target": 3,          # 15m — Playwright fallback + embed
-                    "summarise_page": 3,         # 15m — summariser LLM
-                    "classify_relevance": 3,     # 15m — classifier LLM
-                    "discover_agent_run": 3,     # 15m — Chroma sample + LLM + N SearXNG queries
+                    "planned_search_scrape": 3,       # 15m — scrape worker with network variance
+                    "scrape_page": 3,                 # 15m — fetch + chunk + embed
+                    "pathfinder_extract": 3,          # 15m — fetch + link extract
+                    "summarise_page": 3,              # 15m — summariser LLM
+                    "extract_relationships": 4,       # 20m — relationship extraction LLM
+                    "discover_agent_run": 3,          # 15m — Chroma sample + LLM + SearXNG queries
                 }
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:

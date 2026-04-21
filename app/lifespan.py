@@ -37,21 +37,17 @@ async def lifespan(app: FastAPI):
     from tools.planned_search.agent import run_planned_search_job, run_planned_search_scrape_job
     from tools.research.agent import run_research_agent
     from tools.research.research_planner import run_research_planner_job
-    from tools.enrichment.scraper import scrape_target_job
+    from tools.enrichment.scraper import scrape_page_job
     from tools.enrichment.summariser import summarise_page_job
-    from tools.enrichment.pathfinder import pathfinder_crawl_job
-    from tools.enrichment.classifier import classify_relevance_job
+    from tools.enrichment.pathfinder import pathfinder_extract_job
     from tools.enrichment.discover_agent import discover_agent_job
+    from tools.enrichment.relationships_extractor import extract_relationships_job
     tool_queue = ToolJobQueue()
-    # Priority tiers (lower number = picked first, shorter chat-idle needed):
-    #   2 = user-facing planned_search (runs first when user approves queries)
-    #   3 = research planner + agent (user-initiated, LLM-heavy)
-    #   4 = summarisers, classifier, graph_extract, scrape_target (downstream work
-    #       on already-known URLs — runs ahead of pathfinder so pipelines drain)
-    #   5 = pathfinder (exploratory/discovery — lowest priority, runs only when
-    #       everything above is quiet)
-    # scrape_target is deliberately one tier ABOVE pathfinder_crawl: we'd rather
-    # finish scraping known-good targets than spend compute discovering new ones.
+    # Priority tiers (lower = picked first):
+    #   2 = user-facing planned_search
+    #   3 = research planner + agent
+    #   4 = scrape_page, pathfinder_extract, summarise_page, graph_extract
+    #   5 = discover_agent_run, extract_relationships (background)
     tool_queue.register("planned_search_execute", HandlerConfig(
         handler=lambda p: run_planned_search_job(p["message_id"], p["org_id"]),
         max_workers=1, priority_default=2, source="planned_search",
@@ -72,26 +68,22 @@ async def lifespan(app: FastAPI):
         handler=summarise_page_job,
         max_workers=1, priority_default=4, source="summariser",
     ))
-    tool_queue.register("classify_relevance", HandlerConfig(
-        handler=classify_relevance_job,
-        max_workers=1, priority_default=4, source="classifier",
-    ))
     tool_queue.register("graph_extract", HandlerConfig(
         handler=_handle_graph_extract, max_workers=1, priority_default=4,
     ))
-    tool_queue.register("pathfinder_crawl", HandlerConfig(
-        # accepts payload dict directly; picks next discovery root when payload is empty {}
-        handler=pathfinder_crawl_job,
-        max_workers=1, priority_default=5, source="pathfinder",
+    tool_queue.register("scrape_page", HandlerConfig(
+        handler=scrape_page_job,
+        max_workers=1, priority_default=4, source="scraper",
     ))
-    tool_queue.register("scrape_target", HandlerConfig(
-        # accepts payload dict directly; picks next due target when payload is empty {}
-        handler=scrape_target_job,
-        max_workers=2, priority_default=4, source="scraper",
+    tool_queue.register("pathfinder_extract", HandlerConfig(
+        handler=pathfinder_extract_job,
+        max_workers=1, priority_default=4, source="pathfinder",
+    ))
+    tool_queue.register("extract_relationships", HandlerConfig(
+        handler=extract_relationships_job,
+        max_workers=1, priority_default=5, source="relationships",
     ))
     tool_queue.register("discover_agent_run", HandlerConfig(
-        # autonomous discovery worker: samples Chroma, generates web queries,
-        # and feeds new root URLs into discovery for pathfinder to expand.
         handler=discover_agent_job,
         max_workers=1, priority_default=5, source="discover_agent",
     ))
@@ -100,51 +92,48 @@ async def lifespan(app: FastAPI):
     tool_queue.start()
     _log.info("tool job queue running")
 
-    # periodic dispatchers: submit one scrape_target and one pathfinder_crawl
-    # per interval if none are inflight. Self-chaining has been removed from
-    # both handlers (it caused the runaway-every-1.5s bug); these APScheduler
-    # IntervalTriggers are now the sole drivers.
+    # Periodic dispatchers. Each one enqueues at most one job per tick and is
+    # guarded by an inflight check. The single chat-idle gate in tool_queue
+    # decides when a job actually runs — no startup delay needed here.
     try:
-        from datetime import datetime, timedelta, timezone
         from infra.config import get_feature
-        from tools.enrichment.dispatcher import jumpstart_scraper, jumpstart_pathfinder, jumpstart_discover_agent
+        from tools.enrichment.dispatcher import (
+            jumpstart_discover_agent,
+            jumpstart_pathfinder,
+            jumpstart_scraper,
+        )
         from apscheduler.triggers.interval import IntervalTrigger
-        scrape_interval = int(get_feature("scraper", "dispatch_interval_minutes", 5))
-        # Hold dispatchers for 10 minutes after startup so background queue work
-        # cannot flood immediately on boot.
-        first_run = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        scrape_seconds = int(get_feature("scraper", "dispatch_interval_seconds", 60))
         sched.add_job(
             jumpstart_scraper,
-            IntervalTrigger(minutes=scrape_interval),
+            IntervalTrigger(seconds=max(15, scrape_seconds)),
             id="enrichment_scrape_dispatcher",
             max_instances=1,
             coalesce=True,
             replace_existing=True,
-            next_run_time=first_run,
         )
-        recrawl_interval = int(get_feature("pathfinder", "recrawl_interval_minutes", 60))
+        pathfinder_seconds = int(get_feature("pathfinder", "dispatch_interval_seconds", 120))
         sched.add_job(
             jumpstart_pathfinder,
-            IntervalTrigger(minutes=recrawl_interval),
-            id="pathfinder_recrawl_dispatcher",
+            IntervalTrigger(seconds=max(30, pathfinder_seconds)),
+            id="pathfinder_dispatcher",
             max_instances=1,
             coalesce=True,
             replace_existing=True,
-            next_run_time=first_run,
         )
-        discover_interval = int(get_feature("discover_agent", "run_interval_minutes", 20))
+        discover_minutes = int(get_feature("discover_agent", "run_interval_minutes", 20))
         sched.add_job(
             jumpstart_discover_agent,
-            IntervalTrigger(minutes=discover_interval),
+            IntervalTrigger(minutes=max(1, discover_minutes)),
             id="discover_agent_dispatcher",
             max_instances=1,
             coalesce=True,
             replace_existing=True,
-            next_run_time=first_run,
         )
         _log.info(
-            "enrichment dispatchers scheduled  scrape=%dm  recrawl=%dm  discover=%dm",
-            scrape_interval, recrawl_interval, discover_interval,
+            "enrichment dispatchers scheduled  scrape=%ds pathfinder=%ds discover=%dm",
+            scrape_seconds, pathfinder_seconds, discover_minutes,
         )
     except Exception:
         _log.error("enrichment dispatcher registration failed", exc_info=True)

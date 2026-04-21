@@ -1,17 +1,19 @@
+
 from __future__ import annotations
 
 import logging
 
-from infra.config import get_feature, is_feature_enabled
+from infra.config import (
+    NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
+    get_feature,
+    is_feature_enabled,
+)
 from infra.nocodb_client import NocodbClient
 
 _log = logging.getLogger("enrichment.dispatcher")
 
 
 def _count_inflight(client: NocodbClient, job_type: str) -> int:
-    """Count tool_jobs of a given type with status queued/running.
-    NocoDB v1's where parser doesn't reliably support nested-paren ~or, so we
-    do two single-status queries and sum."""
     total = 0
     for status in ("queued", "running"):
         try:
@@ -26,12 +28,7 @@ def _count_inflight(client: NocodbClient, job_type: str) -> int:
 
 
 def _default_org_id(client: NocodbClient) -> int | None:
-    """Pick an active org_id for jumpstart tool_jobs so they're filterable in the UI.
-
-    Returns None when no tenant context exists yet; callers should skip dispatch
-    instead of submitting jobs with synthetic org ids.
-    """
-    for table in ("discovery", "scrape_targets"):
+    for table in ("scrape_targets", NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS):
         try:
             rows = client._get(table, params={
                 "limit": 1,
@@ -48,20 +45,19 @@ def _default_org_id(client: NocodbClient) -> int | None:
 
 
 def jumpstart_scraper(org_id: int | None = None) -> dict:
-    """Scheduler hook: every `scraper.dispatch_interval_minutes`, queue ONE
-    scrape_target batch job — but only if the previous one has finished. The
-    inflight check ensures the scheduler can't pile up runs if the scrape takes
-    longer than the cron interval."""
+    """Enqueue one `scrape_page` job for the oldest due scrape_target."""
     if not is_feature_enabled("scraper"):
         return {"status": "disabled"}
 
+    from tools.enrichment.scraper import fetch_due_target
     from workers.tool_queue import get_tool_queue
+
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
 
     client = NocodbClient()
-    inflight = _count_inflight(client, "scrape_target")
+    inflight = _count_inflight(client, "scrape_page")
     if inflight > 0:
         return {"status": "already_running", "inflight": inflight}
 
@@ -71,31 +67,54 @@ def jumpstart_scraper(org_id: int | None = None) -> dict:
         org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
+
+    target = fetch_due_target(client, org_id=org_id)
+    if not target:
+        return {"status": "idle"}
+    target_id = int(target.get("Id") or 0)
+    if not target_id:
+        return {"status": "idle"}
+
     try:
-        job_id = tq.submit("scrape_target", {}, source="scraper_jumpstart", priority=4, org_id=org_id)
+        job_id = tq.submit(
+            "scrape_page",
+            {"target_id": target_id, "org_id": org_id},
+            source="scraper_jumpstart",
+            priority=4,
+            org_id=org_id,
+        )
     except Exception:
         _log.warning("scraper jumpstart submit failed", exc_info=True)
         return {"status": "submit_failed"}
-    _log.info("scraper jumpstart queued job=%s org_id=%d", job_id, org_id)
-    return {"status": "kicked", "queued": 1, "org_id": org_id}
+    _log.info("scraper jumpstart queued job=%s target_id=%d org_id=%d", job_id, target_id, org_id)
+    return {"status": "kicked", "target_id": target_id, "org_id": org_id}
+
+
+def _oldest_approved_suggestion(client: NocodbClient, org_id: int) -> dict | None:
+    try:
+        rows = client._get(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, params={
+            "where": f"(status,eq,approved)~and(org_id,eq,{org_id})",
+            "sort": "CreatedAt",
+            "limit": 1,
+        }).get("list", [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
 
 
 def jumpstart_pathfinder(org_id: int | None = None) -> dict:
-    """Scheduler hook: every `pathfinder.recrawl_interval_minutes`, ensure there is
-    exactly ONE pathfinder_crawl in the queue. Skip if one is already inflight.
-    This cron is now the SOLE driver of pathfinder_crawl — self-chaining was
-    removed from the handler because it produced a runaway loop when chat was
-    idle (no backoff gate tripped and jobs ran back-to-back every ~1.5 s)."""
+    """Enqueue one `pathfinder_extract` job for the oldest approved suggestion."""
     if not get_feature("pathfinder", "enabled", True):
         return {"status": "disabled"}
 
     from workers.tool_queue import get_tool_queue
+
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
 
     client = NocodbClient()
-    inflight = _count_inflight(client, "pathfinder_crawl")
+    inflight = _count_inflight(client, "pathfinder_extract")
     if inflight > 0:
         return {"status": "already_running", "inflight": inflight}
 
@@ -105,32 +124,36 @@ def jumpstart_pathfinder(org_id: int | None = None) -> dict:
         org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
+
+    row = _oldest_approved_suggestion(client, org_id)
+    if not row:
+        return {"status": "idle"}
+    suggested_id = int(row.get("Id") or 0)
+    if not suggested_id:
+        return {"status": "idle"}
+
     try:
-        job_id = tq.submit("pathfinder_crawl", {}, source="pathfinder_jumpstart", priority=5, org_id=org_id)
+        job_id = tq.submit(
+            "pathfinder_extract",
+            {"suggested_id": suggested_id, "org_id": org_id},
+            source="pathfinder_jumpstart",
+            priority=4,
+            org_id=org_id,
+        )
     except Exception:
         _log.warning("pathfinder jumpstart submit failed", exc_info=True)
         return {"status": "submit_failed"}
-    _log.info("pathfinder jumpstart queued job=%s org_id=%d", job_id, org_id)
-    return {"status": "kicked", "queued": 1, "org_id": org_id}
-
-
-# Back-compat shims for the old function names
-def enqueue_due_scrape_targets() -> dict:
-    return jumpstart_scraper()
-
-
-def enqueue_due_pathfinder_recrawls() -> dict:
-    return jumpstart_pathfinder()
+    _log.info("pathfinder jumpstart queued job=%s suggested_id=%d", job_id, suggested_id)
+    return {"status": "kicked", "suggested_id": suggested_id, "org_id": org_id}
 
 
 def jumpstart_discover_agent(org_id: int | None = None) -> dict:
-    """Scheduler hook: every ``discover_agent.run_interval_minutes``, queue ONE
-    discover_agent_run job — but only if none is already inflight.  The agent
-    has its own cooldown gate inside the handler so double-triggers are safe."""
+    """Enqueue one `discover_agent_run` job per tick if none inflight."""
     if not get_feature("discover_agent", "enabled", True):
         return {"status": "disabled"}
 
     from workers.tool_queue import get_tool_queue
+
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
@@ -146,14 +169,17 @@ def jumpstart_discover_agent(org_id: int | None = None) -> dict:
         org_id = _default_org_id(client)
     if not org_id:
         return {"status": "no_org_context"}
+
     try:
         job_id = tq.submit(
-            "discover_agent_run", {"org_id": org_id},
-            source="discover_agent_jumpstart", priority=5, org_id=org_id,
+            "discover_agent_run",
+            {"org_id": org_id},
+            source="discover_agent_jumpstart",
+            priority=5,
+            org_id=org_id,
         )
     except Exception:
         _log.warning("discover_agent jumpstart submit failed", exc_info=True)
         return {"status": "submit_failed"}
     _log.info("discover_agent jumpstart queued job=%s org_id=%d", job_id, org_id)
-    return {"status": "kicked", "queued": 1, "org_id": org_id}
-
+    return {"status": "kicked", "org_id": org_id}

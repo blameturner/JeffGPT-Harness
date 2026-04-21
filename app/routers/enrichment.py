@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from infra.config import get_feature
+from infra.config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, get_feature
 from infra.nocodb_client import NocodbClient
 from workers.tool_queue import ToolJob, get_tool_queue
 
@@ -16,9 +16,6 @@ router = APIRouter()
 class PathfinderRequest(BaseModel):
     seed_url: str
     org_id: int
-    max_depth: int = 3
-    max_pages: int = 200
-    same_host_only: bool = True
 
 
 class ScraperRequest(BaseModel):
@@ -35,16 +32,87 @@ class ResearchAgentRequest(BaseModel):
     plan_id: int
 
 
+
+@router.get("/discovery/suggestions")
+def discovery_suggestions_list(org_id: int, status: str | None = "pending", limit: int = 50):
+    limit = min(max(1, limit), 500)
+    client = NocodbClient()
+    parts = [f"(org_id,eq,{org_id})"]
+    if status:
+        parts.append(f"(status,eq,{status})")
+    params: dict = {
+        "where": "~and".join(parts),
+        "sort": "-CreatedAt",
+        "limit": limit,
+    }
+    rows = client._get_paginated(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, params=params)
+    return {"status": "ok", "rows": rows}
+
+
+@router.post("/discovery/suggestions/{suggested_id}/approve")
+def discovery_suggestion_approve(suggested_id: int):
+    """User approves a suggested URL. Mark status=approved and enqueue
+    pathfinder_extract immediately (bypass idle gate — this is user-initiated)."""
+    client = NocodbClient()
+    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id)
+    if not row:
+        return {"status": "not_found", "suggested_id": suggested_id}
+
+    org_id = int(row.get("org_id") or 0)
+    if org_id <= 0:
+        return {"status": "failed", "error": "missing_org_id"}
+
+    try:
+        client._patch(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, {
+            "Id": suggested_id,
+            "status": "approved",
+            "error_message": "",
+            "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+    except Exception:
+        _log.warning("suggestion approve patch failed  id=%d", suggested_id, exc_info=True)
+        return {"status": "failed", "error": "patch_failed"}
+
+    tq = get_tool_queue()
+    if not tq:
+        return {"status": "failed", "error": "tool_queue_unavailable"}
+
+    job_id = tq.submit(
+        "pathfinder_extract",
+        {"suggested_id": suggested_id, "org_id": org_id, "bypass_idle": True},
+        source="discovery_suggestions_api",
+        priority=3,
+        org_id=org_id,
+    )
+    return {"status": "queued", "suggested_id": suggested_id, "job_id": job_id, "org_id": org_id}
+
+
+@router.post("/discovery/suggestions/{suggested_id}/reject")
+def discovery_suggestion_reject(suggested_id: int, reason: str | None = None):
+    client = NocodbClient()
+    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id)
+    if not row:
+        return {"status": "not_found", "suggested_id": suggested_id}
+    try:
+        client._patch(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, {
+            "Id": suggested_id,
+            "status": "rejected",
+            "error_message": (reason or "")[:500],
+            "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+    except Exception:
+        return {"status": "failed", "error": "patch_failed"}
+    return {"status": "ok", "suggested_id": suggested_id}
+
+
+# ── Manual seed entry (bypasses discovery, goes straight to pathfinder) ───────
+
 @router.post("/pathfinder/discover")
 def pathfinder_discover(req: PathfinderRequest):
-    """UI submits a seed URL: upsert as a discovery root and queue a pathfinder_crawl
-    job. Resets status to 'discovered' on re-submission so the scheduler can pick it
-    up on the next cycle even if the in-memory job is lost to a restart."""
-    from tools.enrichment.pathfinder import upsert_discovery_root, _normalize
+    """User directly submits a seed URL. We create a suggested_scrape_targets
+    row pre-approved by the user and queue pathfinder_extract."""
+    from tools.enrichment.pathfinder import _normalize
 
-    # Normalize and validate the URL before touching the DB.
-    # _normalize strips tracking params, www, trailing slashes and returns ""
-    # for non-HTTP(S) schemes — matching exactly what discover() does internally.
     norm_url = _normalize(req.seed_url)
     if not norm_url:
         return {"status": "failed", "error": "invalid_url", "raw": req.seed_url}
@@ -52,38 +120,46 @@ def pathfinder_discover(req: PathfinderRequest):
         return {"status": "failed", "error": "invalid_org_id"}
 
     client = NocodbClient()
-    # reset_status=True: if the URL was previously crawled, mark it 'discovered'
-    # again so both the direct job AND the scheduler fallback can process it.
-    discovery_id = upsert_discovery_root(client, norm_url, req.org_id, reset_status=True)
-    if not discovery_id:
-        return {"status": "failed", "error": "discovery_upsert_failed"}
+    try:
+        row = client._post(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, {
+            "org_id": req.org_id,
+            "url": norm_url,
+            "title": norm_url,
+            "query": "manual_entry",
+            "relevance": "high",
+            "score": 100,
+            "reason": "user-submitted seed",
+            "status": "approved",
+        })
+        suggested_id = row.get("Id")
+    except Exception:
+        _log.warning("pathfinder discover insert failed  url=%s", norm_url[:80], exc_info=True)
+        return {"status": "failed", "error": "insert_failed"}
 
     tq = get_tool_queue()
     if not tq:
         return {"status": "failed", "error": "tool_queue_unavailable"}
 
-    # Priority 3: user-initiated crawls run ahead of background enrichment (4/5)
-    # but after interactive planned_search/research (2/3).
     job_id = tq.submit(
-        "pathfinder_crawl",
-        {"discovery_id": discovery_id},
+        "pathfinder_extract",
+        {"suggested_id": suggested_id, "org_id": req.org_id, "bypass_idle": True},
         source="pathfinder_api",
         priority=3,
         org_id=req.org_id,
     )
-    return {"status": "queued", "discovery_id": discovery_id, "job_id": job_id, "url": norm_url}
+    return {"status": "queued", "suggested_id": suggested_id, "job_id": job_id, "url": norm_url}
 
+
+# ── Scraper control ───────────────────────────────────────────────────────────
 
 @router.post("/scraper/start")
 def scraper_start(org_id: int | None = None):
-    """UI button: jumpstart the scraper chain if it's idle."""
     from tools.enrichment.dispatcher import jumpstart_scraper
     return jumpstart_scraper(org_id=org_id)
 
 
 @router.post("/scrape-targets/{target_id}/run-now")
 def scrape_target_run_now(target_id: int):
-    """UI action: queue a specific scrape_target immediately."""
     tq = get_tool_queue()
     if not tq:
         return {"status": "failed", "error": "tool_queue_unavailable"}
@@ -97,13 +173,8 @@ def scrape_target_run_now(target_id: int):
         return {"status": "failed", "error": "missing_org_id", "target_id": target_id}
 
     job_id = tq.submit(
-        "scrape_target",
-        {
-            "target_id": target_id,
-            "org_id": org_id,
-            "selection_bucket": "manual_run_now",
-            "selection_reason": "queued by user from scrape-targets UI",
-        },
+        "scrape_page",
+        {"target_id": target_id, "org_id": org_id, "bypass_idle": True},
         source="scrape_target_api",
         priority=3,
         org_id=org_id,
@@ -113,59 +184,32 @@ def scrape_target_run_now(target_id: int):
 
 @router.post("/pathfinder/start")
 def pathfinder_start(org_id: int | None = None):
-    """UI button: jumpstart the pathfinder chain if it's idle."""
     from tools.enrichment.dispatcher import jumpstart_pathfinder
     return jumpstart_pathfinder(org_id=org_id)
 
 
 @router.post("/discover-agent/start")
 def discover_agent_start(org_id: int | None = None):
-    """UI button: immediately queue one discover_agent_run (bypasses scheduler interval,
-    still subject to the handler's cooldown gate)."""
     from tools.enrichment.dispatcher import jumpstart_discover_agent
     return jumpstart_discover_agent(org_id=org_id)
 
 
+# ── Previews ──────────────────────────────────────────────────────────────────
+
 @router.post("/pathfinder/fetch-next")
 def pathfinder_fetch_next(org_id: int | None = None):
-    from tools.enrichment.pathfinder import preview_next_seed
-
-    pick = preview_next_seed(org_id=org_id)
-    if not pick:
-        return {"status": "empty", "source": None, "row": None}
-    return {"status": "ok", "source": pick.get("source"), "row": pick.get("row")}
-
-
-@router.post("/pathfinder/mark-processed")
-def pathfinder_mark_processed(url_id: int):
-    from tools.enrichment.pathfinder import mark_processed
-    
-    mark_processed(url_id)
-    return {"status": "ok", "url_id": url_id}
-
-
-@router.post("/scraper/run")
-def scraper_run(req: ScraperRequest):
-    from tools.enrichment.scraper import run_scraper
-    
-    result = run_scraper(req.batch_size)
-    return {"status": "ok", **result}
-
-
-@router.post("/scraper/scrape-next")
-def scraper_scrape_next(org_id: int | None = None):
-    from tools.enrichment.scraper import scrape_next
-    
-    row = scrape_next(org_id=org_id)
+    from tools.enrichment.pathfinder import preview_next_approved
+    row = preview_next_approved(org_id=org_id)
     if not row:
         return {"status": "empty", "row": None}
     return {"status": "ok", "row": row}
 
 
+# ── Research (unchanged) ──────────────────────────────────────────────────────
+
 @router.post("/research/create-plan")
 def research_create_plan(req: ResearchRequest):
     from tools.research.research_planner import create_research_plan
-    
     result = create_research_plan(req.topic, req.org_id)
     return {"status": result.get("status"), **result}
 
@@ -173,7 +217,6 @@ def research_create_plan(req: ResearchRequest):
 @router.post("/research/get-next")
 def research_get_next():
     from tools.research.research_planner import get_next_plan
-    
     row = get_next_plan()
     if not row:
         return {"status": "empty", "row": None}
@@ -183,7 +226,6 @@ def research_get_next():
 @router.post("/research/complete")
 def research_complete(plan_id: int):
     from tools.research.research_planner import complete_plan
-    
     complete_plan(plan_id)
     return {"status": "ok", "plan_id": plan_id}
 
@@ -218,32 +260,13 @@ def research_agent_run(req: ResearchAgentRequest):
 @router.post("/research/agent/next")
 def research_agent_next():
     from tools.research.agent import get_next_research
-    
     row = get_next_research()
     if not row:
         return {"status": "empty", "row": None}
     return {"status": "ok", "row": row}
 
 
-# Passing an explicit `fields` on NocoDB list GETs stops the m2m link expansion
-# (which otherwise generates a massive UNION ALL query per linked table — one
-# sub-SELECT per row — and tanks list-endpoint latency once tables grow).
-_DISCOVERY_LIST_FIELDS = (
-    "Id,org_id,url,url_hash,source_url,depth,domain,score,status,"
-    "error_message,created_at,processed_at,CreatedAt"
-)
-_RESEARCH_PLAN_LIST_FIELDS = (
-    "Id,org_id,topic,hypotheses,sub_topics,queries,schema,iterations,"
-    "max_iterations,confidence_score,confidence_threshold,gap_report,"
-    "paper_content,status,error_message,created_at,completed_at,CreatedAt"
-)
-_SCRAPE_TARGET_LIST_FIELDS = (
-    "Id,org_id,url,name,category,active,frequency_hours,depth,discovered_from,"
-    "auto_crawled,use_playwright,status,last_scraped_at,next_crawl_at,"
-    "consecutive_failures,consecutive_unchanged,content_hash,chunk_count,"
-    "last_scrape_error,CreatedAt"
-)
-
+# ── Listing / dashboard helpers ───────────────────────────────────────────────
 
 def _get_single_row(client: NocodbClient, table: str, row_id: int) -> dict | None:
     try:
@@ -291,52 +314,50 @@ def _last_tool_job_snapshot(client: NocodbClient, org_id: int, job_type: str) ->
         }).get("list", [])
         return ToolJob.from_row(rows[0]).to_api(verbose=True) if rows else None
     except Exception:
-        _log.warning("last tool_jobs query failed  org_id=%d type=%s", org_id, job_type, exc_info=True)
         return None
 
 
 def build_enrichment_runtime_snapshot(request: Request | None, org_id: int, client: NocodbClient | None = None) -> dict:
     client = client or NocodbClient()
-    from tools.enrichment.pathfinder import preview_next_seed
-    from tools.enrichment.scraper import fetch_due_targets
+    from tools.enrichment.scraper import fetch_due_target
+    from tools.enrichment.pathfinder import preview_next_approved
 
     try:
-        next_scrape_rows = fetch_due_targets(client, limit=1, org_id=org_id)
-        next_scrape = next_scrape_rows[0] if next_scrape_rows else None
+        next_scrape = fetch_due_target(client, org_id=org_id)
     except Exception:
-        _log.warning("next scrape target preview failed  org_id=%d", org_id, exc_info=True)
         next_scrape = None
 
     try:
-        next_pathfinder = preview_next_seed(org_id=org_id)
+        next_pathfinder = preview_next_approved(org_id=org_id)
     except Exception:
-        _log.warning("next pathfinder preview failed  org_id=%d", org_id, exc_info=True)
         next_pathfinder = None
 
     return {
         "config": {
-            "startup_grace_seconds": int(get_feature("tool_queue", "startup_grace_seconds", 600) or 600),
-            "strict_chat_idle_seconds": int(get_feature("tool_queue", "strict_chat_idle_seconds", 600) or 600),
-            "scraper_dispatch_interval_minutes": int(get_feature("scraper", "dispatch_interval_minutes", 10) or 10),
-            "scraper_batch_size": int(get_feature("scraper", "batch_size", 10) or 10),
-            "scraper_min_run_interval_seconds": int(get_feature("scraper", "min_run_interval_seconds", 120) or 120),
-            "pathfinder_dispatch_interval_minutes": int(get_feature("pathfinder", "recrawl_interval_minutes", 10) or 10),
-            "pathfinder_stale_after_minutes": int(get_feature("pathfinder", "stale_after_minutes", 60) or 60),
-            "pathfinder_min_run_interval_seconds": int(get_feature("pathfinder", "min_run_interval_seconds", 120) or 120),
-            "discover_agent_dispatch_interval_minutes": int(get_feature("discover_agent", "run_interval_minutes", 20) or 20),
-            "discover_agent_min_run_interval_seconds": int(get_feature("discover_agent", "min_run_interval_seconds", 1080) or 1080),
+            "background_chat_idle_seconds": int(
+                get_feature("tool_queue", "background_chat_idle_seconds", 30) or 30
+            ),
+            "scraper_dispatch_interval_seconds": int(
+                get_feature("scraper", "dispatch_interval_seconds", 60) or 60
+            ),
+            "pathfinder_dispatch_interval_seconds": int(
+                get_feature("pathfinder", "dispatch_interval_seconds", 120) or 120
+            ),
+            "discover_agent_run_interval_minutes": int(
+                get_feature("discover_agent", "run_interval_minutes", 20) or 20
+            ),
         },
         "schedule": {
             "next_scraper_dispatch": _scheduler_next_run(request, "enrichment_scrape_dispatcher"),
-            "next_pathfinder_dispatch": _scheduler_next_run(request, "pathfinder_recrawl_dispatcher"),
+            "next_pathfinder_dispatch": _scheduler_next_run(request, "pathfinder_dispatcher"),
             "next_discover_agent_dispatch": _scheduler_next_run(request, "discover_agent_dispatcher"),
         },
         "last_jobs": {
-            "pathfinder_crawl": _last_tool_job_snapshot(client, org_id, "pathfinder_crawl"),
-            "scrape_target": _last_tool_job_snapshot(client, org_id, "scrape_target"),
+            "scrape_page": _last_tool_job_snapshot(client, org_id, "scrape_page"),
+            "pathfinder_extract": _last_tool_job_snapshot(client, org_id, "pathfinder_extract"),
             "discover_agent_run": _last_tool_job_snapshot(client, org_id, "discover_agent_run"),
             "summarise_page": _last_tool_job_snapshot(client, org_id, "summarise_page"),
-            "classify_relevance": _last_tool_job_snapshot(client, org_id, "classify_relevance"),
+            "extract_relationships": _last_tool_job_snapshot(client, org_id, "extract_relationships"),
         },
         "next_candidates": {
             "pathfinder": next_pathfinder,
@@ -348,15 +369,18 @@ def build_enrichment_runtime_snapshot(request: Request | None, org_id: int, clie
 
 @router.get("/discovery/list")
 def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
+    """Legacy listing of the `discovery` table (kept for backwards compat). The
+    new flow uses /discovery/suggestions."""
     limit = min(max(1, limit), 500)
     client = NocodbClient()
-    params: dict = {"limit": limit, "sort": "-CreatedAt"}
+    parts = [f"(org_id,eq,{org_id})"]
     if status:
-        params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
-    else:
-        params["where"] = f"(org_id,eq,{org_id})"
-
-    rows = client._get_paginated("discovery", params=params)
+        parts.append(f"(status,eq,{status})")
+    params: dict = {"limit": limit, "sort": "-CreatedAt", "where": "~and".join(parts)}
+    try:
+        rows = client._get_paginated("discovery", params=params)
+    except Exception:
+        rows = []
     return {"status": "ok", "rows": rows}
 
 
@@ -369,14 +393,12 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
         params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
     else:
         params["where"] = f"(org_id,eq,{org_id})"
-
     rows = client._get_paginated("research_plans", params=params)
     return {"status": "ok", "rows": rows}
 
 
 @router.get("/research-plans/{plan_id}")
 def research_plan_get(plan_id: int):
-    """Fetch a single research plan (including paper_content) for the report UI."""
     client = NocodbClient()
     data = client._get("research_plans", params={
         "where": f"(Id,eq,{plan_id})",
@@ -426,18 +448,16 @@ def scrape_target_get(target_id: int):
 
 @router.get("/dashboard")
 def enrichment_dashboard(request: Request, org_id: int, limit: int = 20):
-    """Combined enrichment view for frontend dashboards.
-
-    Returns recent discovery rows, scrape targets, and verbose tool_jobs for the
-    org without using `fields=` filters that previously caused NocoDB errors.
-    """
     limit = min(max(1, limit), 100)
     client = NocodbClient()
-    discovery_rows = client._get_paginated("discovery", params={
-        "where": f"(org_id,eq,{org_id})",
-        "sort": "-CreatedAt",
-        "limit": limit,
-    })
+    try:
+        suggestion_rows = client._get_paginated(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, params={
+            "where": f"(org_id,eq,{org_id})",
+            "sort": "-CreatedAt",
+            "limit": limit,
+        })
+    except Exception:
+        suggestion_rows = []
     scrape_target_rows = client._get_paginated("scrape_targets", params={
         "where": f"(org_id,eq,{org_id})",
         "sort": "-CreatedAt",
@@ -448,9 +468,9 @@ def enrichment_dashboard(request: Request, org_id: int, limit: int = 20):
         "status": "ok",
         "org_id": org_id,
         "pipeline": build_enrichment_runtime_snapshot(request, org_id, client=client),
-        "discovery": {
-            "count": len(discovery_rows),
-            "rows": discovery_rows,
+        "suggestions": {
+            "count": len(suggestion_rows),
+            "rows": suggestion_rows,
         },
         "scrape_targets": {
             "count": len(scrape_target_rows),
