@@ -147,11 +147,14 @@ def _normalize_critic_output(topic: str, data: dict[str, Any]) -> dict:
     }
 
 
-def analyze_gaps(topic: str, content: str, schema: dict, context: str = "") -> dict:
+def analyze_gaps(topic: str, content: str, schema: dict, context: str = "", existing_queries: list[str] | None = None) -> dict:
+    existing_queries = existing_queries or []
+    existing_line = ", ".join(existing_queries[:20]) if existing_queries else "None"
     prompt = f"""You are a Research Critic. Analyze the draft research content for gaps and sufficiency.
 
 TOPIC: {topic}
 SCHEMA (data to extract): {json.dumps(schema)}
+EXISTING SEARCH QUERIES (already run): {existing_line}
 
 DRAFT CONTENT:
 {content[:20000]}
@@ -160,7 +163,7 @@ CONTEXT (additional):
 {context[:5000] if context else "No additional context."}
 
 Return ONLY one valid JSON object with EXACTLY these keys:
-- "gaps_found": array of objects with keys {"field","status","needed"}; status must be one of "missing","insufficient","superficial"
+- "gaps_found": array of objects with keys {{"field","status","needed"}}; status must be one of "missing","insufficient","superficial"
 - "new_search_requirements": array of specific follow-up search queries
 - "confidence_score": integer 0..100
 - "ready_for_completion": boolean
@@ -171,6 +174,10 @@ Rules:
 - If evidence is weak or incomplete, set ready_for_completion to false.
 - If gaps exist, include actionable new_search_requirements.
 - Prefer conservative scoring over optimistic scoring.
+- new_search_requirements must be 3-8 precise queries, 5-14 words each.
+- Each new query should include: topic/entity + missing field/angle + evidence type (e.g. benchmark, primary source, pricing, case study, official docs).
+- Do NOT repeat or lightly rephrase queries listed in EXISTING SEARCH QUERIES.
+- If no additional search would materially improve quality, return an empty new_search_requirements array.
 """
 
     try:

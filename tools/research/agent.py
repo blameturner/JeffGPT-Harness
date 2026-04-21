@@ -14,6 +14,7 @@ from tools.search.intent import (
 )
 from tools.search.orchestrator import run_web_search
 from shared.models import model_call
+from tools._org import resolve_org_id
 
 _log = logging.getLogger("research.agent")
 
@@ -201,6 +202,8 @@ HARD RULES:
 - Never emit the phrase "Information unavailable" or similar. If something is unknown, either omit it, note it briefly in prose ("pricing for X was not disclosed in the available sources"), or use `—` inside the comparison table.
 - Synthesise across sources — draw contrasts, note agreement, flag contradictions. Do not restate each source in isolation.
 - Every concrete claim (price, rating, date, numeric value, attribution) MUST carry an inline `[Source: URL]` citation. General framing and analysis does not need a citation.
+- Use ONLY URLs/evidence present in AVAILABLE SOURCE MATERIAL. Never fabricate or infer unseen URLs.
+- If evidence is thin, say so explicitly and keep conclusions conservative.
 - Match the register to the topic. For practical "which X should I use" topics, be opinionated and actionable.
 - Output raw Markdown only — no JSON, no code fences wrapping the whole document, no preamble, no "Here is the paper:"."""
 
@@ -318,7 +321,7 @@ def run_research_agent(plan_id: int) -> dict:
         hypotheses = _safe_json_loads(plan.get("hypotheses", "[]"), [])
         sub_topics = _safe_json_loads(plan.get("sub_topics", "[]"), [])
         iterations = plan.get("iterations", 0)
-        org_id = plan.get("org_id", 0)
+        org_id = resolve_org_id(plan.get("org_id"))
 
         max_iterations = plan.get("max_iterations") or get_feature("research", "max_iterations", DEFAULT_MAX_ITERATIONS)
         confidence_threshold = plan.get("confidence_threshold") or get_confidence_threshold()
@@ -393,7 +396,7 @@ def _run_research_agent_inner(
     critic_timeout_s = _research_timeout("critic_timeout_s", DEFAULT_CRITIC_TIMEOUT_S)
     gap_analysis = _call_with_timeout(
         analyze_gaps,
-        (topic, synthesis.get("content", ""), schema, context),
+        (topic, synthesis.get("content", ""), schema, context, queries),
         critic_timeout_s,
         "critic",
     )
@@ -438,9 +441,12 @@ def _run_research_agent_inner(
     confidence = gap_analysis.get("confidence_score", 0)
     ready = gap_analysis.get("ready_for_completion", False)
     # Normalize model output so odd shapes (null/string/mixed) don't derail iteration.
-    new_queries = _coerce_query_list(gap_analysis.get("new_search_requirements") or [])
+    raw_new_queries = _coerce_query_list(gap_analysis.get("new_search_requirements") or [])
 
-    new_queries_list = queries + new_queries
+    existing_keys = {str(q or "").strip().lower() for q in queries if str(q or "").strip()}
+    new_queries = [q for q in raw_new_queries if q.strip().lower() not in existing_keys]
+
+    new_queries_list = _dedupe_queries(queries + new_queries)
     updated_queries = json.dumps(new_queries_list)
 
     if ready or confidence >= confidence_threshold or iterations + 1 >= max_iterations:

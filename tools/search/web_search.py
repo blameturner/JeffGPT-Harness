@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -304,12 +303,8 @@ async def execute(params: dict, emit) -> ToolResult:
             data="No search queries provided",
         )
 
-    org_id = params.get("_org_id") or 0
-    if not org_id:
-        return ToolResult(
-            tool=ToolName.WEB_SEARCH, action_index=0, ok=False,
-            data="web_search missing org context",
-        )
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(params.get("_org_id"))
 
     emit({"type": "searching", "queries": queries, "mode": mode})
     t0 = time.time()

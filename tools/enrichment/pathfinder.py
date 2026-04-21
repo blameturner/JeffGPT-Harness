@@ -163,7 +163,8 @@ def pathfinder_extract_job(payload: dict | None = None) -> dict:
         return {"status": "skipped", "reason": f"status_{row_status}", "suggested_id": suggested_id}
 
     seed_url = _normalize(str(row.get("url") or "")) or str(row.get("url") or "")
-    org_id = int(row.get("org_id") or 0)
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(row.get("org_id"))
     if not seed_url or org_id <= 0:
         _mark_suggested(client, suggested_id, "rejected", "missing_url_or_org")
         return {"status": "error", "reason": "missing_url_or_org", "suggested_id": suggested_id}

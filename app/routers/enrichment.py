@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from infra.config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, get_feature
 from infra.nocodb_client import NocodbClient
 from workers.tool_queue import ToolJob, get_tool_queue
+from tools._org import resolve_org_id
 
 _log = logging.getLogger("main.enrichment")
 
@@ -53,7 +54,7 @@ def discovery_suggestion_approve(suggested_id: int):
     if not row:
         return {"status": "not_found", "suggested_id": suggested_id}
 
-    org_id = int(row.get("org_id") or 0)
+    org_id = resolve_org_id(row.get("org_id"))
     if org_id <= 0:
         return {"status": "failed", "error": "missing_org_id"}
 
@@ -163,7 +164,7 @@ def scrape_target_run_now(target_id: int):
     if not row:
         return {"status": "not_found", "target_id": target_id}
 
-    org_id = int(row.get("org_id") or 0)
+    org_id = resolve_org_id(row.get("org_id"))
     if org_id <= 0:
         return {"status": "failed", "error": "missing_org_id", "target_id": target_id}
 
@@ -231,16 +232,16 @@ def research_agent_run(req: ResearchAgentRequest):
     if not tq:
         return {"status": "failed", "error": "tool_queue_unavailable"}
 
-    org_id = 0
+    org_id = 1
     try:
         row = NocodbClient()._get("research_plans", params={"where": f"(Id,eq,{req.plan_id})", "limit": 1})
         plan = row.get("list", [])[0] if row.get("list") else None
-        org_id = int((plan or {}).get("org_id") or 0)
+        org_id = resolve_org_id((plan or {}).get("org_id"))
     except Exception:
         _log.warning("research_agent_run org lookup failed  plan_id=%d", req.plan_id, exc_info=True)
 
     if org_id <= 0:
-        return {"status": "failed", "error": "missing_org_id", "plan_id": req.plan_id}
+        org_id = 1
 
     job_id = tq.submit(
         "research_agent",

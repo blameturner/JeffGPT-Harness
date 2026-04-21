@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from infra.config import JOB_QUEUE_POLL_INTERVAL, JOB_QUEUE_STALE_TIMEOUT
+from tools.contract import ToolName
+from tools._org import resolve_org_id
 
 _log = logging.getLogger("tool_queue")
 
@@ -112,7 +114,7 @@ class ToolJob:
     status: str = "queued"
     priority: int = 3
     source: str = ""
-    org_id: int = 0
+    org_id: int = 1
     payload: dict = field(default_factory=dict)
     result: dict = field(default_factory=dict)
     error: str = ""
@@ -211,7 +213,7 @@ class ToolJob:
             status=row.get("status") or "queued",
             priority=int(row.get("priority") or 3),
             source=row.get("source") or "",
-            org_id=int(row.get("org_id") or 0),
+            org_id=resolve_org_id(row.get("org_id")),
             payload=payload,
             result=result,
             error=row.get("error") or "",
@@ -278,7 +280,7 @@ class ToolJobQueue:
         job_type: str,
         payload: dict,
         source: str = "",
-        org_id: int = 0,
+        org_id: int = 1,
         priority: int | None = None,
         depends_on: str = "",
     ) -> str:
@@ -286,13 +288,8 @@ class ToolJobQueue:
         if not config:
             raise ValueError(f"unknown job type: {job_type}")
 
-        if not org_id:
-            payload_org = payload.get("org_id") if isinstance(payload, dict) else None
-            if payload_org not in (None, ""):
-                try:
-                    org_id = int(payload_org)
-                except Exception:
-                    org_id = 0
+        payload_org = payload.get("org_id") if isinstance(payload, dict) else None
+        org_id = resolve_org_id(org_id if org_id else payload_org)
 
         if config.dedup_key and not depends_on:
             dedup_val = payload.get(config.dedup_key, "")
@@ -336,7 +333,7 @@ class ToolJobQueue:
                 job_type=item.get("type", "scrape"),
                 payload=item.get("payload", {}),
                 source=item.get("source", ""),
-                org_id=item.get("org_id", 0),
+                org_id=item.get("org_id", 1),
                 priority=item.get("priority"),
                 depends_on=item.get("depends_on", ""),
             )

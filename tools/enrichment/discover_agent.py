@@ -214,17 +214,12 @@ def discover_agent_job(payload: dict | None = None) -> dict:
 
     client = NocodbClient()
 
-    org_id = int(payload.get("org_id") or 0)
+    from tools._org import resolve_org_id, default_org_id
+    org_id = resolve_org_id(payload.get("org_id"), fallback=0)
     if not org_id:
-        try:
-            rows = client._get("scrape_targets", params={
-                "limit": 1, "sort": "-CreatedAt", "fields": "org_id",
-            }).get("list", [])
-            org_id = int((rows[0].get("org_id") if rows else None) or 0)
-        except Exception:
-            pass
+        org_id = default_org_id(client) or 0
     if not org_id:
-        return {"status": "no_org_context"}
+        org_id = 1  # last-resort fallback
 
     n_samples = int(_cfg("sample_chunks", 12))
     n_queries = int(_cfg("queries_per_run", 6))

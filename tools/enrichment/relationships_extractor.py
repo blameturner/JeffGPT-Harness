@@ -21,7 +21,8 @@ def extract_relationships_job(payload: dict) -> dict:
     payload: {"chunk_ids": [str, ...], "org_id": int, "scrape_target_id"?: int, "url"?: str}
     """
     chunk_ids = list(payload.get("chunk_ids") or [])
-    org_id = int(payload.get("org_id") or 0)
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(payload.get("org_id"))
     if not chunk_ids or org_id <= 0:
         return {"status": "error", "reason": "missing_chunk_ids_or_org"}
 

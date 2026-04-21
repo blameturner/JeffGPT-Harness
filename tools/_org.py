@@ -3,6 +3,8 @@ from __future__ import annotations
 from infra.config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
 from infra.nocodb_client import NocodbClient
 
+DEFAULT_ORG_ID = 1
+
 
 def count_inflight(client: NocodbClient, job_type: str) -> int:
     """Count queued+running rows of a given tool_jobs type. Dispatchers use
@@ -18,6 +20,19 @@ def count_inflight(client: NocodbClient, job_type: str) -> int:
         except Exception:
             pass
     return total
+
+
+def resolve_org_id(raw, fallback: int = DEFAULT_ORG_ID) -> int:
+    """Coerce any org_id value to a valid positive int, falling back to `fallback` (default 1).
+
+    Use this everywhere an org_id might arrive as None/0/str.  Centralises the
+    fallback logic so it never drifts between tools.
+    """
+    try:
+        val = int(raw or 0)
+    except (TypeError, ValueError):
+        val = 0
+    return val if val > 0 else fallback
 
 
 def default_org_id(client: NocodbClient) -> int | None:
@@ -37,7 +52,7 @@ def default_org_id(client: NocodbClient) -> int | None:
                 "sort": "-CreatedAt",
             }).get("list", [])
             if rows:
-                org = int(rows[0].get("org_id") or 0)
+                org = resolve_org_id(rows[0].get("org_id"))
                 if org:
                     return org
         except Exception:

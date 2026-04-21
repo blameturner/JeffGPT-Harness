@@ -66,7 +66,8 @@ def _register_agent_schedules(sched: BackgroundScheduler) -> int:
         try:
             cron_expr = (row.get("cron_expression") or "").strip()
             agent_name = row.get("agent_name")
-            org_id = int(row.get("org_id") or 0)
+            from tools._org import resolve_org_id
+            org_id = resolve_org_id(row.get("org_id"))
             if not cron_expr or not agent_name or not org_id:
                 continue
             tz = row.get("timezone") or "Australia/Sydney"

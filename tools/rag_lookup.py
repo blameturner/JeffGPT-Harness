@@ -25,13 +25,9 @@ async def execute(params: dict, emit) -> ToolResult:
             data="No query provided for RAG lookup",
         )
 
-    org_id = params.get("_org_id") or 0
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(params.get("_org_id"))
     default_collection = params.get("_collection") or "chat_knowledge"
-    if not org_id:
-        return ToolResult(
-            tool=ToolName.RAG_LOOKUP, action_index=0, ok=False,
-            data="rag_lookup missing org context",
-        )
 
     collections = params.get("collections")
     if not collections:

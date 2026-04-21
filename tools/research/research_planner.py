@@ -105,15 +105,53 @@ def _as_string_list(value) -> list[str]:
     return out
 
 
-def _normalize_plan_payload(data: dict, max_queries: int) -> dict:
+def _topic_keywords(topic: str) -> set[str]:
+    kws = re.findall(r"[a-zA-Z0-9][\w\-.]*", topic.lower())
+    return {k for k in kws if len(k) > 2}
+
+
+def _is_low_signal_query(query: str, topic_kws: set[str]) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    toks = re.findall(r"[a-zA-Z0-9][\w\-.]*", q)
+    if len(toks) < 3:
+        return True
+    generic_starts = (
+        "what is ", "overview of ", "introduction to ", "about ",
+        "latest news", "news about", "definition of ",
+    )
+    if any(q.startswith(gs) for gs in generic_starts):
+        return True
+    if topic_kws and not any(t in topic_kws for t in toks):
+        return True
+    return False
+
+
+def _normalize_plan_payload(data: dict, max_queries: int, topic: str = "") -> dict:
     hypotheses = _as_string_list(data.get("hypotheses") or [])
     sub_topics = _as_string_list(data.get("sub_topics") or [])
-    queries = _as_string_list(data.get("queries") or [])[:max_queries]
+    raw_queries = _as_string_list(data.get("queries") or [])
+    topic_kws = _topic_keywords(topic)
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for q in raw_queries:
+        key = q.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if _is_low_signal_query(q, topic_kws):
+            continue
+        queries.append(q)
+        if len(queries) >= max_queries:
+            break
+
     schema = data.get("schema")
     if not isinstance(schema, dict):
         schema = {}
     if not queries:
-        return {"error": "planner produced no queries"}
+        return {"error": "planner produced no valid high-signal queries"}
     return {
         "hypotheses": hypotheses,
         "sub_topics": sub_topics,
@@ -141,6 +179,8 @@ Required output contract:
 3) "queries": array of {min_queries}-{max_queries} unique, high-signal search queries.
    - No generic queries; each should include concrete entities/metrics/angles.
    - Prefer query phrasing that can find primary sources, statistics, and recent evidence.
+   - Use exact domain names/technologies/brands from the topic when present.
+   - Never substitute similar-sounding words (e.g. product names must stay exact).
    - Never return an empty queries array.
 4) "schema": object where each key is a field to extract and each value is one of:
    "numeric", "text", "date", "percent".
@@ -210,7 +250,7 @@ Example shape (structure only, not content):
             else:
                 try:
                     parsed = json.loads(candidate)
-                    normalized = _normalize_plan_payload(parsed, max_queries)
+                    normalized = _normalize_plan_payload(parsed, max_queries, topic=topic)
                     if "error" not in normalized:
                         return normalized
                     last_error = str(normalized.get("error") or "invalid planner payload")
@@ -244,7 +284,8 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
     if not get_feature("research", "planner_enabled", True):
         return {"status": "disabled", "error": "research_planner feature disabled"}
     if int(org_id or 0) <= 0:
-        return {"status": "failed", "error": "invalid_org_id"}
+        from tools._org import resolve_org_id
+        org_id = resolve_org_id(org_id)
 
     client = NocodbClient()
     try:
@@ -329,7 +370,8 @@ def run_research_planner_job(plan_id: int) -> dict:
 
     tq = get_tool_queue()
     if tq:
-        plan_org_id = int(plan.get("org_id") or 0)
+        from tools._org import resolve_org_id
+        plan_org_id = resolve_org_id(plan.get("org_id"))
         job_id = tq.submit(
             "research_agent",
             {"plan_id": plan_id, "org_id": plan_org_id},

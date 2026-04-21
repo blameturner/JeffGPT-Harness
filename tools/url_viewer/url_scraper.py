@@ -12,6 +12,7 @@ from tools.contract import ToolName, ToolResult
 from tools.dispatcher import register_executor
 from tools.scraper.pathfinder import PathfinderScraper
 from tools.search.urls import _is_safe_url
+from tools._org import resolve_org_id
 
 _log = logging.getLogger("tools.url_scraper")
 
@@ -89,7 +90,7 @@ async def execute(params: dict, emit) -> ToolResult:
 	if isinstance(raw_urls, str):
 		raw_urls = [raw_urls]
 	query_text = str(params.get("query") or "")
-	org_id = int(params.get("_org_id") or params.get("org_id") or 0)
+	org_id = resolve_org_id(params.get("_org_id") or params.get("org_id"))
 
 	urls: list[str] = []
 	for u in raw_urls:
@@ -155,4 +156,3 @@ async def execute(params: dict, emit) -> ToolResult:
 		data="\n\n".join(blocks) + summary,
 		elapsed_s=elapsed,
 	)
-

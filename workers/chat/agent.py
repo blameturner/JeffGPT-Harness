@@ -112,7 +112,15 @@ class ChatAgent(BaseAgent):
             or self._default_collection(conversation_id)
         )
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
-        _log.info("chat conv=%s  flags: rag=%s knowledge=%s search=%s", conversation_id, convo_rag_enabled, convo_knowledge, self.search_enabled)
+        # RAG retrieval fires if EITHER rag_enabled OR knowledge_enabled — so that
+        # turns can pull from chat_knowledge even when per-conversation RAG is off.
+        rag_retrieve_enabled = convo_rag_enabled or convo_knowledge
+        # When retrieval is knowledge-only (rag_enabled=False), pull from chat_knowledge
+        # rather than the conversation-specific collection.
+        rag_retrieve_collection = collection_name if convo_rag_enabled else "chat_knowledge"
+        _log.info("chat conv=%s  flags: rag=%s knowledge=%s search=%s retrieve=%s coll=%s",
+                  conversation_id, convo_rag_enabled, convo_knowledge, self.search_enabled,
+                  rag_retrieve_enabled, rag_retrieve_collection)
 
         _t = time.perf_counter()
         schedule_status_processing_write(self.db, conversation_id)
@@ -124,8 +132,8 @@ class ChatAgent(BaseAgent):
         rag_executor, rag_future = submit_rag_future(
             user_message=user_message,
             org_id=self.org_id,
-            collection_name=collection_name,
-            enabled=convo_rag_enabled,
+            collection_name=rag_retrieve_collection,
+            enabled=rag_retrieve_enabled,
         )
 
         _t_search = time.perf_counter()

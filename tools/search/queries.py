@@ -561,6 +561,28 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     return result
 
 
+def _condense_long_message(message: str) -> str:
+    """For messages over 200 chars, extract a condensed searchable form.
+
+    Strips conversational preamble/context and returns just the core question
+    or topic the user actually wants searched. Falls back to the first 200 chars
+    of the cleaned message if the message is short enough.
+    """
+    if len(message) <= 200:
+        return message
+    # Take up to first 600 chars to keep prompt small, then strip to last sentence
+    # that ends with '?' or use the stripped preamble of the whole thing
+    head = message[:600]
+    # Prefer the last sentence ending in '?' — that's usually the real question
+    sentences = re.split(r"(?<=[.!?])\s+", head)
+    questions = [s.strip() for s in sentences if "?" in s]
+    if questions:
+        return questions[-1][:300]
+    # Otherwise return stripped preamble of full message, capped at 300 chars
+    stripped = _strip_preamble(message[:400])
+    return stripped[:300] if stripped else message[:200]
+
+
 def generate_llm_queries(
     user_message: str,
     *,
@@ -581,25 +603,56 @@ def generate_llm_queries(
     if not cleaned:
         return []
 
+    # For long conversational messages, condense to the actual searchable question
+    # to avoid the LLM latching onto surface words (e.g. "rebuild" → rebuilding articles)
+    search_focus = _condense_long_message(cleaned)
+
+    # Also extract explicit tech/proper-noun entities from the full message
+    # so the LLM knows to treat them as specific products/frameworks, not generic words
+    all_entities = _detect_entities(cleaned)
+    entities_hint = ""
+    if all_entities:
+        entities_hint = (
+            f"Key named entities/technologies in the message (treat as specific proper nouns, "
+            f"NOT generic words): {', '.join(all_entities[:10])}\n"
+        )
+
     topics_line = ""
     if conversation_topics:
         topics_line = f"Prior conversation topics: {', '.join(list(conversation_topics)[:6])}\n"
 
+    # For long messages, only send the condensed focus to the model — not the full
+    # noisy message. Sending both lets the model latch onto surface words in the
+    # full text and ignore the focus hint (especially with smaller models).
+    is_long = len(cleaned) > 200
+    message_line = (
+        f"Search topic: {search_focus}\n"
+        if is_long
+        else f"User question: {cleaned}\n"
+    )
+
     prompt = (
         f"{build_prompt_date_header()}\n\n"
         f"{topics_line}"
-        f"User question: {cleaned}\n\n"
-        f"Generate {count_max} diverse web search queries to thoroughly answer this question. Cover:\n"
-        "- the direct question, phrased for a search engine\n"
+        f"{entities_hint}"
+        f"{message_line}\n"
+        f"Generate {count_max} diverse web search queries to find information that would help answer this. "
+        f"Focus on the SPECIFIC technologies, products, and concepts mentioned — do NOT generate queries "
+        f"about unrelated things that share common words.\n\n"
+        "Cover:\n"
+        "- the direct question phrased for a search engine\n"
+        "- specific named technologies/frameworks/libraries mentioned (use exact names)\n"
         "- alternative phrasings (different keywords, same intent)\n"
-        "- entity-focused queries (quote proper nouns)\n"
-        "- time-anchored queries when the topic is time-sensitive (add the year)\n"
-        "- comparison / context angles when relevant\n\n"
+        "- comparison or 'best practice' angles for any tech stack decisions\n"
+        "- time-anchored queries when the topic is time-sensitive (add the year)\n\n"
         "Rules:\n"
         "- Each query: 3-10 words, optimised for searxng/Google.\n"
+        "- Use exact product/technology names — never substitute similar-sounding unrelated words.\n"
         "- No duplicates. No meta-commentary.\n"
+        "- If the question is conversational advice-seeking with no clear factual target, "
+        "  generate queries about the specific technologies and patterns in the entities list.\n"
         "- Output ONLY a JSON array of strings. No markdown fences, no prose.\n\n"
-        "Example output: [\"RBA cash rate decision 2026\", \"Australian interest rate announcement\", ...]"
+        "Example output: [\"TanStack Start SSR architecture 2026\", \"Hono API gateway monorepo\", ...]"
     )
 
     t0 = time.time()

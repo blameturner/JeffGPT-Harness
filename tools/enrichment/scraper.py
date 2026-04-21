@@ -137,7 +137,9 @@ def scrape_page_job(payload: dict | int | None = None) -> dict:
     else:
         # No target_id: pick the oldest-due row.
         client = NocodbClient()
-        row = fetch_due_target(client, org_id=(int((payload or {}).get("org_id") or 0) or None))
+        from tools._org import resolve_org_id
+        req_org = resolve_org_id((payload or {}).get("org_id"), fallback=0)
+        row = fetch_due_target(client, org_id=(req_org or None))
         if not row:
             return {"status": "idle"}
         target_id = int(row.get("Id") or 0)
@@ -163,7 +165,8 @@ def _scrape_one(target_id: int, client: NocodbClient | None = None, row: dict | 
         row = rows[0]
 
     url = row.get("url") or ""
-    org_id = int(row.get("org_id") or 0)
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(row.get("org_id"))
     frequency_hours = int(row.get("frequency_hours") or DEFAULT_FREQUENCY_HOURS)
     consecutive_failures = int(row.get("consecutive_failures") or 0)
     consecutive_unchanged = int(row.get("consecutive_unchanged") or 0)

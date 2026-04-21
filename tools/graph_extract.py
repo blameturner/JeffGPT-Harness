@@ -9,7 +9,8 @@ def _handle_graph_extract(payload: dict) -> dict:
     user_text = payload.get("user_text") or ""
     assistant_text = payload.get("assistant_text") or ""
     conversation_id = payload.get("conversation_id") or 0
-    org_id = int(payload.get("org_id") or 0)
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(payload.get("org_id"))
 
     if not user_text and not assistant_text:
         _log.info("queue graph_extract: skipped — empty input  org=%d", org_id)
