@@ -20,6 +20,24 @@ Executor = Callable[[dict, Emit], Awaitable[ToolResult]]
 
 EXECUTORS: dict[ToolName, Executor] = {}
 
+# Chat-initiated tool work must keep the tool_queue's chat-idle gate alive for
+# its full duration, or background jobs slip in mid-tool. Touch at the start of
+# every action, and run a low-frequency heartbeat during the await so long
+# searches/scrapes stay covered even if the tool itself forgets to touch.
+# 10s keeps us well inside the default 30s gate; raise/lower in lockstep if you
+# change `features.tool_queue.background_chat_idle_seconds`.
+_CHAT_HEARTBEAT_S = 10.0
+
+
+async def _chat_activity_heartbeat():
+    from workers.tool_queue import touch_chat_activity
+    try:
+        while True:
+            touch_chat_activity()
+            await asyncio.sleep(_CHAT_HEARTBEAT_S)
+    except asyncio.CancelledError:
+        pass
+
 
 def register_executor(tool: ToolName):
     def decorator(fn: Executor) -> Executor:
@@ -56,6 +74,13 @@ async def execute_plan(
             "reason": action.reason,
         })
 
+        # Prime the chat-idle gate before awaiting the tool and keep it fresh
+        # throughout — prevents background tool_queue workers from claiming
+        # jobs while this tool is in flight.
+        from workers.tool_queue import touch_chat_activity
+        touch_chat_activity()
+        heartbeat = asyncio.create_task(_chat_activity_heartbeat())
+
         t0 = time.time()
         try:
             result = await executor(action.params, _emit)
@@ -68,6 +93,11 @@ async def execute_plan(
                 tool=action.tool, action_index=index, ok=False,
                 data=str(e), elapsed_s=round(time.time() - t0, 2),
             )
+        finally:
+            heartbeat.cancel()
+            # One final touch so the gate covers the window between tool end
+            # and whatever the caller does next (usually a model_call).
+            touch_chat_activity()
 
         _emit({
             "type": "tool_status",

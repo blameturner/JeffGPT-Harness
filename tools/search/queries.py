@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from urllib.parse import urlparse
 
 from tools.search.intent import (
     CHAT_INTENT_CHITCHAT,
@@ -178,26 +179,25 @@ def rerank_candidates(
     entities = intent_dict.get("entities") or []
     entities_str = ", ".join(entities[:5]) if entities else "(none extracted)"
 
+    # Compact listing: title + host path only. Snippets and full URLs blow up
+    # prompt tokens and dominate rerank latency on CPU-bound planners.
     listing = []
     for i, c in enumerate(head, start=1):
-        title = (c.get("title") or c.get("url") or "").strip()[:120]
-        url = (c.get("url") or "").strip()[:160]
-        snippet = re.sub(r"\s+", " ", (c.get("snippet") or "").strip())[:200]
-        listing.append(f"{i}. {title}\n   {url}\n   {snippet}")
+        title = (c.get("title") or c.get("url") or "").strip()[:80]
+        raw_url = (c.get("url") or "").strip()
+        try:
+            parsed = urlparse(raw_url)
+            host_path = f"{parsed.netloc}{parsed.path}"[:80]
+        except Exception:
+            host_path = raw_url[:80]
+        listing.append(f"{i}. {title} — {host_path}")
 
     prompt = (
-        f"{build_prompt_date_header()}\n\n"
-        f"The user's intent is: {intent_label}\n"
-        f"They're asking about: {entities_str}\n\n"
-        "Rate each candidate 1-5 for how likely it is to actually contain "
-        "what the user wants. Score 1 if the candidate matches a phrase "
-        "from the query but is clearly about a different topic (e.g. an "
-        "Excel tutorial for 'analyse the menu', or a dictionary entry "
-        "for a common idiom). Score 5 only if the candidate is clearly "
-        "on-topic and about the named entities.\n\n"
-        "Return ONLY a JSON array of integers, one per candidate in the "
-        "same order. Example: [5,4,1,3,2,1,1,4]\n\n"
-        f"Candidates:\n" + "\n".join(listing) + "\n\nScores:"
+        f"Topic: {entities_str}\n"
+        "Rate each candidate 1-5 for likelihood of containing what the user "
+        "wants. 1=off-topic phrase match, 5=clearly on-topic.\n"
+        "Return ONLY a JSON array of integers in the same order, e.g. [5,4,1,3,2,1,1,4].\n\n"
+        + "\n".join(listing) + "\n\nScores:"
     )
 
     started = time.time()

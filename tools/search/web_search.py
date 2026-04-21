@@ -458,22 +458,27 @@ async def execute(params: dict, emit) -> ToolResult:
         if s["text"] and s not in priority_with_text and s not in supp_with_text
     ]
 
-    # Priority tier → individual summaries (bigger context per page)
-    priority_summaries: list[dict] = []
-    if priority_with_text:
-        _pri_sem = asyncio.Semaphore(2)
+    # Priority and supplementary summarisation run in parallel: with
+    # MODEL_PARALLEL_SLOTS≥2 on the summariser role, this overlaps wall-clock
+    # time for the two tiers instead of serialising them.
+    async def _do_priority() -> list[dict]:
+        if not priority_with_text:
+            return []
+        # sem=1 so priority pages don't both grab slots while supp is also
+        # waiting — leaves room for the batch call to interleave.
+        _pri_sem = asyncio.Semaphore(1)
 
         async def _bounded_one(p):
             async with _pri_sem:
                 return await _summarise_one(p["url"], p["text"], query_str)
 
-        priority_summaries = list(await asyncio.gather(
+        return list(await asyncio.gather(
             *[_bounded_one(p) for p in priority_with_text]
         ))
 
-    # Supplementary tier → batched summary
-    supp_summaries: list[dict] = []
-    if supp_with_text:
+    async def _do_supplementary() -> list[dict]:
+        if not supp_with_text:
+            return []
         batch_cfg = get_function_config("web_search_summarise_batch")
         batch_max_input = batch_cfg.get("max_input_chars", 14000)
         batches = _build_batches(supp_with_text, batch_max_input, batch_target)
@@ -481,16 +486,21 @@ async def execute(params: dict, emit) -> ToolResult:
             "summarise batches=%d pages=%d target=%d",
             len(batches), len(supp_with_text), batch_target,
         )
-
-        _sem = asyncio.Semaphore(2)
+        _sem = asyncio.Semaphore(1)
 
         async def _bounded_batch(batch):
             async with _sem:
                 return await _summarise_batch(batch, query_str)
 
         batch_results = await asyncio.gather(*[_bounded_batch(b) for b in batches])
+        out: list[dict] = []
         for br in batch_results:
-            supp_summaries.extend(br)
+            out.extend(br)
+        return out
+
+    priority_summaries, supp_summaries = await asyncio.gather(
+        _do_priority(), _do_supplementary(),
+    )
 
     snippet_summaries = [
         {"summary": s["text"][:max_summary], "relevance": "low", "source_type": "snippet"}
