@@ -24,6 +24,105 @@ from workers.code.config import code_style_prompt, code_max_tokens, code_tempera
 _log = logging.getLogger("code")
 
 
+_LANGUAGE_EXT_MAP: dict[str, str] = {
+    ".py": "Python", ".pyi": "Python",
+    ".ts": "TypeScript", ".tsx": "TypeScript",
+    ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".java": "Java",
+    ".kt": "Kotlin", ".kts": "Kotlin",
+    ".swift": "Swift",
+    ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++",
+    ".c": "C", ".h": "C",
+    ".cs": "C#",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".scala": "Scala",
+    ".sh": "Bash", ".bash": "Bash", ".zsh": "Bash",
+    ".sql": "SQL",
+    ".lua": "Lua",
+    ".pl": "Perl",
+    ".r": "R",
+    ".dart": "Dart",
+    ".ex": "Elixir", ".exs": "Elixir",
+    ".elm": "Elm",
+    ".hs": "Haskell",
+    ".clj": "Clojure", ".cljs": "Clojure",
+    ".nim": "Nim",
+    ".zig": "Zig",
+    ".vue": "Vue",
+    ".svelte": "Svelte",
+}
+
+_LANGUAGE_KEYWORD_MAP: tuple[tuple[str, str], ...] = (
+    ("typescript", "TypeScript"),
+    ("javascript", "JavaScript"),
+    ("python", "Python"),
+    ("golang", "Go"),
+    ("rust", "Rust"),
+    ("kotlin", "Kotlin"),
+    ("swift", "Swift"),
+    ("scala", "Scala"),
+    ("haskell", "Haskell"),
+    ("elixir", "Elixir"),
+    ("ruby on rails", "Ruby"),
+    ("ruby", "Ruby"),
+    ("c++", "C++"),
+    ("c#", "C#"),
+    (" c ", "C"),
+    (" go ", "Go"),
+    (" java ", "Java"),
+    (" php ", "PHP"),
+    (" sql ", "SQL"),
+    (" bash ", "Bash"),
+)
+
+
+def _detect_language(files: list[dict] | None, user_message: str) -> str | None:
+    """Detect the programming language from attached files (priority) or the
+    user message. Returns a canonical name like 'Python' or None."""
+    for f in files or []:
+        name = (f.get("name") or "").lower()
+        for ext, lang in _LANGUAGE_EXT_MAP.items():
+            if name.endswith(ext):
+                return lang
+    if user_message:
+        haystack = f" {user_message.lower()} "
+        for kw, lang in _LANGUAGE_KEYWORD_MAP:
+            if kw in haystack:
+                return lang
+    return None
+
+
+def _augment_code_queries(queries: list[str], language: str | None, user_message: str) -> list[str]:
+    """Bias queries toward the detected language + official docs. If no language
+    is known, queries pass through unchanged."""
+    if not language or not queries:
+        return queries
+    lang_lower = language.lower()
+    augmented: list[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        q = q.strip()
+        if not q:
+            continue
+        if lang_lower not in q.lower():
+            q = f"{q} {language}"
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            augmented.append(q)
+    # Guarantee a docs-oriented query so the retrieval pool leans on official
+    # documentation and established public references rather than drive-by blogs.
+    if not any("doc" in q.lower() for q in augmented):
+        topic = re.sub(r"\s+", " ", (user_message or "").strip())[:60] or "guide"
+        docs_query = f"{language} official documentation {topic}".strip()
+        if docs_query.lower() not in seen:
+            augmented.append(docs_query)
+    return augmented
+
+
 PLAN_SYSTEM = (
     "You are a senior software engineer in PLAN mode. "
     "Analyse the user's request and any attached files, then produce a "
@@ -324,11 +423,34 @@ class CodeAgent(BaseAgent):
 
                 if hints == {"web_search"}:
                     _log.info("web_search fast-path  conv=%s", conversation_id)
-                    from tools.search.queries import generate_broad_queries
+                    from infra.config import get_feature
+                    from tools.search.queries import generate_llm_queries
                     from workers.chat.history import extract_conversation_topics
-                    convo_topics = extract_conversation_topics(history)
-                    queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
-                    _log.info("web_search fast-path queries  conv=%s queries=%s", conversation_id, queries)
+                    convo_topics = extract_conversation_topics(history) or []
+
+                    language = _detect_language(self.files, user_message)
+                    doc_topics: list[str] = []
+                    if language:
+                        doc_topics = [
+                            f"{language} official documentation",
+                            f"{language} standard library",
+                            language,
+                        ]
+                    merged_topics = doc_topics + list(convo_topics)
+
+                    min_q = int(get_feature("web_search", "standard_query_count_min", 2) or 2)
+                    max_q = int(get_feature("web_search", "standard_query_count_max", 3) or 3)
+                    queries = generate_llm_queries(
+                        user_message,
+                        conversation_topics=merged_topics,
+                        count_min=min_q,
+                        count_max=max_q,
+                    )
+                    queries = _augment_code_queries(queries, language, user_message)
+                    _log.info(
+                        "web_search fast-path queries  conv=%s language=%s queries=%s",
+                        conversation_id, language, queries,
+                    )
 
                     if queries:
                         from tools.contract import ToolAction, ToolName, ToolPlan
@@ -337,9 +459,9 @@ class CodeAgent(BaseAgent):
                                 tool=ToolName.WEB_SEARCH,
                                 params={
                                     "queries": queries,
+                                    "mode": "standard",
                                     "_org_id": self.org_id,
                                     "_collection": code_collection,
-                                    "_mode": "normal",
                                 },
                                 reason="web search",
                             )],
@@ -351,6 +473,8 @@ class CodeAgent(BaseAgent):
                             _log.error("web_search fast-path failed  conv=%s", conversation_id, exc_info=True)
                             tool_context = ToolContext()
                 else:
+                    language = _detect_language(self.files, user_message)
+
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:
@@ -372,6 +496,13 @@ class CodeAgent(BaseAgent):
                                 if codebase_collection:
                                     cols.append(codebase_collection)
                                 a.params["collections"] = cols
+                            if a.tool.value == "web_search":
+                                a.params["mode"] = "standard"
+                                a.params["queries"] = _augment_code_queries(
+                                    a.params.get("queries") or [],
+                                    language,
+                                    user_message,
+                                )
                         emit({
                             "type": "tool_status",
                             "phase": "planning",
