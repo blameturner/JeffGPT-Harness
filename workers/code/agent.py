@@ -95,6 +95,15 @@ def _detect_language(files: list[dict] | None, user_message: str) -> str | None:
     return None
 
 
+def _query_mentions_language(query: str, lang_lower: str) -> bool:
+    """True if the language name appears as a whole token. Substring match for
+    symbol-bearing names (C++, C#) since \\b doesn't work around '+' or '#'."""
+    q = query.lower()
+    if any(ch in lang_lower for ch in ("+", "#", ".")):
+        return lang_lower in q
+    return re.search(r"\b" + re.escape(lang_lower) + r"\b", q) is not None
+
+
 def _augment_code_queries(queries: list[str], language: str | None, user_message: str) -> list[str]:
     """Bias queries toward the detected language + official docs. If no language
     is known, queries pass through unchanged."""
@@ -107,7 +116,7 @@ def _augment_code_queries(queries: list[str], language: str | None, user_message
         q = q.strip()
         if not q:
             continue
-        if lang_lower not in q.lower():
+        if not _query_mentions_language(q, lang_lower):
             q = f"{q} {language}"
         key = q.lower()
         if key not in seen:
