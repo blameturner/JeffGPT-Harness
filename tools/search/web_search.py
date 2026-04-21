@@ -187,17 +187,11 @@ async def _summarise_one(
     max_input = cfg.get("max_input_chars", 12000)
 
     prompt = (
-        f"Summarise the following web page content. Focus ONLY on information "
-        f"relevant to: {user_query}\n\n"
-        f"Rules:\n"
-        f"- Keep under 300 words.\n"
-        f"- Include specific facts, numbers, dates, names.\n"
-        f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n"
-        f"- On the LAST line output ONLY: RELEVANCE: high|medium|low\n"
-        f"  (high = directly answers the query, medium = related context, "
-        f"low = tangential or mostly irrelevant)\n\n"
-        f"URL: {url}\n\n"
-        f"Content:\n{text[:max_input]}"
+        f"Summarise this page for: {user_query}\n"
+        f"- Under 200 words.\n"
+        f"- Facts, numbers, dates, names only.\n"
+        f"- Last line only: RELEVANCE: high|medium|low\n\n"
+        f"URL: {url}\n{text[:max_input]}"
     )
 
     try:
@@ -264,16 +258,11 @@ async def _summarise_batch(
     body = "\n\n".join(sections)
 
     prompt = (
-        f"Summarise each web page below. Focus ONLY on information "
-        f"relevant to: {user_query}\n\n"
-        f"Rules:\n"
-        f"- For EACH page, output a section starting with PAGE N:\n"
-        f"- Use 3-5 bullet points per page, under 80 words total.\n"
-        f"- Include specific facts, numbers, dates, names.\n"
-        f"- Skip navigation, boilerplate, cookie notices, unrelated content.\n"
-        f"- End each section with RELEVANCE: high|medium|low\n"
-        f"  (high = directly answers the query, medium = related context, "
-        f"low = tangential or mostly irrelevant)\n\n"
+        f"Summarise each page for: {user_query}\n"
+        f"- Each section starts 'PAGE N:'\n"
+        f"- 3 bullets, under 50 words per page.\n"
+        f"- Facts, numbers, dates, names only.\n"
+        f"- End each section with RELEVANCE: high|medium|low\n\n"
         f"{body}"
     )
 
@@ -449,7 +438,8 @@ async def execute(params: dict, emit) -> ToolResult:
     supplementary_scraped = list(supplementary_scraped)
     scraped = priority_scraped + supplementary_scraped
 
-    query_str = " | ".join(queries)
+    # Focus hint for every summariser call — cap so long fan-outs don't bloat prompts.
+    query_str = " | ".join(queries)[:160]
 
     priority_with_text = [s for s in priority_scraped if s["text"] and len(s["text"]) >= 100]
     supp_with_text = [s for s in supplementary_scraped if s["text"] and len(s["text"]) >= 100]

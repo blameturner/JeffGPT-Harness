@@ -29,7 +29,7 @@
       "standard_query_cap": 3,
       "searxng_per_query": 10,
       "priority_urls": 2,
-      "priority_extract_chars": 4000,
+      "priority_extract_chars": 2500,
       "supplementary_extract_chars": 1200,
       "rerank_when_candidates_over": 15,
       "rerank_max": 8,
@@ -40,7 +40,7 @@
       "relevance_min_keep": 4,
       "models": {
         "web_search_query_generator": { "role": "t3_tool",    "temperature": 0.2, "max_tokens": 600, "max_input_chars": 4000 },
-        "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 300, "max_input_chars": 4500, "frequency_penalty": 0.2 },
+        "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 300, "max_input_chars": 3000, "frequency_penalty": 0.2 },
         "web_search_summarise_batch": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 400, "max_input_chars": 8000, "frequency_penalty": 0.2 }
       }
     },
