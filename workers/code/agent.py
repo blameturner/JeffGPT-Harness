@@ -597,8 +597,7 @@ class CodeAgent(BaseAgent):
 
             # Reset the idle clock now that the full turn window (including summarising)
             # is closed.  The backoff timer only starts from this point — not from when
-            # the LLM finished streaming.  planned_search jobs are submitted to the
-            # tool_queue and run outside this window, so they are not affected.
+            # the LLM finished streaming.
             from workers.tool_queue import touch_chat_activity
             touch_chat_activity()
             _log.info("code conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)

@@ -1,4 +1,5 @@
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -24,10 +25,9 @@ class ChatRequest(BaseModel):
     rag_enabled: bool | None = None
     rag_collection: str | None = None
     knowledge_enabled: bool | None = None
-    search_enabled: bool = False
-    search_consent_declined: bool = False
     response_style: str | None = None
-    search_mode: str = "normal"
+    search_mode: Literal["disabled", "basic", "standard"] = "standard"
+    search_consent_confirmed: bool = False
 
 
 def _distinct_nonempty(rows: list[dict], field: str) -> list[str]:
@@ -48,12 +48,12 @@ def _counter(rows: list[dict], field: str) -> dict:
 
 @router.post("/chat")
 def chat(request: ChatRequest):
-    _log.info("POST /chat  model=%s org=%d conv=%s search=%s", request.model, request.org_id, request.conversation_id, request.search_enabled)
+    _log.info("POST /chat  model=%s org=%d conv=%s search_mode=%s", request.model, request.org_id, request.conversation_id, request.search_mode)
     try:
         agent = ChatAgent(
             model=request.model,
             org_id=request.org_id,
-            search_enabled=request.search_enabled,
+            search_enabled=request.search_mode != "disabled",
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -69,7 +69,7 @@ def chat(request: ChatRequest):
         rag_enabled=request.rag_enabled,
         rag_collection=request.rag_collection,
         knowledge_enabled=request.knowledge_enabled,
-        search_consent_declined=request.search_consent_declined,
+        search_consent_confirmed=request.search_consent_confirmed,
         response_style=request.response_style,
     ))
     return {"job_id": job.id}

@@ -12,7 +12,8 @@ from tools.dispatcher import register_executor
 from tools.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
-MAX_URLS_TO_PROCESS = 5
+BASIC_MAX_URLS = 5
+STANDARD_MAX_URLS = 10
 MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
@@ -32,7 +33,7 @@ async def _search_one(query: str) -> list[dict]:
     return results or []
 
 
-async def _search_all(queries: list[str]) -> list[dict]:
+async def _search_all(queries: list[str], url_cap: int) -> list[dict]:
     all_results = await asyncio.gather(*[_search_one(q) for q in queries])
 
     seen: set[str] = set()
@@ -44,7 +45,7 @@ async def _search_all(queries: list[str]) -> list[dict]:
                 continue
             seen.add(url)
             deduped.append(r)
-    return deduped[:MAX_URLS_TO_PROCESS]
+    return deduped[:url_cap]
 
 
 def _filter_results_by_relevance(
@@ -291,7 +292,12 @@ async def execute(params: dict, emit) -> ToolResult:
     raw_queries = params.get("queries") or []
     if isinstance(raw_queries, str):
         raw_queries = [raw_queries]
-    queries = [str(q).strip() for q in raw_queries if str(q).strip()][:5]
+    mode = (params.get("mode") or "basic").lower()
+    if mode not in ("basic", "standard"):
+        mode = "basic"
+    query_cap = 20 if mode == "standard" else 5
+    url_cap = STANDARD_MAX_URLS if mode == "standard" else BASIC_MAX_URLS
+    queries = [str(q).strip() for q in raw_queries if str(q).strip()][:query_cap]
     if not queries:
         return ToolResult(
             tool=ToolName.WEB_SEARCH, action_index=0, ok=False,
@@ -305,11 +311,15 @@ async def execute(params: dict, emit) -> ToolResult:
             data="web_search missing org context",
         )
 
-    emit({"type": "searching", "queries": queries})
+    emit({"type": "searching", "queries": queries, "mode": mode})
     t0 = time.time()
 
-    results = await _search_all(queries)
-    _log.info("searxng  queries=%d urls_deduped=%d", len(queries), len(results))
+    # keep queue consumers backing off for the whole search window
+    from workers.tool_queue import touch_chat_activity
+
+    results = await _search_all(queries, url_cap=url_cap)
+    touch_chat_activity()
+    _log.info("searxng  mode=%s queries=%d urls_deduped=%d cap=%d", mode, len(queries), len(results), url_cap)
 
     if not results:
         emit({
@@ -337,6 +347,7 @@ async def execute(params: dict, emit) -> ToolResult:
         )
 
     scraped = await asyncio.gather(*[_scrape_one(r) for r in results])
+    touch_chat_activity()
 
     with_text = [s for s in scraped if s["text"] and len(s["text"]) >= 100]
     query_str = " | ".join(queries)

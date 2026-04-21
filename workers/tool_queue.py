@@ -718,19 +718,10 @@ class ToolJobQueue:
             if NOCODB_TABLE not in db.tables:
                 return
             # Dynamic stale sizing for long fan-out jobs.
-            # planned_search_execute runtime can legitimately approach
-            # scrape_timeout_s + synthesis_timeout_s.
-            planned_dynamic_mult = 14
             research_agent_dynamic_mult = 8
             research_planner_dynamic_mult = 4
             try:
                 from infra.config import get_feature
-                scrape_s = int(get_feature("planned_search", "scrape_timeout_s", 1800) or 1800)
-                synth_s = int(get_feature("planned_search", "synthesis_timeout_s", 1800) or 1800)
-                # Add a 5-minute buffer for queue bookkeeping/DB writes.
-                required_s = max(300, scrape_s + synth_s + 300)
-                planned_dynamic_mult = max(14, int(ceil(required_s / max(1, JOB_QUEUE_STALE_TIMEOUT))))
-
                 # research_agent can run multiple web-search calls (one per query)
                 # then synthesis + critic in the same handler invocation.
                 rq_timeout = int(get_feature("research", "web_search_per_query_timeout_s", 180) or 180)
@@ -752,7 +743,6 @@ class ToolJobQueue:
                     max(4, int(ceil(planner_required_s / max(1, JOB_QUEUE_STALE_TIMEOUT)))),
                 )
             except Exception:
-                planned_dynamic_mult = 14
                 research_agent_dynamic_mult = 8
                 research_planner_dynamic_mult = 4
 
@@ -777,8 +767,6 @@ class ToolJobQueue:
                     "graph_extract": 4,               # 20m — LLM inference 7-16min
                     "research_planner": research_planner_dynamic_mult,
                     "research_agent": research_agent_dynamic_mult,
-                    "planned_search_execute": planned_dynamic_mult,
-                    "planned_search_scrape": 3,       # 15m — scrape worker with network variance
                     "scrape_page": 3,                 # 15m — fetch + chunk + embed
                     "pathfinder_extract": 3,          # 15m — fetch + link extract
                     "summarise_page": 3,              # 15m — summariser LLM

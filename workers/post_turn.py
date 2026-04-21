@@ -25,8 +25,8 @@ def ingest_output(
     """Embed an output and queue graph extraction. Safe to call from any background context.
 
     Mirrors the embed/graph phases of `run_post_turn_work` without the summary machinery,
-    so one-shot producers (planned_search, research) can feed RAG + FalkorDB the same way
-    chat/code conversations do.
+    so one-shot producers (e.g. research) can feed RAG + FalkorDB the same way chat/code
+    conversations do.
     """
     if not output:
         return
@@ -241,8 +241,7 @@ def run_post_turn_work(config: PostTurnConfig) -> None:
 
     # Reset the idle clock now that the full turn window (including summarising) is
     # closed.  The backoff timer only starts from this point — not from when the LLM
-    # finished streaming.  planned_search jobs are submitted to the tool_queue and run
-    # outside this window, so they are correctly unaffected.
+    # finished streaming.
     try:
         from workers.tool_queue import touch_chat_activity
         touch_chat_activity()

@@ -12,11 +12,11 @@ from tools.dispatcher import execute_plan
 from tools.gate import gate_check
 from tools.planner import generate_plan
 from workers.base import BaseAgent, ChatResult, _get_summary_event, SUMMARY_WAIT_TIMEOUT
-from tools.search.queries import generate_broad_queries
+from tools.search.queries import generate_broad_queries, generate_llm_queries
 from workers.chat.config import chat_style_prompt, chat_max_tokens, chat_temperature
 from workers.chat.history import maybe_summarise, extract_conversation_topics
 from workers.chat.payload import build_chat_payload
-from workers.chat.search_phase import SearchPhaseResult, run_search_phase
+from workers.chat.search_phase import SearchPhaseResult
 from workers.chat.rag_phase import submit_rag_future, collect_rag, cancel_rag
 from workers.chat.persistence import (
     schedule_status_processing_write,
@@ -39,7 +39,7 @@ class ChatAgent(BaseAgent):
         rag_enabled: bool | None = None,
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
-        search_consent_declined: bool = False,
+        search_consent_confirmed: bool = False,
         response_style: str | None = None,
     ) -> None:
         from shared.jobs import STORE
@@ -130,10 +130,14 @@ class ChatAgent(BaseAgent):
 
         _t_search = time.perf_counter()
         tool_context: ToolContext = ToolContext()
-        web_search_enabled = is_feature_enabled("web_search")
+        search_result = SearchPhaseResult()
 
-        if TOOLS_FRAMEWORK_ENABLED:
-            search_result = SearchPhaseResult()
+        search_mode = (getattr(self, "_search_mode", "standard") or "standard").lower()
+        if search_mode not in ("disabled", "basic", "standard"):
+            search_mode = "standard"
+        web_search_enabled = is_feature_enabled("web_search") and search_mode != "disabled"
+
+        if TOOLS_FRAMEWORK_ENABLED and web_search_enabled:
             last_assistant = ""
             for turn in reversed(history):
                 if turn.get("role") == "assistant":
@@ -142,22 +146,56 @@ class ChatAgent(BaseAgent):
             _t_tools = time.perf_counter()
 
             hints = gate_check(user_message, conversation_context=last_assistant)
-            if not web_search_enabled or not self.search_enabled:
-                hints.discard("web_search")
-            # explicit UI signal: search_mode in {"planned", "deep", "deep_search", "planned_search"}
-            # forces the planned_search route regardless of message content.
-            search_mode = (getattr(self, "_search_mode", "normal") or "normal").lower()
-            _PLANNED_MODES = {"planned", "deep", "deep_search", "planned_search"}
-            if search_mode in _PLANNED_MODES and is_feature_enabled("planned_search"):
-                hints.add("planned_search")
-                hints.discard("web_search")
             _log.info("chat conv=%s  gate: hints=%s mode=%s", conversation_id, sorted(hints) or "none", search_mode)
+
+            # standard-mode consent gate: ambiguous web_search hint → ask user first
+            if (
+                search_mode == "standard"
+                and "web_search" in hints
+                and not search_consent_confirmed
+            ):
+                from tools.search.intent import classify_message_intent
+                try:
+                    intent_dict = classify_message_intent(user_message, history=history)
+                except Exception:
+                    _log.warning("intent classify failed — falling through to auto-search", exc_info=True)
+                    intent_dict = None
+                search_result.intent_dict = intent_dict
+                confidence = (intent_dict or {}).get("confidence", "low")
+                if intent_dict:
+                    emit({
+                        "type": "intent_classified",
+                        "route": intent_dict.get("route"),
+                        "intent": intent_dict.get("intent"),
+                        "confidence": confidence,
+                    })
+                if confidence != "high":
+                    intent_label = (intent_dict or {}).get("intent") or "question"
+                    reason = f"this looks like a {intent_label.replace('_', ' ')} — run a web search?"
+                    _log.info("chat conv=%s  search consent required  confidence=%s", conversation_id, confidence)
+                    emit({
+                        "type": "search_consent_required",
+                        "query": user_message,
+                        "reason": reason,
+                    })
+                    emit({
+                        "type": "done",
+                        "conversation_id": conversation_id,
+                        "awaiting": "search_consent",
+                        "model": self.model,
+                        "tokens_input": 0,
+                        "tokens_output": 0,
+                        "duration_seconds": 0.0,
+                        "rag_enabled": False,
+                        "context_chars": 0,
+                    })
+                    cancel_rag(rag_future, rag_executor)
+                    return
 
             if hints:
                 tool_labels = {
                     "web_search": "web search",
                     "rag_lookup": "conversation history lookup",
-                    "planned_search": "planned search (awaiting approval)",
                     "url_scraper": "URL scraping",
                 }
                 hint_names = [tool_labels.get(h, h) for h in sorted(hints)]
@@ -169,83 +207,10 @@ class ChatAgent(BaseAgent):
                     "tools": sorted(hints),
                 })
 
-                # planned_search is mutex with web_search — when hinted, dispatch it directly and skip
-                # the LLM planner, which otherwise tends to keep picking web_search.
-                if "planned_search" in hints:
-                    _log.info("chat conv=%s  planned_search fast-path", conversation_id)
-
-                    # Write user message FIRST so its NocoDB Id is lower than the
-                    # proposal message that execute() is about to create.
-                    # _find_original_question queries Id < proposal_id — the user row
-                    # must already exist in the DB before the proposal is inserted.
-                    _ps_style_key, _ = chat_style_prompt(response_style)
-                    _ps_user_written = schedule_user_message_write(
-                        db=self.db,
-                        conversation_id=conversation_id,
-                        org_id=self.org_id,
-                        user_message=user_message,
-                        model=self.model,
-                        style_key=_ps_style_key,
-                    )
-                    if not _ps_user_written.wait(timeout=10.0):
-                        _log.warning(
-                            "planned_search user message write still pending after 10s  conv=%s",
-                            conversation_id,
-                        )
-
-                    plan = ToolPlan(
-                        actions=[ToolAction(
-                            tool=ToolName.PLANNED_SEARCH,
-                            params={
-                                "question": user_message,
-                                "_org_id": self.org_id,
-                                "_conversation_id": conversation_id,
-                                "_collection": collection_name,
-                            },
-                            reason="planned search (proposes queries for approval)",
-                        )],
-                        summary=instant_summary,
-                    )
-                    ps_ok = False
-                    try:
-                        tool_context = asyncio.run(execute_plan(plan, emit))
-                        ps_ok = any(r.tool.value == "planned_search" and r.ok for r in tool_context.results)
-                        _log.info("chat conv=%s  planned_search dispatched  ok=%s elapsed=%.2fs",
-                                  conversation_id, ps_ok, time.perf_counter() - _t_tools)
-                    except Exception:
-                        _log.error("chat conv=%s  planned_search failed", conversation_id, exc_info=True)
-                        tool_context = ToolContext()
-
-                    if ps_ok:
-                        # short-circuit: proposal is already saved with pending_approval=1;
-                        # the UI polls /planned_search/{id} for the user to approve/reject.
-                        # User message was already written above so the conversation is intact.
-                        emit({
-                            "type": "planned_search_pending",
-                            "conversation_id": conversation_id,
-                            "summary": "Proposed search queries — awaiting your approval.",
-                        })
-                        emit({
-                            "type": "done",
-                            "conversation_id": conversation_id,
-                            "awaiting": "planned_search_approval",
-                            "model": "planned_search",
-                            "tokens_input": 0,
-                            "tokens_output": 0,
-                            "duration_seconds": 0.0,
-                            "rag_enabled": False,
-                            "context_chars": 0,
-                        })
-                        cancel_rag(rag_future, rag_executor)
-                        return
-                    # if planned_search failed to produce queries, fall through to the
-                    # normal LLM planner so the user still gets a response
-                    hints = set()
-
                 # tools dispatchable without the planner (no model-generated params needed)
                 _DIRECT_TOOLS = {"web_search", "rag_lookup", "url_scraper"}
 
-                if hints and hints <= _DIRECT_TOOLS:
+                if hints <= _DIRECT_TOOLS:
                     _log.info("chat conv=%s  search fast-path  tools=%s", conversation_id, sorted(hints))
                     pre_results = []
 
@@ -303,17 +268,32 @@ class ChatAgent(BaseAgent):
                                     _log.info("chat conv=%s  early RAG returned empty — no topic enrichment", conversation_id)
                             except Exception as e:
                                 _log.info("chat conv=%s  early RAG unavailable (%s) — proceeding without topics", conversation_id, type(e).__name__)
-                        queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
-                        _log.info("chat conv=%s  search queries (%d): %s", conversation_id, len(queries), [q[:60] for q in queries])
+
+                        if search_mode == "standard":
+                            from infra.config import get_feature
+                            min_q = int(get_feature("web_search", "standard_query_count_min", 10) or 10)
+                            max_q = int(get_feature("web_search", "standard_query_count_max", 20) or 20)
+                            queries = generate_llm_queries(
+                                user_message,
+                                conversation_topics=convo_topics,
+                                count_min=min_q,
+                                count_max=max_q,
+                            )
+                        else:  # basic
+                            queries = generate_broad_queries(user_message, max_queries=5, conversation_topics=convo_topics)
+                        _log.info("chat conv=%s  %s queries (%d): %s", conversation_id, search_mode, len(queries), [q[:60] for q in queries])
+                        # keep queue consumers yielding for the searxng+scrape window
+                        touch_chat_activity()
                         if queries:
                             actions.append(ToolAction(
                                 tool=ToolName.WEB_SEARCH,
                                 params={
                                     "queries": queries,
+                                    "mode": search_mode,
                                     "_org_id": self.org_id,
                                     "_collection": collection_name,
                                 },
-                                reason="web search",
+                                reason=f"web search ({search_mode})",
                             ))
 
                     if "rag_lookup" in hints:
@@ -340,7 +320,7 @@ class ChatAgent(BaseAgent):
                             tool_context = ToolContext()
                     elif pre_results:
                         tool_context = ToolContext(plan_summary=instant_summary, results=pre_results)
-                elif hints:
+                else:
                     async def _plan_and_run() -> ToolContext:
                         convo_summary = ""
                         if history:
@@ -387,43 +367,7 @@ class ChatAgent(BaseAgent):
                         "Answer from your own knowledge, and suggest 1-2 specific "
                         "search terms the user could try to find what they need."
                     )
-        else:
-            search_result = run_search_phase(
-                user_message=user_message,
-                history=history,
-                convo=convo,
-                conversation_id=conversation_id,
-                org_id=self.org_id,
-                search_enabled=self.search_enabled,
-                search_consent_declined=search_consent_declined,
-                emit=emit,
-                span=_span,
-            )
         _span("search_total_ms", _t_search)
-
-        if search_result.consent_required:
-            try:
-                self.db.update_conversation(conversation_id, {"status": "awaiting_consent"})
-            except Exception:
-                pass
-            emit({
-                "type": "search_consent_required",
-                "query": user_message,
-                "reason": search_result.consent_reason,
-            })
-            emit({
-                "type": "done",
-                "conversation_id": conversation_id,
-                "awaiting": "search_consent",
-                "model": self.model,
-                "tokens_input": 0,
-                "tokens_output": 0,
-                "duration_seconds": 0.0,
-                "rag_enabled": False,
-                "context_chars": 0,
-            })
-            cancel_rag(rag_future, rag_executor)
-            return
 
         search_context = search_result.search_context
         search_sources = search_result.search_sources
@@ -656,8 +600,7 @@ class ChatAgent(BaseAgent):
 
             # Reset the idle clock now that the full turn window (including summarising)
             # is closed.  The backoff timer only starts from this point — not from when
-            # the LLM finished streaming.  planned_search jobs are submitted to the
-            # tool_queue and run outside this window, so they are not affected.
+            # the LLM finished streaming.
             from workers.tool_queue import touch_chat_activity
             touch_chat_activity()
             _log.info("chat conv=%s  post-turn complete  total=%.2fs", conversation_id, time.perf_counter() - _t_bg)
@@ -679,7 +622,7 @@ class ChatAgent(BaseAgent):
         rag_enabled: bool | None = None,
         rag_collection: str | None = None,
         knowledge_enabled: bool | None = None,
-        search_consent_declined: bool = False,
+        search_consent_confirmed: bool = False,
         response_style: str | None = None,
     ) -> Iterator[dict]:
         from shared.jobs import Job
@@ -694,7 +637,7 @@ class ChatAgent(BaseAgent):
             rag_enabled=rag_enabled,
             rag_collection=rag_collection,
             knowledge_enabled=knowledge_enabled,
-            search_consent_declined=search_consent_declined,
+            search_consent_confirmed=search_consent_confirmed,
             response_style=response_style,
         )
         yield from job.events

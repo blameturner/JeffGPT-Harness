@@ -83,16 +83,16 @@ CHAT_STYLES: dict[str, str] = {
 CHAT_DEFAULT_STYLE = "general"
 
 CHAT_MAX_TOKENS: dict[str, int] = {
-    "general": 2000,
-    "conversational": 1500,
-    "explanatory": 8192,
-    "learning": 4096,
-    "deep_dive": 8192,
-    "direct": 1000,
-    "strategist": 4096,
-    "challenger": 1500,
-    "inquisitive": 2000,
-    "default": 4096,
+    "general": 4000,
+    "conversational": 3000,
+    "explanatory": 16384,
+    "learning": 8192,
+    "deep_dive": 16384,
+    "direct": 2000,
+    "strategist": 8192,
+    "challenger": 3000,
+    "inquisitive": 4000,
+    "default": 8192,
 }
 
 CHAT_TEMPERATURES: dict[str, float] = {

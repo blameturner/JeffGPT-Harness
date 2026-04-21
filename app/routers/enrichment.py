@@ -18,11 +18,6 @@ class PathfinderRequest(BaseModel):
     org_id: int
 
 
-class ScraperRequest(BaseModel):
-    org_id: int
-    batch_size: int = 10
-
-
 class ResearchRequest(BaseModel):
     topic: str
     org_id: int

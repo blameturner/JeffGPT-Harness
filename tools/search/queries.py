@@ -561,6 +561,102 @@ def generate_broad_queries(message: str, *, max_queries: int = 10, conversation_
     return result
 
 
+def generate_llm_queries(
+    user_message: str,
+    *,
+    conversation_topics: list[str] | None = None,
+    count_min: int = 10,
+    count_max: int = 20,
+) -> list[str]:
+    """LLM-driven search query fan-out for the "standard" search mode.
+
+    Asks the query-generator model for `count_max` diverse queries covering
+    direct phrasing, alt phrasings, entity-focused, time-anchored, and
+    comparison/context angles. Returns a deduped list truncated to `count_max`.
+
+    Falls back to `generate_broad_queries` on any model failure, empty output,
+    parse failure, or fewer than `count_min` usable queries. Never raises.
+    """
+    cleaned = re.sub(r"\s+", " ", (user_message or "").strip())
+    if not cleaned:
+        return []
+
+    topics_line = ""
+    if conversation_topics:
+        topics_line = f"Prior conversation topics: {', '.join(list(conversation_topics)[:6])}\n"
+
+    prompt = (
+        f"{build_prompt_date_header()}\n\n"
+        f"{topics_line}"
+        f"User question: {cleaned}\n\n"
+        f"Generate {count_max} diverse web search queries to thoroughly answer this question. Cover:\n"
+        "- the direct question, phrased for a search engine\n"
+        "- alternative phrasings (different keywords, same intent)\n"
+        "- entity-focused queries (quote proper nouns)\n"
+        "- time-anchored queries when the topic is time-sensitive (add the year)\n"
+        "- comparison / context angles when relevant\n\n"
+        "Rules:\n"
+        "- Each query: 3-10 words, optimised for searxng/Google.\n"
+        "- No duplicates. No meta-commentary.\n"
+        "- Output ONLY a JSON array of strings. No markdown fences, no prose.\n\n"
+        "Example output: [\"RBA cash rate decision 2026\", \"Australian interest rate announcement\", ...]"
+    )
+
+    t0 = time.time()
+    try:
+        raw, _tokens = model_call("web_search_query_generator", prompt)
+    except Exception as e:
+        _log.warning("llm_queries model_call failed: %s — falling back to broad queries", e)
+        return generate_broad_queries(
+            cleaned, max_queries=count_max, conversation_topics=conversation_topics,
+        )
+
+    if not raw:
+        _log.warning("llm_queries empty response — falling back to broad queries")
+        return generate_broad_queries(
+            cleaned, max_queries=count_max, conversation_topics=conversation_topics,
+        )
+
+    # strip accidental markdown fencing before JSON parse
+    body = raw.strip()
+    if body.startswith("```"):
+        body = re.sub(r"^```[^\n]*\n", "", body).rstrip("`").strip()
+    match = re.search(r"\[[\s\S]*\]", body)
+    parsed: list[str] = []
+    if match:
+        try:
+            arr = json.loads(match.group(0))
+            if isinstance(arr, list):
+                parsed = [str(q).strip() for q in arr if str(q).strip()]
+        except Exception:
+            parsed = []
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for q in parsed:
+        key = q.lower()
+        if key in seen or len(q) < 3:
+            continue
+        seen.add(key)
+        unique.append(q)
+
+    if len(unique) < count_min:
+        _log.warning(
+            "llm_queries parsed %d < min %d — falling back to broad queries  elapsed=%.2fs",
+            len(unique), count_min, time.time() - t0,
+        )
+        return generate_broad_queries(
+            cleaned, max_queries=count_max, conversation_topics=conversation_topics,
+        )
+
+    result = unique[:count_max]
+    _log.info(
+        "llm_queries generated  parsed=%d kept=%d elapsed=%.2fs",
+        len(unique), len(result), time.time() - t0,
+    )
+    return result
+
+
 def reformulate_query(
     original_query: str,
     intent_dict: dict,

@@ -9,39 +9,9 @@ from infra.config import (
     is_feature_enabled,
 )
 from infra.nocodb_client import NocodbClient
+from tools._org import count_inflight as _count_inflight, default_org_id as _default_org_id
 
 _log = logging.getLogger("enrichment.dispatcher")
-
-
-def _count_inflight(client: NocodbClient, job_type: str) -> int:
-    total = 0
-    for status in ("queued", "running"):
-        try:
-            data = client._get("tool_jobs", params={
-                "where": f"(type,eq,{job_type})~and(status,eq,{status})",
-                "limit": 50,
-            })
-            total += len(data.get("list", []))
-        except Exception:
-            pass
-    return total
-
-
-def _default_org_id(client: NocodbClient) -> int | None:
-    for table in ("scrape_targets", NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS):
-        try:
-            rows = client._get(table, params={
-                "limit": 1,
-                "fields": "org_id",
-                "sort": "-CreatedAt",
-            }).get("list", [])
-            if rows:
-                org = int(rows[0].get("org_id") or 0)
-                if org:
-                    return org
-        except Exception:
-            continue
-    return None
 
 
 def jumpstart_scraper(org_id: int | None = None) -> dict:

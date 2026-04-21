@@ -135,36 +135,77 @@ def _build_context(topic: str, fresh_queries: list, prior_queries: list, org_id:
     return "\n\n".join(parts)
 
 
-def _synthesize(topic: str, context: str, schema: dict, iteration: int) -> dict:
+def _synthesize(
+    topic: str,
+    context: str,
+    hypotheses: list[str],
+    sub_topics: list[str],
+    schema: dict,
+    iteration: int,
+) -> dict:
     timeout_s = _research_timeout("synthesis_timeout_s", DEFAULT_SYNTHESIS_TIMEOUT_S)
 
-    # Build a human-readable section guide from the schema keys so the model knows
-    # what to cover, without constraining the output to JSON.
-    schema_guide = ""
-    if schema:
-        fields = list(schema.keys()) if isinstance(schema, dict) else []
-        if fields:
-            schema_guide = "Cover the following topics as sections:\n" + "\n".join(f"- {f}" for f in fields)
+    # Sub-topics drive the body's section structure; schema drives the comparison
+    # table. Do NOT treat schema keys as section headings — they are data-extraction
+    # fields, not topics. Previously this confusion forced the model into per-field
+    # bullet dumps with "Information unavailable" rows instead of real prose.
+    hypothesis_block = ""
+    if hypotheses:
+        hypothesis_block = "HYPOTHESES TO EVALUATE:\n" + "\n".join(f"- {h}" for h in hypotheses)
 
-    prompt = f"""You are a Research Synthesis Agent. Write a comprehensive, well-structured research paper in Markdown format.
+    section_block = ""
+    if sub_topics:
+        section_block = (
+            "REQUIRED BODY SECTIONS (use each as a `## <section>` heading, in this order):\n"
+            + "\n".join(f"- {s}" for s in sub_topics)
+        )
+
+    schema_block = ""
+    if isinstance(schema, dict) and schema:
+        fields = list(schema.keys())
+        schema_block = (
+            "DATA FIELDS FOR THE COMPARISON TABLE (columns, in this order):\n"
+            + ", ".join(fields)
+            + "\n\nAfter the body sections, include a single `## Comparison` section "
+            "containing ONE markdown table whose rows are the resources/entities and "
+            "columns are these fields. For cells where the evidence is missing, write "
+            "`—` (an em dash). Do NOT write `_Information unavailable_` anywhere in "
+            "the document."
+        )
+
+    prompt = f"""You are a Research Synthesis Agent. Produce a polished research paper in Markdown prose — NOT a template fill-in, NOT a bulleted data dump. A reader should be able to read it linearly and come away with a clear picture of the topic and a concrete recommendation where one is warranted.
 
 TOPIC: {topic}
 ITERATION: {iteration + 1}
-{schema_guide}
 
-AVAILABLE CONTEXT:
+{hypothesis_block}
+
+{section_block}
+
+{schema_block}
+
+AVAILABLE SOURCE MATERIAL:
 {context[:25000]}
 
-INSTRUCTIONS:
-1. Write a comprehensive research paper using the context above.
-2. Use Markdown formatting with ## section headers and ### subsections.
-3. Every factual claim must cite a source inline as [Source: URL].
-4. If information for a section is missing or insufficient, note it as _Information unavailable_.
-5. End with a ## Sources section listing all cited URLs.
-6. Output ONLY the Markdown document — no JSON, no code fences, no preamble."""
+STRUCTURE (follow exactly):
+1. `# {topic}` — the title.
+2. `## Executive Summary` — 2-4 paragraphs in prose. State the headline findings, which hypotheses held up, and (if the topic calls for a recommendation) give a direct recommendation with the single most important reason. No bullets here.
+3. Body sections — one `## <section>` per required section above. Each section is MINIMUM 2 substantive paragraphs of analytical prose that compares and contrasts the evidence across sources, not a per-item list. Inline citations as `[Source: URL]` after each factual claim. Use `###` subsections sparingly when a section has genuinely distinct angles.
+4. `## Comparison` — the single data table (if schema was provided above).
+5. `## Key Takeaways` — 3-6 crisp bullet points, each one sentence. This is the ONE place bullets are allowed in the body.
+6. `## Recommendation` — 1-2 paragraphs. Concrete guidance for the reader given the evidence. If the evidence genuinely doesn't support a recommendation, say so and explain what would be needed.
+7. `## Sources` — a deduped bullet list of every URL cited in the paper.
+
+HARD RULES:
+- Write in flowing prose. Bullet points are ONLY allowed in `## Key Takeaways` and `## Sources`. Anywhere else, use full sentences in paragraphs.
+- Never emit the phrase "Information unavailable" or similar. If something is unknown, either omit it, note it briefly in prose ("pricing for X was not disclosed in the available sources"), or use `—` inside the comparison table.
+- Synthesise across sources — draw contrasts, note agreement, flag contradictions. Do not restate each source in isolation.
+- Every concrete claim (price, rating, date, numeric value, attribution) MUST carry an inline `[Source: URL]` citation. General framing and analysis does not need a citation.
+- Match the register to the topic. For practical "which X should I use" topics, be opinionated and actionable.
+- Output raw Markdown only — no JSON, no code fences wrapping the whole document, no preamble, no "Here is the paper:"."""
 
     def _run():
-        return model_call("research_agent", prompt, max_tokens=4000, temperature=0.3)
+        return model_call("research_agent", prompt, temperature=0.3)
 
     ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-syn")
     try:
@@ -274,6 +315,8 @@ def run_research_agent(plan_id: int) -> dict:
         topic = plan.get("topic", "")
         queries = _safe_json_loads(plan.get("queries", "[]"), [])
         schema = _safe_json_loads(plan.get("schema", "{}"), {})
+        hypotheses = _safe_json_loads(plan.get("hypotheses", "[]"), [])
+        sub_topics = _safe_json_loads(plan.get("sub_topics", "[]"), [])
         iterations = plan.get("iterations", 0)
         org_id = plan.get("org_id", 0)
 
@@ -285,6 +328,7 @@ def run_research_agent(plan_id: int) -> dict:
         return _run_research_agent_inner(
             client, plan_id, topic, queries, schema, iterations,
             org_id, max_iterations, confidence_threshold, plan,
+            hypotheses=hypotheses, sub_topics=sub_topics,
         )
     except Exception as e:
         _log.error("research_agent uncaught error  plan_id=%d", plan_id, exc_info=True)
@@ -306,7 +350,12 @@ def _run_research_agent_inner(
     max_iterations: int,
     confidence_threshold: int,
     plan: dict,
+    *,
+    hypotheses: list[str] | None = None,
+    sub_topics: list[str] | None = None,
 ) -> dict:
+    hypotheses = hypotheses or []
+    sub_topics = sub_topics or []
     if iterations == 0:
         fresh_queries = queries
         prior_queries: list = []
@@ -332,7 +381,7 @@ def _run_research_agent_inner(
     # the UI status accurately reflects which phase is running.
     _patch_or_log(client, plan_id, {"status": "synthesizing"}, "synthesizing")
 
-    synthesis = _synthesize(topic, context, schema, iterations)
+    synthesis = _synthesize(topic, context, hypotheses, sub_topics, schema, iterations)
 
     if synthesis.get("status") == "failed":
         client._patch("research_plans", plan_id, {"status": "failed", "error_message": synthesis.get("error")})

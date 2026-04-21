@@ -16,7 +16,10 @@
     },
     "web_search": {
       "enabled": true,
+      "standard_query_count_min": 10,
+      "standard_query_count_max": 20,
       "models": {
+        "web_search_query_generator": { "role": "t3_tool",    "temperature": 0.2, "max_tokens": 600, "max_input_chars": 4000 },
         "web_search_summarise":       { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 150, "max_input_chars": 3000, "frequency_penalty": 0.2 },
         "web_search_summarise_batch": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 250, "max_input_chars": 4000, "frequency_penalty": 0.2 }
       }
@@ -75,18 +78,8 @@
       "search_extraction_model": "research_search_extraction",
       "models": {
         "research_planner":          { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
-        "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 13000, "max_input_chars": 30000 },
+        "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 20000, "max_input_chars": 30000 },
         "research_search_extraction": { "role": "exp_rwkv_r",   "temperature": 0.2, "max_tokens": 500,   "max_input_chars": 12000, "frequency_penalty": 0.2 }
-      }
-    },
-    "planned_search": {
-      "enabled": true,
-      "successful_scrapes_needed": 10,
-      "scrape_timeout_s": 1800,
-      "synthesis_timeout_s": 1800,
-      "models": {
-        "planned_search":        { "role": "t3_tool",      "temperature": 0.1, "max_tokens": 500,  "max_input_chars": 10000 },
-        "planned_search_answer": { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 8000, "max_input_chars": 24000 }
       }
     },
     "graph_extract": {
@@ -126,9 +119,7 @@
         "extract_relationships": 2,
         "discover_agent_run": 2,
         "research_planner": 2,
-        "research_agent": 2,
-        "planned_search_execute": 2,
-        "planned_search_scrape": 2
+        "research_agent": 2
       }
     }
   }

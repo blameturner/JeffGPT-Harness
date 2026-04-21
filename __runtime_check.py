@@ -2,7 +2,6 @@ import sys
 import types
 import threading
 import time
-from unittest.mock import patch
 
 if "chromadb" not in sys.modules:
     sys.modules["chromadb"] = types.ModuleType("chromadb")
@@ -23,7 +22,6 @@ if "pydantic" not in sys.modules:
     sys.modules["pydantic"] = pydantic
 
 from shared.model_pool import _PrioritySemaphore
-from tools.planned_search.agent import run_planned_search_scrape_job
 
 sem = _PrioritySemaphore(0)
 results: list[str] = []
@@ -52,24 +50,3 @@ t1.join(timeout=1)
 t2.join(timeout=1)
 assert results == ["priority", "normal"], results
 print("priority semaphore ordering OK")
-
-with patch("tools.planned_search.agent.PathfinderScraper") as MockScraper:
-    MockScraper.return_value.scrape.return_value = {
-        "status": "ok",
-        "canonical": "https://example.com/final",
-        "text": "useful content " * 80,
-    }
-    res = run_planned_search_scrape_job(
-        {
-            "url": "https://example.com",
-            "title": "Example",
-            "org_id": 123,
-            "query_keywords": ["useful", "content"],
-        }
-    )
-    assert res["status"] == "ok", res
-    assert res["org_id"] == 123, res
-    assert res["url"] == "https://example.com/final", res
-print("planned_search scrape worker OK")
-
-

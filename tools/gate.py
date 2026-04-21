@@ -58,23 +58,7 @@ _CODE_ERROR_SIGNALS = re.compile(
     re.I,
 )
 
-_PLANNED_SEARCH = re.compile(
-    r"\b(research|investigate|investigation|deep[\s-]?dive|comprehensive(?:ly)?|thorough(?:ly)?|"
-    r"in[\s-]?depth|plan (?:a|the|my) search|propose (?:searches|queries)|"
-    r"multi[\s-]?(?:angle|aspect|faceted)|literature review|state of the art|"
-    r"landscape|survey of)\b",
-    re.I,
-)
-
 _URL_IN_TEXT = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
-# NOTE: an earlier version of this regex also matched "analysis of", "compare",
-# "vs", "best resources/tools/...", "how do i learn|use|choose|pick|evaluate",
-# "guide to", "tutorial on", etc. That was far too broad — common chat
-# questions routed to planned_search, and combined with the `hints.discard(
-# "web_search")` below caused normal chat turns to silently short-circuit into
-# a pending-approval flow. Planned_search is now reserved for EXPLICIT research
-# intent or the UI's explicit `search_mode="planned"` signal handled in
-# workers/chat/agent.py.
 
 
 def gate_check(
@@ -115,8 +99,6 @@ def gate_check(
         hints.add("web_search")
     if _RAG_LOOKUP.search(msg):
         hints.add("rag_lookup")
-    if _PLANNED_SEARCH.search(msg):
-        hints.add("planned_search")
 
     if is_code:
         if _CODE_API_LOOKUP.search(msg):
@@ -129,15 +111,8 @@ def gate_check(
         if "[Tool results" in conversation_context or "web_search" in conversation_context.lower():
             hints.add("web_search")
 
-    if "web_search" not in hints and "planned_search" not in hints and len(msg) > 30:
+    if "web_search" not in hints and len(msg) > 30:
         hints.add("web_search")
-
-    # planned_search supersedes web_search: when the user asks for a research-style
-    # investigation, only the explicit, user-approved planned_search pipeline should
-    # run. Firing web_search alongside planned_search double-scrapes and trips the
-    # "planned_search invoking web_search" behaviour.
-    if "planned_search" in hints:
-        hints.discard("web_search")
 
     hints = {h for h in hints if is_feature_enabled(h)}
 

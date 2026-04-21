@@ -5,7 +5,6 @@ import json
 import logging
 import random
 import re
-from urllib.parse import urlparse
 
 from infra.config import (
     NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS,
@@ -158,15 +157,6 @@ def _classify_hit(query: str, hit: dict) -> dict | None:
         "score": score,
         "reason": str(parsed.get("reason") or "")[:500],
     }
-
-
-def _host_only(url: str) -> str:
-    try:
-        p = urlparse(url)
-        host = p.netloc.lower()
-        return host[4:] if host.startswith("www.") else host
-    except Exception:
-        return ""
 
 
 def _existing_urls(client: NocodbClient, org_id: int) -> set[str]:

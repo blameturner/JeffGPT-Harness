@@ -10,9 +10,8 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 
-from infra.config import get_feature, is_feature_enabled
+from infra.config import is_feature_enabled
 from infra.memory import remember
 from infra.nocodb_client import NocodbClient
 from tools.scraper.pathfinder import PathfinderScraper
@@ -92,7 +91,7 @@ def fetch_due_target(client: NocodbClient, org_id: int | None = None) -> dict | 
     """Return the single oldest-due active scrape_targets row, or None.
 
     "Oldest" means earliest `next_crawl_at` (nulls treated as now), falling
-    back to CreatedAt, then Id, per user's "oldest to newest" requirement.
+    back to CreatedAt, then Id.
     """
     try:
         where = "(active,eq,1)"
@@ -113,26 +112,6 @@ def fetch_due_target(client: NocodbClient, org_id: int | None = None) -> dict | 
         return None
     due.sort(key=_due_key)
     return due[0]
-
-
-def fetch_due_targets(client: NocodbClient, limit: int = 10, org_id: int | None = None) -> list[dict]:
-    """Compat shim for dashboards that previewed a list. Returns up to `limit`
-    oldest-due rows using the same ordering as fetch_due_target."""
-    try:
-        where = "(active,eq,1)"
-        if org_id and int(org_id) > 0:
-            where = f"{where}~and(org_id,eq,{int(org_id)})"
-        rows = client._get_paginated("scrape_targets", params={
-            "where": where,
-            "limit": 500,
-            "sort": "next_crawl_at,CreatedAt",
-        })
-    except Exception:
-        return []
-    now = datetime.now(timezone.utc)
-    due = [r for r in rows if _is_due(r, now)]
-    due.sort(key=_due_key)
-    return due[:limit]
 
 
 def _patch_target(client: NocodbClient, target_id: int, payload: dict) -> None:

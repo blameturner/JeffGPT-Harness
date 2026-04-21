@@ -56,7 +56,7 @@ class BaseAgent:
         self.org_id = org_id
         self.url = url
         self.search_enabled = search_enabled
-        self._search_mode = "normal"
+        self._search_mode = "standard"
         self.db = NocodbClient()
 
     @staticmethod
