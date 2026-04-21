@@ -83,6 +83,31 @@ def _retry_backoff_s(job_type: str, attempt: int) -> float:
         return _DEFAULT_RETRY_BACKOFF_S
 
 
+def _priority_yield_max_seconds(job_type: str, my_priority: int) -> float:
+    """Max time a worker will keep yielding to higher-priority queued jobs.
+
+    Prevents permanent starvation when a steady p3 stream would otherwise block
+    all p4/p5 work forever. A value <= 0 disables the cap.
+    """
+    try:
+        from infra.config import get_feature
+        per_type = get_feature("tool_queue", "job_type_priority_yield_max_seconds", None)
+        if isinstance(per_type, dict):
+            val = per_type.get(job_type)
+            if val is not None:
+                return float(val)
+        # Conservative defaults: keep strict yield for p1-p3, allow p4/p5 to
+        # make occasional progress when backlog is continuous.
+        raw = get_feature(
+            "tool_queue",
+            "priority_yield_max_seconds",
+            120 if my_priority >= 4 else 0,
+        )
+        return float(raw)
+    except Exception:
+        return 120.0 if my_priority >= 4 else 0.0
+
+
 def _is_interactive_source(source: str) -> bool:
     s = (source or "").strip().lower()
     return s == "chat" or s == "code" or s.startswith("chat_") or s.startswith("code_")
@@ -519,7 +544,15 @@ class ToolJobQueue:
             my_priority = config.priority_default
             if my_priority > 1 and not head_bypass:
                 yielded = False
+                yield_started = time.time()
+                yield_cap_s = _priority_yield_max_seconds(job_type, my_priority)
                 while self._higher_priority_queued(my_priority):
+                    if yield_cap_s > 0 and (time.time() - yield_started) >= yield_cap_s:
+                        _log.info(
+                            "queue %s: fairness override — yielded %.0fs; claiming %s work",
+                            worker_id, yield_cap_s, job_type,
+                        )
+                        break
                     if not yielded:
                         _log.info(
                             "queue %s: yielding — higher-priority job queued (my p=%d)",
