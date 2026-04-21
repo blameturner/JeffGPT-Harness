@@ -70,6 +70,24 @@ def _due_key(row: dict) -> tuple[datetime, int]:
     )
 
 
+SCRAPING_LOCK_TTL_SECONDS = 1800  # 30 minutes — recover rows stuck in status=scraping from a crashed handler
+
+
+def _is_due(r: dict, now: datetime) -> bool:
+    """True if this row is selectable: not locked by a recent in-flight scrape,
+    and either never-scraped or past its next_crawl_at."""
+    if str(r.get("status") or "").strip().lower() == "scraping":
+        # Respect the lock only while it's fresh. If UpdatedAt is older than the
+        # TTL, treat the row as eligible so crashed handlers don't wedge it.
+        updated = _parse_iso(r.get("UpdatedAt") or r.get("updated_at"))
+        if updated and (now - updated).total_seconds() < SCRAPING_LOCK_TTL_SECONDS:
+            return False
+    if r.get("last_scraped_at") in (None, ""):
+        return True
+    nca = _parse_iso(r.get("next_crawl_at"))
+    return nca is None or nca <= now
+
+
 def fetch_due_target(client: NocodbClient, org_id: int | None = None) -> dict | None:
     """Return the single oldest-due active scrape_targets row, or None.
 
@@ -90,16 +108,7 @@ def fetch_due_target(client: NocodbClient, org_id: int | None = None) -> dict | 
         return None
 
     now = datetime.now(timezone.utc)
-    due: list[dict] = []
-    for r in rows:
-        if str(r.get("status") or "").strip().lower() == "scraping":
-            continue
-        if r.get("last_scraped_at") in (None, ""):
-            due.append(r)
-            continue
-        nca = _parse_iso(r.get("next_crawl_at"))
-        if nca is None or nca <= now:
-            due.append(r)
+    due = [r for r in rows if _is_due(r, now)]
     if not due:
         return None
     due.sort(key=_due_key)
@@ -121,16 +130,7 @@ def fetch_due_targets(client: NocodbClient, limit: int = 10, org_id: int | None 
     except Exception:
         return []
     now = datetime.now(timezone.utc)
-    due: list[dict] = []
-    for r in rows:
-        if str(r.get("status") or "").strip().lower() == "scraping":
-            continue
-        if r.get("last_scraped_at") in (None, ""):
-            due.append(r)
-            continue
-        nca = _parse_iso(r.get("next_crawl_at"))
-        if nca is None or nca <= now:
-            due.append(r)
+    due = [r for r in rows if _is_due(r, now)]
     due.sort(key=_due_key)
     return due[:limit]
 

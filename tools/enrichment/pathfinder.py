@@ -158,6 +158,10 @@ def pathfinder_extract_job(payload: dict | None = None) -> dict:
         return {"status": "not_found", "suggested_id": suggested_id}
 
     row = rows[0]
+    row_status = str(row.get("status") or "").strip().lower()
+    if row_status in ("extracted", "rejected"):
+        return {"status": "skipped", "reason": f"status_{row_status}", "suggested_id": suggested_id}
+
     seed_url = _normalize(str(row.get("url") or "")) or str(row.get("url") or "")
     org_id = int(row.get("org_id") or 0)
     if not seed_url or org_id <= 0:

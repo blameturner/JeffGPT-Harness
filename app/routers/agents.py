@@ -113,7 +113,7 @@ def scheduler_status(request: Request):
                 agent_jobs.append(payload)
             elif job.id in {
                 "enrichment_scrape_dispatcher",
-                "pathfinder_recrawl_dispatcher",
+                "pathfinder_dispatcher",
                 "discover_agent_dispatcher",
             }:
                 enrichment_jobs.append(payload)

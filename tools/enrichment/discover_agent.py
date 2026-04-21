@@ -275,10 +275,18 @@ def discover_agent_job(payload: dict | None = None) -> dict:
 
     _log.info("discover_agent candidates  queries=%d found=%d", len(queries), len(candidates))
 
+    from workers.tool_queue import _background_idle_gate, seconds_since_chat
+
     added = 0
     classified = 0
+    yielded_to_chat = False
     for q, hit, url in candidates:
         if added >= max_suggestions:
+            break
+        # Yield mid-loop if chat gets touched: classification LLM calls share the
+        # model server with chat, so keep this loop cooperative.
+        if seconds_since_chat() < _background_idle_gate():
+            yielded_to_chat = True
             break
         verdict = _classify_hit(q, hit)
         if verdict is None:
@@ -305,4 +313,5 @@ def discover_agent_job(payload: dict | None = None) -> dict:
         "candidates_found": len(candidates),
         "classified": classified,
         "suggested": added,
+        "yielded_to_chat": yielded_to_chat,
     }

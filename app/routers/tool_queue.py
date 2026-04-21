@@ -48,7 +48,7 @@ def _scheduler_status(request: Request) -> dict:
                 agent_jobs.append(payload)
             elif job.id in {
                 "enrichment_scrape_dispatcher",
-                "pathfinder_recrawl_dispatcher",
+                "pathfinder_dispatcher",
                 "discover_agent_dispatcher",
             }:
                 enrichment_jobs.append(payload)

@@ -52,17 +52,9 @@
     },
     "scraper": {
       "enabled": true,
-      "batch_size": 10,
-      "max_per_domain_per_batch": 2,
-      "in_progress_lock_ttl_seconds": 1800,
+      "dispatch_interval_seconds": 60,
       "summariser_model": "scrape_summariser",
-      "classifier_model": "scrape_classifier",
-      "dispatch_interval_minutes": 10,
-      "max_jobs_per_dispatch": 25,
-      "min_run_interval_seconds": 120,
-      "rag_collection": "discovery",
-      "summary_collection": "discovery_summaries",
-      "_comment_models": "scrape_summariser/classifier are for background enrichment queue jobs only. chat/code web search uses features.web_search.models.*. research uses features.research.models.research_search_extraction.",
+      "_comment_models": "scrape_summariser runs on every scraped page. scrape_classifier is used inline by the discover agent on search results pre-approval.",
       "models": {
         "scrape_summariser": { "role": "exp_rwkv_r", "temperature": 0.2, "max_tokens": 500, "max_input_chars": 12000, "frequency_penalty": 0.2 },
         "scrape_classifier": { "role": "t3_tool",    "temperature": 0.1, "max_tokens": 200, "max_input_chars": 8000 }
@@ -105,71 +97,38 @@
     },
     "pathfinder": {
       "enabled": true,
-      "max_depth": 0,
-      "max_pages": 500,
-      "concurrency": 8,
-      "per_host_delay_s": 0.5,
-      "robots_cache_ttl_s": 3600,
-      "sitemap_limit": 200,
-      "recrawl_interval_minutes": 10,
-      "batch_size": 5,
-      "max_links_per_seed": 100,
-      "stale_after_minutes": 60,
-      "fallback_to_scrape_targets": true,
-      "fallback_auto_max_depth": 2,
-      "fallback_auto_max_path_segments": 2,
-      "min_run_interval_seconds": 120
+      "dispatch_interval_seconds": 120,
+      "same_host_only": true,
+      "max_links_per_seed": 100
     },
     "discover_agent": {
       "enabled": true,
       "run_interval_minutes": 20,
-      "min_run_interval_seconds": 1080,
       "sample_collection": "discovery",
       "sample_chunks": 12,
       "sample_max_chars_per_chunk": 400,
       "queries_per_run": 6,
       "results_per_query": 8,
-      "max_roots_per_run": 10,
-      "existing_host_scan_limit": 10000,
-      "query_model": "tool_planner"
-    },
-    "scraper_runtime": {
-      "_comment": "scraper feature config lives in features.scraper — this key is unused; the scraper handler reads scraper.min_run_interval_seconds",
-      "min_run_interval_seconds": 120
+      "max_suggestions_per_run": 20,
+      "min_relevance": "medium",
+      "existing_scan_limit": 5000,
+      "query_model": "tool_planner",
+      "classify_model": "scrape_classifier"
     },
     "tool_queue": {
-      "startup_grace_seconds": 600,
-      "strict_chat_idle_seconds": 600,
+      "background_chat_idle_seconds": 30,
       "default_max_attempts": 3,
       "default_retry_backoff_seconds": 5,
-      "priority_backoff_seconds": {
-        "1": 600,
-        "2": 600,
-        "3": 600,
-        "4": 600,
-        "5": 600
-      },
-      "default_backoff_seconds": 600,
-      "job_type_min_idle_seconds": {
-        "summarise_page": 300,
-        "pathfinder_crawl": 1200,
-        "discover_agent_run": 1200
-      },
       "job_type_max_attempts": {
         "summarise_page": 3,
-        "classify_relevance": 3,
-        "scrape_target": 2,
-        "pathfinder_crawl": 2,
+        "scrape_page": 2,
+        "pathfinder_extract": 2,
+        "extract_relationships": 2,
         "discover_agent_run": 2,
         "research_planner": 2,
         "research_agent": 2,
         "planned_search_execute": 2,
         "planned_search_scrape": 2
-      },
-      "job_type_additional_idle_seconds": {
-        "summarise_page": 0,
-        "pathfinder_crawl": 0,
-        "discover_agent_run": 0
       }
     }
   }
