@@ -44,6 +44,7 @@ class ChatAgent(BaseAgent):
     ) -> None:
         from shared.jobs import STORE
         from shared.model_pool import _user_priority_ctx
+        from shared.models import set_model_usage_context
 
         # Mark this call stack as user-initiated so every nested model_call —
         # tool_planner, intent_classifier, search extraction, queries, quality,
@@ -52,6 +53,7 @@ class ChatAgent(BaseAgent):
         # this signal via _user_requests_waiting and yield before taking a
         # model slot, so chat/code never sit behind background work.
         _user_priority_ctx.set(True)
+        set_model_usage_context(org_id=self.org_id, source="chat")
 
         if temperature is None:
             temperature = chat_temperature(response_style)
@@ -105,6 +107,11 @@ class ChatAgent(BaseAgent):
                 for m in self.db.list_messages(conversation_id)
             ]
         _span("load_convo_ms", _t)
+        set_model_usage_context(
+            org_id=self.org_id,
+            source="chat",
+            conversation_id=conversation_id,
+        )
 
         convo_rag_enabled = self._truthy(convo.get("rag_enabled"))
         collection_name = (

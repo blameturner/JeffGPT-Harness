@@ -661,7 +661,10 @@ class ToolJobQueue:
         while attempts < max_attempts:
             attempts += 1
             try:
-                result = config.handler(job.payload)
+                from shared.models import model_usage_scope
+
+                with model_usage_scope(org_id=job.org_id, source=f"tool_queue:{job.type}"):
+                    result = config.handler(job.payload)
                 result = result or {}
                 status_val = str((result.get("status") if isinstance(result, dict) else "") or "").lower()
                 if status_val in {"failed", "error"}:

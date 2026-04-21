@@ -177,6 +177,7 @@ class CodeAgent(BaseAgent):
         knowledge_enabled: bool | None = None,
     ) -> None:
         from shared.jobs import STORE
+        from shared.models import set_model_usage_context
 
         if temperature is None:
             temperature = code_temperature(response_style)
@@ -190,6 +191,7 @@ class CodeAgent(BaseAgent):
         # tool_queue workers yield. See workers/chat/agent.py for context.
         from shared.model_pool import _user_priority_ctx
         _user_priority_ctx.set(True)
+        set_model_usage_context(org_id=self.org_id, source="code")
 
         # signal active session so queue workers back off
         from workers.tool_queue import touch_chat_activity
@@ -242,6 +244,11 @@ class CodeAgent(BaseAgent):
                 return
 
         convo_knowledge = self._truthy(convo.get("knowledge_enabled")) or bool(knowledge_enabled)
+        set_model_usage_context(
+            org_id=self.org_id,
+            source="code",
+            conversation_id=conversation_id,
+        )
         _log.info("code conversation flags  conv=%s knowledge=%s mode=%s", conversation_id, convo_knowledge, self.mode)
 
         if conversation_id is not None and not is_new:

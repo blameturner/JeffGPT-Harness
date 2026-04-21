@@ -1,0 +1,13 @@
+{
+  "family": "deepseek",
+  "match_patterns": ["deepseek-r1", "deepseek_r1", "deepseek r1", "deepseek"],
+  "thinking": {
+    "style": "think_tags",
+    "open_tag": "<think>",
+    "close_tag": "</think>",
+    "disable_params": {
+      "chat_template_kwargs": {"enable_thinking": false}
+    }
+  }
+}
+

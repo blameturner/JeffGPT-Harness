@@ -107,7 +107,7 @@ def fetch_due_target(client: NocodbClient, org_id: int | None = None) -> dict | 
         return None
 
     now = datetime.now(timezone.utc)
-    due = [r for r in rows if _is_due(r, now)]
+    due = [r for r in rows if _is_due(r, now) and not r.get("dup_of")]
     if not due:
         return None
     due.sort(key=_due_key)

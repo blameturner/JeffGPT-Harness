@@ -1,0 +1,10 @@
+{
+  "family": "qwen-coder",
+  "match_patterns": ["qwen3-coder", "qwen2.5-coder", "qwen-coder"],
+  "thinking": {
+    "style": "none",
+    "disable_params": {
+      "chat_template_kwargs": {"enable_thinking": false}
+    }
+  }
+}

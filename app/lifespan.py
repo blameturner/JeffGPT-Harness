@@ -41,6 +41,9 @@ async def lifespan(app: FastAPI):
     from tools.enrichment.pathfinder import pathfinder_extract_job
     from tools.enrichment.discover_agent import discover_agent_job
     from tools.enrichment.relationships_extractor import extract_relationships_job
+    from tools.digest.agent import daily_digest_job
+    from tools.seed_feedback.agent import seed_feedback_job
+    from tools.corpus_maintenance.agent import corpus_maintenance_job
     tool_queue = ToolJobQueue()
     # Priority tiers (lower = picked first):
     #   3 = graph_extract, research planner + agent
@@ -77,6 +80,18 @@ async def lifespan(app: FastAPI):
         handler=discover_agent_job,
         max_workers=1, priority_default=5, source="discover_agent",
     ))
+    tool_queue.register("daily_digest", HandlerConfig(
+        handler=daily_digest_job,
+        max_workers=1, priority_default=5, source="daily_digest",
+    ))
+    tool_queue.register("seed_feedback", HandlerConfig(
+        handler=seed_feedback_job,
+        max_workers=1, priority_default=5, source="seed_feedback",
+    ))
+    tool_queue.register("corpus_maintenance", HandlerConfig(
+        handler=corpus_maintenance_job,
+        max_workers=1, priority_default=5, source="corpus_maintenance",
+    ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue
     tool_queue.start()
@@ -92,6 +107,10 @@ async def lifespan(app: FastAPI):
             jumpstart_pathfinder,
             jumpstart_scraper,
         )
+        from tools.digest.dispatcher import jumpstart_daily_digest
+        from tools.seed_feedback.dispatcher import jumpstart_seed_feedback
+        from tools.corpus_maintenance.dispatcher import jumpstart_corpus_maintenance
+        from apscheduler.triggers.cron import CronTrigger
         from apscheduler.triggers.interval import IntervalTrigger
 
         scrape_seconds = int(get_feature("scraper", "dispatch_interval_seconds", 60))
@@ -125,6 +144,43 @@ async def lifespan(app: FastAPI):
             "enrichment dispatchers scheduled  scrape=%ds pathfinder=%ds discover=%dm",
             scrape_seconds, pathfinder_seconds, discover_minutes,
         )
+
+        if get_feature("daily_digest", "enabled", True):
+            digest_hour = int(get_feature("daily_digest", "cron_hour", 7))
+            digest_minute = int(get_feature("daily_digest", "cron_minute", 0))
+            sched.add_job(
+                jumpstart_daily_digest,
+                CronTrigger(hour=digest_hour, minute=digest_minute),
+                id="daily_digest_dispatcher",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            _log.info("daily_digest dispatcher scheduled  %02d:%02d UTC", digest_hour, digest_minute)
+
+        if get_feature("seed_feedback", "enabled", True):
+            seed_hours = int(get_feature("seed_feedback", "run_interval_hours", 6))
+            sched.add_job(
+                jumpstart_seed_feedback,
+                IntervalTrigger(hours=max(1, seed_hours)),
+                id="seed_feedback_dispatcher",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            _log.info("seed_feedback dispatcher scheduled  every=%dh", seed_hours)
+
+        if get_feature("corpus_maintenance", "enabled", True):
+            maint_hours = int(get_feature("corpus_maintenance", "run_interval_hours", 12))
+            sched.add_job(
+                jumpstart_corpus_maintenance,
+                IntervalTrigger(hours=max(1, maint_hours)),
+                id="corpus_maintenance_dispatcher",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            _log.info("corpus_maintenance dispatcher scheduled  every=%dh", maint_hours)
     except Exception:
         _log.error("enrichment dispatcher registration failed", exc_info=True)
 

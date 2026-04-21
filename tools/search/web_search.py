@@ -11,22 +11,37 @@ from tools.dispatcher import register_executor
 from tools.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
+# Last-resort defaults — every use site reads the live value from config via
+# _cfg_int() so operators can retune without a redeploy.
 BASIC_MAX_URLS = 8
-STANDARD_MAX_URLS = 10
-MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
+STANDARD_MAX_URLS = 8
+SUPPLEMENTARY_EXTRACT_CHARS = 1200
+PRIORITY_EXTRACT_CHARS = min(6000, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
 BATCH_TARGET = 5
+PRIORITY_URLS = 2
+RERANK_WHEN_CANDIDATES_OVER = 5
+RERANK_MAX = 8
+BASIC_QUERY_CAP = 5
+STANDARD_QUERY_CAP = 3
 RELEVANCE_KEYWORD_THRESHOLD = 0.16
 RELEVANCE_MIN_ABS_HITS = 2
 RELEVANCE_MIN_KEEP = 4
 
 
+def _cfg_int(key: str, default: int) -> int:
+    try:
+        return int(get_feature("web_search", key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
 
 async def _search_one(query: str) -> list[dict]:
+    per_query = _cfg_int("searxng_per_query", SEARXNG_PER_QUERY)
     try:
         results = await asyncio.to_thread(
-            searxng_search, query, SEARXNG_PER_QUERY,
+            searxng_search, query, per_query,
         )
     except Exception as e:
         _log.warning("searxng failed q=%r: %s", query[:80], e)
@@ -117,7 +132,7 @@ def _filter_results_by_relevance(
     return kept
 
 
-async def _scrape_one(item: dict) -> dict:
+async def _scrape_one(item: dict, extract_cap: int) -> dict:
     from tools.search.scraping import scrape_page
 
     url = item["url"]
@@ -134,10 +149,11 @@ async def _scrape_one(item: dict) -> dict:
         text = snippet
         meta["path"] = "error"
 
+    cap = min(max(1, extract_cap), PER_PAGE_CHAR_CAP)
     return {
         "url": url,
         "title": title,
-        "text": (text or "")[:MAX_EXTRACT_CHARS],
+        "text": (text or "")[:cap],
         "path": meta.get("path", "unknown"),
     }
 
@@ -163,8 +179,9 @@ async def _summarise_one(
     function_name: str = "web_search_summarise",
     priority: bool = True,
 ) -> dict:
+    max_summary = _cfg_int("max_summary_chars", MAX_SUMMARY_CHARS)
     if len(text) < 100:
-        return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "snippet"}
+        return {"summary": text[:max_summary], "relevance": "low", "source_type": "snippet"}
 
     cfg = get_function_config(function_name)
     max_input = cfg.get("max_input_chars", 12000)
@@ -189,14 +206,14 @@ async def _summarise_one(
             model_call, function_name, prompt, priority,
         )
         if not raw:
-            return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "unknown"}
+            return {"summary": text[:max_summary], "relevance": "low", "source_type": "unknown"}
 
         summary, relevance = _parse_relevance(raw)
         _log.info("summarise ok  url=%s chars=%d relevance=%s", url[:80], len(summary), relevance)
-        return {"summary": summary[:MAX_SUMMARY_CHARS], "relevance": relevance, "source_type": "article"}
+        return {"summary": summary[:max_summary], "relevance": relevance, "source_type": "article"}
     except Exception as e:
         _log.warning("summarise failed  url=%s: %s %r", url[:80], type(e).__name__, e)
-        return {"summary": text[:MAX_SUMMARY_CHARS], "relevance": "low", "source_type": "unknown"}
+        return {"summary": text[:max_summary], "relevance": "low", "source_type": "unknown"}
 
 
 def _build_batches(
@@ -293,11 +310,12 @@ def _parse_batch_response(raw: str, expected: int) -> list[dict]:
     parts = re.split(r"(?:^|\n)\s*PAGE\s+\d+\s*:\s*", raw, flags=re.IGNORECASE)
     sections = [p.strip() for p in parts if p.strip()]
 
+    max_summary = _cfg_int("max_summary_chars", MAX_SUMMARY_CHARS)
     results: list[dict] = []
     for section in sections[:expected]:
         summary, relevance = _parse_relevance(section)
         results.append({
-            "summary": summary[:MAX_SUMMARY_CHARS],
+            "summary": summary[:max_summary],
             "relevance": relevance,
             "source_type": "article",
         })
@@ -324,15 +342,28 @@ async def execute(params: dict, emit) -> ToolResult:
     mode = (params.get("mode") or "basic").lower()
     if mode not in ("basic", "standard"):
         mode = "basic"
-    query_cap = 20 if mode == "standard" else 5
+
+    query_cap = _cfg_int(
+        "standard_query_cap" if mode == "standard" else "basic_query_cap",
+        STANDARD_QUERY_CAP if mode == "standard" else BASIC_QUERY_CAP,
+    )
     default_url_cap = STANDARD_MAX_URLS if mode == "standard" else BASIC_MAX_URLS
-    cfg_key = "standard_max_urls" if mode == "standard" else "basic_max_urls"
-    cfg_cap = int(get_feature("web_search", cfg_key, default_url_cap) or default_url_cap)
-    # Standard mode should not collapse to tiny caps when many queries are generated.
-    if mode == "standard":
-        url_cap = max(cfg_cap, len(raw_queries) if isinstance(raw_queries, list) else 0)
-    else:
-        url_cap = cfg_cap
+    url_cap = _cfg_int(
+        "standard_max_urls" if mode == "standard" else "basic_max_urls",
+        default_url_cap,
+    )
+
+    priority_urls = max(0, _cfg_int("priority_urls", PRIORITY_URLS))
+    priority_cap = _cfg_int("priority_extract_chars", PRIORITY_EXTRACT_CHARS)
+    supp_cap = _cfg_int("supplementary_extract_chars", SUPPLEMENTARY_EXTRACT_CHARS)
+    rerank_threshold = _cfg_int("rerank_when_candidates_over", RERANK_WHEN_CANDIDATES_OVER)
+    rerank_max = _cfg_int("rerank_max", RERANK_MAX)
+    batch_target = max(1, _cfg_int("batch_target", BATCH_TARGET))
+    max_summary = _cfg_int("max_summary_chars", MAX_SUMMARY_CHARS)
+    # Pool cap gives the reranker something to choose from — we want the raw
+    # dedupe pool to be comfortably larger than url_cap when rerank runs.
+    pool_cap = max(url_cap, rerank_max * 2)
+
     queries = [str(q).strip() for q in raw_queries if str(q).strip()][:query_cap]
     if not queries:
         return ToolResult(
@@ -349,9 +380,12 @@ async def execute(params: dict, emit) -> ToolResult:
     # keep queue consumers backing off for the whole search window
     from workers.tool_queue import touch_chat_activity
 
-    results = await _search_all(queries, url_cap=url_cap)
+    results = await _search_all(queries, url_cap=pool_cap)
     touch_chat_activity()
-    _log.info("searxng  mode=%s queries=%d urls_deduped=%d cap=%d", mode, len(queries), len(results), url_cap)
+    _log.info(
+        "searxng  mode=%s queries=%d urls_deduped=%d pool=%d url_cap=%d",
+        mode, len(queries), len(results), pool_cap, url_cap,
+    )
 
     if not results:
         emit({
@@ -378,20 +412,74 @@ async def execute(params: dict, emit) -> ToolResult:
             elapsed_s=round(time.time() - t0, 2),
         )
 
-    scraped = await asyncio.gather(*[_scrape_one(r) for r in results])
-    touch_chat_activity()
+    # Conditional rerank: only when the post-filter pool is large enough that
+    # the extra LLM call pays for itself. Below the threshold, trust searxng's
+    # ordering (already the result of a relevance-ranked search).
+    reranked = False
+    if len(results) > rerank_threshold:
+        try:
+            from tools.search.queries import rerank_candidates, _extract_keywords
+            entities = [
+                kw for kw in _extract_keywords(queries[0])
+                if len(kw) > 2 and not kw.isdigit()
+            ][:8]
+            intent_dict = {"intent": "search_explicit", "entities": entities}
+            ranked = await asyncio.to_thread(
+                rerank_candidates, results, intent_dict, rerank_max,
+            )
+            if ranked:
+                results = [r for r, _score in ranked]
+                reranked = True
+        except Exception as e:
+            _log.warning("rerank skipped: %s %r", type(e).__name__, e)
 
-    with_text = [s for s in scraped if s["text"] and len(s["text"]) >= 100]
+    results = results[:url_cap]
+
+    # Tier split: top priority_urls get the deep scrape + individual summary,
+    # the rest get a smaller extract and go through the batch summariser.
+    priority_candidates = results[:priority_urls]
+    supplementary_candidates = results[priority_urls:]
+
+    priority_scraped, supplementary_scraped = await asyncio.gather(
+        asyncio.gather(*[_scrape_one(r, priority_cap) for r in priority_candidates]),
+        asyncio.gather(*[_scrape_one(r, supp_cap) for r in supplementary_candidates]),
+    )
+    touch_chat_activity()
+    priority_scraped = list(priority_scraped)
+    supplementary_scraped = list(supplementary_scraped)
+    scraped = priority_scraped + supplementary_scraped
+
     query_str = " | ".join(queries)
 
-    summary_results: list[dict] = []
-    if with_text:
+    priority_with_text = [s for s in priority_scraped if s["text"] and len(s["text"]) >= 100]
+    supp_with_text = [s for s in supplementary_scraped if s["text"] and len(s["text"]) >= 100]
+    snippet_only = [
+        s for s in scraped
+        if s["text"] and s not in priority_with_text and s not in supp_with_text
+    ]
+
+    # Priority tier → individual summaries (bigger context per page)
+    priority_summaries: list[dict] = []
+    if priority_with_text:
+        _pri_sem = asyncio.Semaphore(2)
+
+        async def _bounded_one(p):
+            async with _pri_sem:
+                return await _summarise_one(p["url"], p["text"], query_str)
+
+        priority_summaries = list(await asyncio.gather(
+            *[_bounded_one(p) for p in priority_with_text]
+        ))
+
+    # Supplementary tier → batched summary
+    supp_summaries: list[dict] = []
+    if supp_with_text:
         batch_cfg = get_function_config("web_search_summarise_batch")
         batch_max_input = batch_cfg.get("max_input_chars", 14000)
-        batches = _build_batches(with_text, batch_max_input, BATCH_TARGET)
+        batches = _build_batches(supp_with_text, batch_max_input, batch_target)
         _log.info(
             "summarise batches=%d pages=%d target=%d",
-            len(batches), len(with_text), BATCH_TARGET,
+            len(batches), len(supp_with_text), batch_target,
         )
 
         _sem = asyncio.Semaphore(2)
@@ -400,20 +488,17 @@ async def execute(params: dict, emit) -> ToolResult:
             async with _sem:
                 return await _summarise_batch(batch, query_str)
 
-        batch_results = await asyncio.gather(*[
-            _bounded_batch(b) for b in batches
-        ])
+        batch_results = await asyncio.gather(*[_bounded_batch(b) for b in batches])
         for br in batch_results:
-            summary_results.extend(br)
+            supp_summaries.extend(br)
 
-    snippet_only = [s for s in scraped if s["text"] and s not in with_text]
-    for s in snippet_only:
-        summary_results.append({
-            "summary": s["text"][:MAX_SUMMARY_CHARS],
-            "relevance": "low",
-            "source_type": "snippet",
-        })
-    combined_items = with_text + snippet_only
+    snippet_summaries = [
+        {"summary": s["text"][:max_summary], "relevance": "low", "source_type": "snippet"}
+        for s in snippet_only
+    ]
+
+    combined_items = priority_with_text + supp_with_text + snippet_only
+    summary_results = priority_summaries + supp_summaries + snippet_summaries
 
     context_parts: list[str] = []
     sources_meta: list[dict] = []
@@ -441,16 +526,18 @@ async def execute(params: dict, emit) -> ToolResult:
         "urls": len(results),
         "scraped_ok": len([s for s in scraped if s["text"] and s["path"] not in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
         "snippet_only": len([s for s in scraped if s["path"] in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
-        "summarised": len(with_text),
+        "summarised": len(priority_with_text) + len(supp_with_text),
         "chars": len(combined),
     }
     path_counts: dict[str, int] = {}
     for s in scraped:
         path_counts[s["path"]] = path_counts.get(s["path"], 0) + 1
     _log.info(
-        "search_metrics queries=%d urls=%d scraped_ok=%d snippet_only=%d summarised=%d chars=%d paths=%s elapsed=%.2fs",
-        counts["queries"], counts["urls"], counts["scraped_ok"],
-        counts["snippet_only"], counts["summarised"], counts["chars"],
+        "search_metrics queries=%d urls=%d reranked=%s priority=%d supplementary=%d scraped_ok=%d snippet_only=%d summarised=%d chars=%d paths=%s elapsed=%.2fs",
+        counts["queries"], counts["urls"], reranked,
+        len(priority_with_text), len(supp_with_text),
+        counts["scraped_ok"], counts["snippet_only"],
+        counts["summarised"], counts["chars"],
         path_counts, elapsed,
     )
 
