@@ -3,6 +3,11 @@
   "features": {
     "chat": {
       "enabled": true,
+      "chat_summarise": {
+        "threshold_chars": 5000,
+        "threshold_messages": 6,
+        "keep_recent_exchanges": 3
+      },
       "models": {
         "chat":           { "role": "t1_primary" },
         "chat_summarise": { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500, "max_input_chars": 16000, "frequency_penalty": 0.2 }

@@ -9,8 +9,8 @@ _log = logging.getLogger("chat.history")
 MAX_HISTORY_CHARS = 8_000
 KEEP_RECENT_EXCHANGES = 3
 MAX_SINGLE_MESSAGE_CHARS = 2_000
-SUMMARISE_THRESHOLD_CHARS = 6_000
-SUMMARISE_THRESHOLD_MESSAGES = 8
+SUMMARISE_THRESHOLD_CHARS = 5_000
+SUMMARISE_THRESHOLD_MESSAGES = 3
 
 
 def _truncate_message(msg: dict) -> dict:
@@ -47,11 +47,12 @@ def maybe_summarise(history: list[dict], truncate_only: bool = False) -> tuple[l
         return history, None
 
     total = _total_chars(history)
+    threshold_chars, threshold_messages, keep_recent_exchanges = _summary_thresholds()
 
-    if total <= SUMMARISE_THRESHOLD_CHARS and len(history) <= SUMMARISE_THRESHOLD_MESSAGES:
+    if total <= threshold_chars and len(history) <= threshold_messages:
         return [_truncate_message(m) for m in history], None
 
-    keep_count = min(len(history), KEEP_RECENT_EXCHANGES * 2)
+    keep_count = min(len(history), keep_recent_exchanges * 2)
     older = history[:-keep_count] if keep_count < len(history) else []
     recent = history[-keep_count:]
 
@@ -168,3 +169,27 @@ def _call_summarise(older_text: str, existing_summary: str) -> tuple[str, list[s
     except Exception:
         _log.error("chat summarise failed", exc_info=True)
         return None, []
+
+
+def _summary_thresholds() -> tuple[int, int, int]:
+    """Runtime-configurable summary thresholds.
+
+    Lower defaults make post-turn summaries happen more often, improving topic
+    extraction used by search query generation on subsequent turns.
+    """
+    try:
+        from infra.config import get_feature
+
+        cfg = get_feature("chat", "chat_summarise", {}) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        chars = int(cfg.get("threshold_chars", SUMMARISE_THRESHOLD_CHARS) or SUMMARISE_THRESHOLD_CHARS)
+        messages = int(cfg.get("threshold_messages", SUMMARISE_THRESHOLD_MESSAGES) or SUMMARISE_THRESHOLD_MESSAGES)
+        keep_recent = int(cfg.get("keep_recent_exchanges", KEEP_RECENT_EXCHANGES) or KEEP_RECENT_EXCHANGES)
+    except Exception:
+        chars = SUMMARISE_THRESHOLD_CHARS
+        messages = SUMMARISE_THRESHOLD_MESSAGES
+        keep_recent = KEEP_RECENT_EXCHANGES
+
+    return max(1000, chars), max(4, messages), max(1, keep_recent)
