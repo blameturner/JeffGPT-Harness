@@ -12,7 +12,7 @@ from tools.search.engine import PER_PAGE_CHAR_CAP, searxng_search
 _log = logging.getLogger("tools.web_search")
 
 BASIC_MAX_URLS = 8
-STANDARD_MAX_URLS = 25
+STANDARD_MAX_URLS = 10
 MAX_EXTRACT_CHARS = min(2500, PER_PAGE_CHAR_CAP)
 MAX_SUMMARY_CHARS = 1500
 SEARXNG_PER_QUERY = 10
