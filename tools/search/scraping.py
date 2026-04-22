@@ -126,12 +126,14 @@ def _looks_like_antibot(text: str) -> bool:
     return any(m in lower for m in markers)
 
 
-# thread-affinity: sync_playwright() is pinned to its starting thread; all pw calls MUST run on this worker
+# thread-affinity: sync_playwright() is pinned to its starting thread; each worker owns its own
+# browser instance, pulling from a single shared queue so flaky URLs don't block the pool.
 _PW_QUEUE_SENTINEL = object()
 _pw_queue: queue.Queue | None = None
-_pw_worker: threading.Thread | None = None
+_pw_workers: list[threading.Thread] = []
 _pw_worker_lock = threading.Lock()
-PLAYWRIGHT_FETCH_TIMEOUT = 120
+PLAYWRIGHT_FETCH_TIMEOUT = 25
+PLAYWRIGHT_WORKERS = 2
 MAX_RESPONSE_BYTES = 5_000_000
 
 
@@ -221,15 +223,15 @@ def _playwright_worker_main() -> None:
                     else route.abort()
                 ))
 
-                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                page.goto(url, wait_until="domcontentloaded", timeout=15_000)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=30_000)
+                    page.wait_for_load_state("networkidle", timeout=5_000)
                 except Exception:
                     pass
                 try:
                     page.wait_for_function(
                         "() => document.body && document.body.innerText.length > 200",
-                        timeout=30_000,
+                        timeout=5_000,
                     )
                 except Exception:
                     pass
@@ -299,20 +301,24 @@ def _playwright_worker_main() -> None:
 
 
 def _ensure_playwright_worker() -> None:
-    global _pw_queue, _pw_worker
-    if _pw_worker is not None and _pw_worker.is_alive():
-        return
+    global _pw_queue
     with _pw_worker_lock:
-        if _pw_worker is not None and _pw_worker.is_alive():
-            return
-        _pw_queue = queue.Queue()
-        _pw_worker = threading.Thread(
-            target=_playwright_worker_main,
-            name="playwright-worker",
-            daemon=True,
-        )
-        _pw_worker.start()
-        _log.info("playwright worker thread started")
+        if _pw_queue is None:
+            _pw_queue = queue.Queue()
+        alive = [w for w in _pw_workers if w.is_alive()]
+        _pw_workers[:] = alive
+        while len(_pw_workers) < PLAYWRIGHT_WORKERS:
+            t = threading.Thread(
+                target=_playwright_worker_main,
+                name=f"playwright-worker-{len(_pw_workers)}",
+                daemon=True,
+            )
+            t.start()
+            _pw_workers.append(t)
+            _log.info(
+                "playwright worker thread started  pool=%d/%d",
+                len(_pw_workers), PLAYWRIGHT_WORKERS,
+            )
 
 
 def playwright_fetch(url: str) -> str:
@@ -351,13 +357,16 @@ def playwright_fetch_html(url: str) -> tuple[str, str]:
     return "", url
 
 
+HTTPX_FETCH_TIMEOUT = 10
+
+
 def _scrape_with_httpx(url: str) -> str:
     started = time.time()
     resp = None
     try:
         resp = httpx.get(
             url,
-            timeout=60,
+            timeout=HTTPX_FETCH_TIMEOUT,
             follow_redirects=True,
             headers=BROWSER_HEADERS,
         )
@@ -367,7 +376,7 @@ def _scrape_with_httpx(url: str) -> str:
         if "ssl" in err_str or "certificate" in err_str or "verify" in err_str:
             _log.warning("scrape ssl error, retrying without verification  url=%s", url[:80])
             try:
-                resp = httpx.get(url, timeout=60, follow_redirects=True, headers=BROWSER_HEADERS, verify=False)
+                resp = httpx.get(url, timeout=HTTPX_FETCH_TIMEOUT, follow_redirects=True, headers=BROWSER_HEADERS, verify=False)
                 resp.raise_for_status()
             except Exception as e2:
                 _log.warning("scrape ssl retry also failed  url=%s: %s", url[:80], e2)
@@ -379,7 +388,7 @@ def _scrape_with_httpx(url: str) -> str:
         _log.warning("scrape %d  url=%s (%s)", e.response.status_code, url[:80], e.response.reason_phrase)
         return ""
     except httpx.TimeoutException:
-        _log.warning("scrape timeout after 60s  url=%s", url[:80])
+        _log.warning("scrape timeout after %ds  url=%s", HTTPX_FETCH_TIMEOUT, url[:80])
         return ""
     except Exception as e:
         _log.warning("scrape failed  url=%s: %s (%s)", url[:80], type(e).__name__, e)

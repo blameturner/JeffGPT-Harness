@@ -28,6 +28,12 @@ STANDARD_QUERY_CAP = 3
 RELEVANCE_KEYWORD_THRESHOLD = 0.16
 RELEVANCE_MIN_ABS_HITS = 2
 RELEVANCE_MIN_KEEP = 4
+# Per-URL hard cap: httpx (10s) + playwright fallback (25s) worst-case is ~35s;
+# we cut the tail at 28s so one stuck URL can never stall its whole tier.
+SCRAPE_DEADLINE_S = 28
+# basic mode only: if SearXNG's snippet is already this long, skip the fetch
+# and summarise the snippet directly — trades a little depth for a lot of speed.
+BASIC_SNIPPET_DIRECT_MIN_CHARS = 400
 
 
 def _cfg_int(key: str, default: int) -> int:
@@ -141,9 +147,14 @@ async def _scrape_one(item: dict, extract_cap: int) -> dict:
 
     meta: dict = {}
     try:
-        text = await asyncio.to_thread(
-            scrape_page, url, snippet, None, meta,
+        text = await asyncio.wait_for(
+            asyncio.to_thread(scrape_page, url, snippet, None, meta),
+            timeout=SCRAPE_DEADLINE_S,
         )
+    except asyncio.TimeoutError:
+        _log.warning("scrape deadline exceeded (%ds)  url=%s", SCRAPE_DEADLINE_S, url[:80])
+        text = snippet
+        meta["path"] = "deadline"
     except Exception as e:
         _log.warning("scrape_page raised for %s: %s", url, e)
         text = snippet
@@ -429,54 +440,70 @@ async def execute(params: dict, emit) -> ToolResult:
     priority_candidates = results[:priority_urls]
     supplementary_candidates = results[priority_urls:]
 
-    priority_scraped, supplementary_scraped = await asyncio.gather(
-        asyncio.gather(*[_scrape_one(r, priority_cap) for r in priority_candidates]),
-        asyncio.gather(*[_scrape_one(r, supp_cap) for r in supplementary_candidates]),
-    )
-    touch_chat_activity()
-    priority_scraped = list(priority_scraped)
-    supplementary_scraped = list(supplementary_scraped)
-    scraped = priority_scraped + supplementary_scraped
-
     # Focus hint for every summariser call — cap so long fan-outs don't bloat prompts.
     query_str = " | ".join(queries)[:160]
 
-    priority_with_text = [s for s in priority_scraped if s["text"] and len(s["text"]) >= 100]
-    supp_with_text = [s for s in supplementary_scraped if s["text"] and len(s["text"]) >= 100]
-    snippet_only = [
-        s for s in scraped
-        if s["text"] and s not in priority_with_text and s not in supp_with_text
-    ]
+    # basic-mode shortcut: if SearXNG already gave us a substantial snippet for a
+    # supplementary URL, skip the fetch entirely and feed the snippet to the batch
+    # summariser. Cuts N httpx/Playwright round-trips out of the supp tier.
+    supp_direct: list[dict] = []
+    supp_to_fetch: list[dict] = supplementary_candidates
+    if mode == "basic":
+        supp_direct = []
+        supp_to_fetch = []
+        for r in supplementary_candidates:
+            snip = (r.get("snippet") or "").strip()
+            if len(snip) >= BASIC_SNIPPET_DIRECT_MIN_CHARS:
+                supp_direct.append({
+                    "url": r["url"],
+                    "title": r.get("title") or r["url"],
+                    "text": snip[:supp_cap],
+                    "path": "snippet_direct",
+                })
+            else:
+                supp_to_fetch.append(r)
+        if supp_direct:
+            _log.info(
+                "basic snippet-direct  skipped_fetch=%d fetching=%d",
+                len(supp_direct), len(supp_to_fetch),
+            )
 
-    # Priority and supplementary summarisation run in parallel: with
-    # MODEL_PARALLEL_SLOTS≥2 on the summariser role, this overlaps wall-clock
-    # time for the two tiers instead of serialising them.
-    async def _do_priority() -> list[dict]:
-        if not priority_with_text:
-            return []
-        # sem=1 so priority pages don't both grab slots while supp is also
-        # waiting — leaves room for the batch call to interleave.
-        _pri_sem = asyncio.Semaphore(1)
-
-        async def _bounded_one(p):
-            async with _pri_sem:
-                return await _summarise_one(p["url"], p["text"], query_str)
-
-        return list(await asyncio.gather(
-            *[_bounded_one(p) for p in priority_with_text]
+    # Each tier runs scrape → summarise as a unit, and the two tiers run in
+    # parallel. This means priority summarisation can start the moment the 2
+    # priority pages have scraped, without waiting for the supp tier's fetches.
+    async def _priority_tier() -> tuple[list[dict], list[dict], list[dict]]:
+        if not priority_candidates:
+            return [], [], []
+        scraped_t = list(await asyncio.gather(
+            *[_scrape_one(r, priority_cap) for r in priority_candidates]
         ))
+        with_text = [s for s in scraped_t if s["text"] and len(s["text"]) >= 100]
+        if not with_text:
+            return scraped_t, [], []
+        # Only 2 priority pages by default — run them fully in parallel.
+        summaries = list(await asyncio.gather(
+            *[_summarise_one(p["url"], p["text"], query_str) for p in with_text]
+        ))
+        return scraped_t, with_text, summaries
 
-    async def _do_supplementary() -> list[dict]:
-        if not supp_with_text:
-            return []
+    async def _supp_tier() -> tuple[list[dict], list[dict], list[dict]]:
+        fetched = list(await asyncio.gather(
+            *[_scrape_one(r, supp_cap) for r in supp_to_fetch]
+        )) if supp_to_fetch else []
+        scraped_t = supp_direct + fetched
+        with_text = [s for s in scraped_t if s["text"] and len(s["text"]) >= 100]
+        if not with_text:
+            return scraped_t, [], []
         batch_cfg = get_function_config("web_search_summarise_batch")
         batch_max_input = batch_cfg.get("max_input_chars", 14000)
-        batches = _build_batches(supp_with_text, batch_max_input, batch_target)
+        batches = _build_batches(with_text, batch_max_input, batch_target)
         _log.info(
             "summarise batches=%d pages=%d target=%d",
-            len(batches), len(supp_with_text), batch_target,
+            len(batches), len(with_text), batch_target,
         )
-        _sem = asyncio.Semaphore(1)
+        # Sem=2 so batches can overlap; the priority tier runs on its own
+        # anyway, so there's nothing to starve.
+        _sem = asyncio.Semaphore(2)
 
         async def _bounded_batch(batch):
             async with _sem:
@@ -486,11 +513,17 @@ async def execute(params: dict, emit) -> ToolResult:
         out: list[dict] = []
         for br in batch_results:
             out.extend(br)
-        return out
+        return scraped_t, with_text, out
 
-    priority_summaries, supp_summaries = await asyncio.gather(
-        _do_priority(), _do_supplementary(),
-    )
+    (
+        (priority_scraped, priority_with_text, priority_summaries),
+        (supplementary_scraped, supp_with_text, supp_summaries),
+    ) = await asyncio.gather(_priority_tier(), _supp_tier())
+    touch_chat_activity()
+
+    scraped = priority_scraped + supplementary_scraped
+    summarised_set = {id(s) for s in priority_with_text} | {id(s) for s in supp_with_text}
+    snippet_only = [s for s in scraped if s["text"] and id(s) not in summarised_set]
 
     snippet_summaries = [
         {"summary": s["text"][:max_summary], "relevance": "low", "source_type": "snippet"}
@@ -524,8 +557,8 @@ async def execute(params: dict, emit) -> ToolResult:
     counts = {
         "queries": len(queries),
         "urls": len(results),
-        "scraped_ok": len([s for s in scraped if s["text"] and s["path"] not in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
-        "snippet_only": len([s for s in scraped if s["path"] in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed")]),
+        "scraped_ok": len([s for s in scraped if s["text"] and s["path"] not in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed", "snippet_direct", "deadline", "error")]),
+        "snippet_only": len([s for s in scraped if s["path"] in ("snippet", "fallback", "pdf_failed", "playwright_auto_failed", "snippet_direct", "deadline", "error")]),
         "summarised": len(priority_with_text) + len(supp_with_text),
         "chars": len(combined),
     }

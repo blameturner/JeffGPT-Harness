@@ -26,7 +26,7 @@ class ChatRequest(BaseModel):
     rag_collection: str | None = None
     knowledge_enabled: bool | None = None
     response_style: str | None = None
-    search_mode: Literal["disabled", "basic", "standard"] = "standard"
+    search_mode: Literal["disabled", "basic", "standard"] = "basic"
     search_consent_confirmed: bool = False
 
 

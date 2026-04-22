@@ -147,9 +147,9 @@ class ChatAgent(BaseAgent):
         tool_context: ToolContext = ToolContext()
         search_result = SearchPhaseResult()
 
-        search_mode = (getattr(self, "_search_mode", "standard") or "standard").lower()
+        search_mode = (getattr(self, "_search_mode", "basic") or "basic").lower()
         if search_mode not in ("disabled", "basic", "standard"):
-            search_mode = "standard"
+            search_mode = "basic"
         web_search_enabled = is_feature_enabled("web_search") and search_mode != "disabled"
 
         if TOOLS_FRAMEWORK_ENABLED and web_search_enabled:
