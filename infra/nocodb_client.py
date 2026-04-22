@@ -204,8 +204,18 @@ class NocodbClient:
         return self._patch("conversations", conversation_id, {"Id": conversation_id, **data})
 
     def list_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
+        # Exclude the home dashboard's rolling conversation — it's surfaced
+        # via /home/overview, not the chat list. `kind` is the new column;
+        # the title check is a fallback until every env has `kind` populated.
+        # Strings duplicated from shared/home_conversation.py (HOME_KIND,
+        # HOME_TITLE) to avoid a circular import.
+        where = (
+            f"(org_id,eq,{org_id})"
+            f"~and(kind,neq,home)"
+            f"~and(title,neq,Home — ongoing)"
+        )
         return self._get_paginated("conversations", params={
-            "where": f"(org_id,eq,{org_id})",
+            "where": where,
             "sort": "-CreatedAt",
             "limit": limit,
         })
