@@ -202,7 +202,7 @@ def run_digest_now(body: DigestRunRequest):
         raise HTTPException(status_code=503, detail="tool queue unavailable")
     job_id = tq.submit(
         "daily_digest",
-        {"org_id": body.org_id},
+        {"org_id": body.org_id, "bypass_idle": True},
         source="home_manual",
         org_id=body.org_id,
     )

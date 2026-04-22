@@ -2,12 +2,12 @@
 
 Once per day, pull the last 24h of completed `scrape_targets` for a single
 org, cluster by domain, summarise each cluster with `model_call("daily_digest",
-...)`, and emit three artefacts:
+...)`, and emit two artefacts:
 
-  1. Markdown file at `{DIGEST_DIR}/{org_id}/YYYY-MM-DD.md` — human-readable.
-  2. A row in the `daily_digests` NocoDB table (best-effort; skipped if the
-     table doesn't exist yet) indexing the file for UI enumeration.
-  3. A Chroma embedding in the `daily_digests` collection so the digest is
+  1. A row in the `daily_digests` NocoDB table with the rendered markdown
+     stored inline in the ``markdown`` column (best-effort; skipped if the
+     table doesn't exist yet).
+  2. A Chroma embedding in the `daily_digests` collection so the digest is
      recallable via the existing RAG path.
 
 Single-org per tick (same pattern as the enrichment dispatchers); no fan-out.
@@ -15,10 +15,8 @@ Single-org per tick (same pattern as the enrichment dispatchers); no fan-out.
 from __future__ import annotations
 
 import logging
-import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from infra.config import get_feature, get_function_config, is_feature_enabled
 from infra.memory import remember
@@ -28,7 +26,6 @@ from tools._org import resolve_org_id
 
 _log = logging.getLogger("digest")
 
-DEFAULT_DIGEST_DIR = os.getenv("DIGEST_DIR", "/app/data/digests")
 DEFAULT_FUNCTION = "daily_digest"
 DIGESTS_TABLE = "daily_digests"
 
@@ -168,16 +165,7 @@ def _render_markdown(org_id: int, date_str: str, clusters: dict[str, list[dict]]
     return "\n".join(parts)
 
 
-def _write_markdown(org_id: int, date_str: str, markdown: str) -> Path:
-    base = Path(_cfg("dir", DEFAULT_DIGEST_DIR)).expanduser()
-    org_dir = base / str(org_id)
-    org_dir.mkdir(parents=True, exist_ok=True)
-    out = org_dir / f"{date_str}.md"
-    out.write_text(markdown, encoding="utf-8")
-    return out
-
-
-def _persist_row(client: NocodbClient, org_id: int, date_str: str, path: Path,
+def _persist_row(client: NocodbClient, org_id: int, date_str: str, markdown: str,
                  cluster_count: int, source_count: int) -> int | None:
     if DIGESTS_TABLE not in client.tables:
         _log.info("daily_digests table absent — skipping NocoDB index write")
@@ -186,7 +174,7 @@ def _persist_row(client: NocodbClient, org_id: int, date_str: str, path: Path,
         row = client._post(DIGESTS_TABLE, {
             "org_id": org_id,
             "digest_date": date_str,
-            "markdown_path": str(path),
+            "markdown": markdown,
             "cluster_count": cluster_count,
             "source_count": source_count,
         })
@@ -233,14 +221,13 @@ def daily_digest_job(payload: dict | None = None) -> dict:
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     markdown = _render_markdown(org_id, date_str, clusters, cluster_texts)
-    path = _write_markdown(org_id, date_str, markdown)
     source_count = sum(len(v) for v in clusters.values())
-    nocodb_id = _persist_row(client, org_id, date_str, path, len(clusters), source_count)
+    nocodb_id = _persist_row(client, org_id, date_str, markdown, len(clusters), source_count)
     embedded = _embed_digest(org_id, date_str, markdown)
 
     _log.info(
-        "daily_digest done  org_id=%d date=%s clusters=%d sources=%d path=%s embedded=%d",
-        org_id, date_str, len(clusters), source_count, path, embedded,
+        "daily_digest done  org_id=%d date=%s clusters=%d sources=%d nocodb_id=%s embedded=%d",
+        org_id, date_str, len(clusters), source_count, nocodb_id, embedded,
     )
     return {
         "status": "ok",
@@ -248,7 +235,6 @@ def daily_digest_job(payload: dict | None = None) -> dict:
         "date": date_str,
         "clusters": len(clusters),
         "sources": source_count,
-        "path": str(path),
         "nocodb_id": nocodb_id,
         "embedded_chunks": embedded,
     }
