@@ -27,6 +27,7 @@ def build_chat_payload(
     search_note: str,
     rag_context: str,
     search_status: str = "",
+    graph_context: str = "",
 ) -> list[dict]:
     payload: list[dict] = []
     payload.append({"role": "system", "content": BASE_SYSTEM_PROMPT})
@@ -45,6 +46,16 @@ def build_chat_payload(
                 "The following context was retrieved from this "
                 "conversation's memory. Use it where relevant.\n\n"
                 f"{rag_context}"
+            ),
+        })
+    if graph_context:
+        payload.append({
+            "role": "system",
+            "content": (
+                "The following facts come from the user's knowledge graph. "
+                "Treat them as established context; cite them when relevant. "
+                "Format edges as `(A) -[REL]-> (B)` when referring back.\n\n"
+                f"{graph_context}"
             ),
         })
     # style last so formatting instructions sit closest to history

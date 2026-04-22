@@ -177,7 +177,40 @@
       "default_chat_model": "chat",
       "email": { "enabled": false },
       "calendar": { "enabled": false },
-      "graph": { "enabled": false }
+      "graph": { "enabled": true }
+    },
+    "surfacing": {
+      "enabled": false,
+      "email_to": ""
+    },
+    "graph_maintenance": {
+      "enabled": true,
+      "entity_resolution_interval_hours": 24,
+      "maintenance_interval_hours": 168,
+      "entity_scan_limit": 500,
+      "max_merges_per_run": 25,
+      "max_pairs_per_label": 20,
+      "alias_similarity_threshold": 0.72,
+      "alias_confidence_floor": 0.75,
+      "decay_factor": 0.9,
+      "drop_below_weight": 0.2,
+      "co_occurrence_min": 2,
+      "co_occurrence_limit": 40,
+      "models": {
+        "graph_alias_judge": { "role": "t3_tool", "temperature": 0.0, "max_tokens": 150, "max_input_chars": 2000 }
+      }
+    },
+    "insights": {
+      "enabled": true,
+      "tick_minutes": 10,
+      "chat_idle_hours": 2,
+      "fallback_hours": 12,
+      "auto_research": true,
+      "models": {
+        "insight_topic_picker": { "role": "t3_tool",    "temperature": 0.3, "max_tokens": 500,  "max_input_chars": 6000 },
+        "insight_synthesis":    { "role": "t1_primary", "temperature": 0.3, "max_tokens": 3500, "max_input_chars": 28000 },
+        "insight_ack":          { "role": "exp_rwkv_r", "temperature": 0.4, "max_tokens": 120,  "max_input_chars": 1500 }
+      }
     },
     "tool_queue": {
       "background_chat_idle_seconds": 30,

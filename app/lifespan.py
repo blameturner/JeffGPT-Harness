@@ -44,6 +44,11 @@ async def lifespan(app: FastAPI):
     from tools.digest.agent import daily_digest_job
     from tools.seed_feedback.agent import seed_feedback_job
     from tools.corpus_maintenance.agent import corpus_maintenance_job
+    from tools.insight.agent import insight_produce_job
+    from tools.graph_maintenance.agent import (
+        graph_maintenance_job,
+        graph_resolve_entities_job,
+    )
     tool_queue = ToolJobQueue()
     # Priority tiers (lower = picked first):
     #   3 = graph_extract, research planner + agent
@@ -91,6 +96,18 @@ async def lifespan(app: FastAPI):
     tool_queue.register("corpus_maintenance", HandlerConfig(
         handler=corpus_maintenance_job,
         max_workers=1, priority_default=5, source="corpus_maintenance",
+    ))
+    tool_queue.register("insight_produce", HandlerConfig(
+        handler=insight_produce_job,
+        max_workers=1, priority_default=5, source="insight",
+    ))
+    tool_queue.register("graph_resolve_entities", HandlerConfig(
+        handler=graph_resolve_entities_job,
+        max_workers=1, priority_default=5, source="graph_maintenance",
+    ))
+    tool_queue.register("graph_maintenance", HandlerConfig(
+        handler=graph_maintenance_job,
+        max_workers=1, priority_default=5, source="graph_maintenance",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue
@@ -169,6 +186,41 @@ async def lifespan(app: FastAPI):
                 replace_existing=True,
             )
             _log.info("seed_feedback dispatcher scheduled  every=%dh", seed_hours)
+
+        if get_feature("graph_maintenance", "enabled", True):
+            er_hours = int(get_feature("graph_maintenance", "entity_resolution_interval_hours", 24))
+            gm_hours = int(get_feature("graph_maintenance", "maintenance_interval_hours", 168))
+            from tools.graph_maintenance.dispatcher import (
+                jumpstart_entity_resolution,
+                jumpstart_graph_maintenance,
+            )
+            sched.add_job(
+                jumpstart_entity_resolution,
+                IntervalTrigger(hours=max(1, er_hours)),
+                id="graph_entity_resolution_dispatcher",
+                max_instances=1, coalesce=True, replace_existing=True,
+            )
+            sched.add_job(
+                jumpstart_graph_maintenance,
+                IntervalTrigger(hours=max(1, gm_hours)),
+                id="graph_maintenance_dispatcher",
+                max_instances=1, coalesce=True, replace_existing=True,
+            )
+            _log.info("graph maintenance scheduled  entity_res=%dh maintenance=%dh",
+                      er_hours, gm_hours)
+
+        if get_feature("insights", "enabled", True):
+            insight_tick_minutes = int(get_feature("insights", "tick_minutes", 10))
+            from tools.insight.dispatcher import jumpstart_insights
+            sched.add_job(
+                jumpstart_insights,
+                IntervalTrigger(minutes=max(1, insight_tick_minutes)),
+                id="insight_dispatcher",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            _log.info("insight dispatcher scheduled  tick=%dm", insight_tick_minutes)
 
         if get_feature("corpus_maintenance", "enabled", True):
             maint_hours = int(get_feature("corpus_maintenance", "run_interval_hours", 12))

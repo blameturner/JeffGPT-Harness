@@ -155,6 +155,60 @@ def mark_answered(
         _log.warning("mark_answered failed  id=%s", question_id, exc_info=True)
 
 
+def mark_pending(question_id: int) -> None:
+    """Revert an answered question to pending (undo / retract)."""
+    client = NocodbClient()
+    if not _table_present(client):
+        return
+    try:
+        client._patch(NOCODB_TABLE_ASSISTANT_QUESTIONS, int(question_id), {
+            "status": STATUS_PENDING,
+            "answer_selected_option": "",
+            "answer_text": "",
+            "answered_at": None,
+        })
+        _log.info("question retracted  id=%s", question_id)
+    except Exception:
+        _log.warning("mark_pending failed  id=%s", question_id, exc_info=True)
+
+
+def render_answer(question: dict, selected_option: str, answer_text: str) -> str:
+    """Compose the user's answer as a chat message, keeping the structured
+    selection visible to the model."""
+    labels_by_value = {
+        str(o.get("value") or ""): str(o.get("label") or "")
+        for o in (question.get("suggested_options") or [])
+    }
+    label = labels_by_value.get(selected_option, selected_option)
+    lines = [f"(Answering: '{question.get('question_text') or ''}')"]
+    if selected_option:
+        lines.append(f"Selected: {label}")
+    if answer_text:
+        lines.append(answer_text)
+    return "\n".join(lines)
+
+
+def render_provenance(context_ref: str) -> str:
+    """Turn a ``context_ref`` like ``graph_discovery:entity=Postgres`` into a
+    human-readable 'Because …' phrase for the UI. Unknown schemes echo back."""
+    if not context_ref:
+        return ""
+    try:
+        scheme, _, rest = context_ref.partition(":")
+    except Exception:
+        return context_ref
+    if scheme == "graph_discovery" and rest:
+        parts = dict(p.split("=", 1) for p in rest.split(",") if "=" in p)
+        entity = parts.get("entity") or parts.get("topic")
+        if entity:
+            return f"Because you've been working with {entity}"
+    if scheme == "chat_idle" and rest:
+        return "Because the system had idle time to dig deeper"
+    if scheme == "manual":
+        return "You queued this manually"
+    return context_ref
+
+
 def mark_dismissed(question_id: int, reason: str = "") -> None:
     client = NocodbClient()
     if not _table_present(client):
@@ -171,52 +225,72 @@ def mark_dismissed(question_id: int, reason: str = "") -> None:
 
 
 def dispatch_followup(action: str, org_id: int, question_id: int | None = None) -> dict:
-    """Interpret a `followup_action` string and enqueue the matching tool job.
+    """Interpret a ``followup_action`` string and enqueue the matching job.
 
     Supported schemes (v1):
-      - ``enqueue:research:<entity>``  → research_agent job
-      - ``enqueue:scrape:<url>``       → scrape_page job
+      - ``enqueue:research:<topic>``   → creates a research_plans row via
+                                          ``create_research_plan`` which
+                                          itself enqueues the planner
+      - ``enqueue:scrape:<url>``       → writes a ``suggested_scrape_targets``
+                                          row that the enrichment pipeline
+                                          picks up on its next dispatcher tick
       - ``""`` / unknown               → no-op
     """
     if not action:
         return {"status": "noop"}
 
-    try:
-        scheme, _, rest = action.partition(":")
-    except Exception:
-        return {"status": "invalid", "action": action}
-
+    scheme, _, rest = action.partition(":")
     if scheme != "enqueue" or not rest:
-        _log.info("followup unhandled  action=%s", action)
+        _log.warning("followup unhandled action  action=%s", action)
         return {"status": "unhandled", "action": action}
 
     job_type, _, arg = rest.partition(":")
     if not job_type or not arg:
+        _log.warning("followup malformed action  action=%s", action)
         return {"status": "invalid", "action": action}
 
-    try:
-        from workers.tool_queue import get_tool_queue
-    except Exception:
-        _log.warning("tool_queue import failed; followup skipped")
-        return {"status": "queue_unavailable"}
-    tq = get_tool_queue()
-    if not tq:
-        return {"status": "queue_unavailable"}
-
     if job_type == "research":
-        payload = {"topic": arg, "org_id": org_id, "source_question_id": question_id}
-        target_type = "research_planner"
-    elif job_type == "scrape":
-        payload = {"url": arg, "org_id": org_id, "source_question_id": question_id}
-        target_type = "scrape_page"
-    else:
-        _log.info("followup unknown job_type=%s", job_type)
-        return {"status": "unknown_job_type", "job_type": job_type}
+        try:
+            from tools.research.research_planner import create_research_plan
+        except Exception:
+            _log.error("followup research: create_research_plan import failed", exc_info=True)
+            return {"status": "import_failed"}
+        try:
+            result = create_research_plan(arg, org_id=org_id)
+        except Exception as e:
+            _log.error("followup research: create_research_plan failed  topic=%s err=%s", arg, e, exc_info=True)
+            return {"status": "submit_failed", "error": str(e)[:200]}
+        if result.get("status") != "queued":
+            _log.warning("followup research not queued  topic=%s result=%s", arg, result)
+            return {"status": result.get("status") or "failed", "detail": result}
+        _log.info("followup research queued  topic=%s plan_id=%s",
+                  arg, result.get("plan_id"))
+        return {
+            "status": "dispatched",
+            "job_type": "research_planner",
+            "plan_id": result.get("plan_id"),
+            "tool_job_id": result.get("job_id"),
+        }
 
-    try:
-        job_id = tq.submit(target_type, payload, source=f"home_question:{question_id}", org_id=org_id)
-        _log.info("followup dispatched  action=%s job_id=%s", action, job_id)
-        return {"status": "dispatched", "job_type": target_type, "job_id": job_id}
-    except Exception as e:
-        _log.warning("followup submit failed  action=%s err=%s", action, e, exc_info=True)
-        return {"status": "submit_failed", "error": str(e)}
+    if job_type == "scrape":
+        from infra.nocodb_client import NocodbClient
+        client = NocodbClient()
+        if "suggested_scrape_targets" not in client.tables:
+            _log.error("followup scrape: suggested_scrape_targets table missing")
+            return {"status": "table_missing", "table": "suggested_scrape_targets"}
+        try:
+            row = client._post("suggested_scrape_targets", {
+                "url": arg,
+                "org_id": int(org_id),
+                "status": "new",
+                "source": f"home_question:{question_id}" if question_id else "home_question",
+            })
+            _log.info("followup scrape suggested  url=%s row_id=%s", arg, row.get("Id"))
+            return {"status": "dispatched", "job_type": "suggested_scrape_targets",
+                    "row_id": row.get("Id")}
+        except Exception as e:
+            _log.error("followup scrape: write failed  url=%s err=%s", arg, e, exc_info=True)
+            return {"status": "submit_failed", "error": str(e)[:200]}
+
+    _log.warning("followup unknown job_type  job_type=%s", job_type)
+    return {"status": "unknown_job_type", "job_type": job_type}

@@ -5,76 +5,81 @@ Thin wrapper over :class:`workers.chat.agent.ChatAgent` that:
 1. Targets the org's rolling "home" conversation instead of creating a new one.
 2. Prepends today's digest to the system prompt so replies like "tell me more
    about the first cluster" have the digest in scope without the user needing
-   to paste it.
+   to paste it. The preface is cached per-org with a short TTL so chat turns
+   don't repeatedly hit NocoDB + the filesystem.
 3. When ``answer_question_id`` is supplied, hydrates the pending
-   ``assistant_questions`` row, annotates the user turn with the structured
-   answer, and marks the question answered + dispatches its follow-up action
-   after the chat job finishes.
+   ``assistant_questions`` row, then marks the question answered + dispatches
+   its follow-up action after the chat job finishes. Answer flows use a
+   *lightweight* path (no web search, bounded tokens) because the real work
+   is dispatched via ``followup_action``; the chat turn is just the human-
+   readable acknowledgement.
 """
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from infra.config import NOCODB_TABLE_DAILY_DIGESTS, get_feature
+from infra.config import get_feature
 from infra.nocodb_client import NocodbClient
-from shared import home_questions
+from shared import digest_reader, home_questions
 from shared.home_conversation import get_or_create_home_conversation
 from shared.jobs import STORE
 from workers.chat.agent import ChatAgent
 
 _log = logging.getLogger("home.chat")
 
-
-def _latest_digest(client: NocodbClient, org_id: int) -> dict | None:
-    if NOCODB_TABLE_DAILY_DIGESTS not in client.tables:
-        return None
-    try:
-        rows = client._get_paginated(NOCODB_TABLE_DAILY_DIGESTS, params={
-            "where": f"(org_id,eq,{org_id})",
-            "sort": "-digest_date",
-            "limit": 1,
-        })
-    except Exception:
-        _log.debug("daily_digests fetch failed  org=%d", org_id, exc_info=True)
-        return None
-    return rows[0] if rows else None
-
-
-def _read_digest_markdown(row: dict | None) -> str:
-    if not row:
-        return ""
-    path = (row.get("markdown_path") or "").strip()
-    if not path:
-        return ""
-    try:
-        p = Path(path).expanduser()
-        if p.is_file():
-            return p.read_text(encoding="utf-8")
-    except Exception:
-        _log.debug("digest markdown read failed  path=%s", path, exc_info=True)
-    return ""
+_PREFACE_CACHE_TTL_S = 300
+_preface_cache: dict[int, tuple[float, str]] = {}
+_preface_lock = threading.Lock()
 
 
 def _build_digest_preface(org_id: int) -> str:
-    """Return a system-prompt preface containing today's digest (truncated),
-    or empty string if no digest is available."""
+    now = time.time()
+    with _preface_lock:
+        hit = _preface_cache.get(org_id)
+        if hit and now - hit[0] < _PREFACE_CACHE_TTL_S:
+            return hit[1]
+
     client = NocodbClient()
-    row = _latest_digest(client, org_id)
-    markdown = _read_digest_markdown(row)
+    row = digest_reader.latest_digest(client, org_id)
+    markdown, _ = digest_reader.read_markdown(row)
     if not markdown:
-        return ""
-    cap = int(get_feature("home", "digest_preface_chars", 2000))
-    snippet = markdown[:cap]
-    date_str = (row or {}).get("digest_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return (
-        "You are replying inside the user's HOME dashboard. The user may be "
-        "responding to the daily digest below. Ground your answer in it when "
-        "relevant; otherwise treat the reply as ordinary conversation.\n\n"
-        f"--- DAILY DIGEST ({date_str}) ---\n{snippet}\n--- END DIGEST ---"
-    )
+        preface = ""
+    else:
+        cap = int(get_feature("home", "digest_preface_chars", 2000))
+        snippet = markdown[:cap]
+        date_str = (row or {}).get("digest_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        preface = (
+            "You are replying inside the user's HOME dashboard. The user may be "
+            "responding to the daily digest below. Ground your answer in it when "
+            "relevant; otherwise treat the reply as ordinary conversation.\n\n"
+            f"--- DAILY DIGEST ({date_str}) ---\n{snippet}\n--- END DIGEST ---"
+        )
+
+    with _preface_lock:
+        _preface_cache[org_id] = (now, preface)
+    return preface
+
+
+def invalidate_digest_preface(org_id: int | None = None) -> None:
+    """Called when a new digest lands so the next chat turn sees it."""
+    with _preface_lock:
+        if org_id is None:
+            _preface_cache.clear()
+        else:
+            _preface_cache.pop(org_id, None)
+
+
+_ACK_SYSTEM = (
+    "You are acknowledging the user's answer to a structured question on their "
+    "HOME dashboard. The backend has already dispatched any follow-up work. "
+    "Reply in ONE short sentence confirming you got their answer and naming "
+    "the follow-up that will happen, if any. Do not restate the question. "
+    "Do not offer to do more work."
+)
 
 
 def run_home_turn(
@@ -90,22 +95,29 @@ def run_home_turn(
     search_consent_confirmed: bool = False,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    lightweight: bool = False,
 ) -> None:
-    """Run a single home-conversation turn. Matches the shape of
-    :meth:`ChatAgent.run_job` so it can be invoked via ``run_in_background``."""
+    """Run a single home-conversation turn.
+
+    Set ``lightweight=True`` for answer-acknowledgement flows: disables web
+    search, bounds max_tokens, and switches to a terse system prompt.
+    """
     convo = get_or_create_home_conversation(org_id, model=model)
 
     question: dict[str, Any] | None = None
     if answer_question_id:
         question = home_questions.get_question(int(answer_question_id))
         if not question:
-            STORE.append(job, {
-                "type": "error",
-                "message": f"question {answer_question_id} not found",
-            })
+            STORE.append(job, {"type": "error", "message": f"question {answer_question_id} not found"})
             return
 
-    system_preface = _build_digest_preface(org_id)
+    if lightweight:
+        search_mode = "disabled"
+        if max_tokens is None:
+            max_tokens = 200
+        system_preface = _ACK_SYSTEM
+    else:
+        system_preface = _build_digest_preface(org_id)
 
     agent = ChatAgent(
         model=model,
@@ -115,8 +127,8 @@ def run_home_turn(
     agent._search_mode = search_mode
 
     _log.info(
-        "home turn  org=%d conv=%s question=%s digest_preface=%d",
-        org_id, convo.get("Id"), answer_question_id, len(system_preface),
+        "home turn  org=%d conv=%s question=%s lightweight=%s preface=%d",
+        org_id, convo.get("Id"), answer_question_id, lightweight, len(system_preface),
     )
 
     try:

@@ -131,10 +131,18 @@ def _salvage_json_array(text: str) -> list | None:
     return None
 
 
-def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
+def _extract_relationships(
+    text: str,
+    org_id: int,
+    conversation_id: int | None = None,
+    source_chunk_id: str | None = None,
+) -> tuple[int, int]:
     cfg = get_function_config("relationships")
     max_input = cfg.get("max_input_chars", 8000)
-    _log.debug("extracting relationships  org=%d text_len=%d max_input=%d", org_id, len(text), max_input)
+    _log.debug(
+        "extracting relationships  org=%d text_len=%d max_input=%d conv=%s chunk=%s",
+        org_id, len(text), max_input, conversation_id, source_chunk_id,
+    )
     prompt = _RELATIONSHIP_EXTRACTION_PROMPT.format(
         content=text[:max_input],
     )
@@ -166,6 +174,8 @@ def _extract_relationships(text: str, org_id: int) -> tuple[int, int]:
                 relationship=str(t["relationship"]),
                 to_type=str(t["to_type"]),
                 to_name=str(t["to_name"]),
+                conversation_id=conversation_id,
+                source_chunk_id=source_chunk_id,
             )
             written += 1
         except Exception:

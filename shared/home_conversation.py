@@ -35,7 +35,7 @@ def _find_home(client: NocodbClient, org_id: int) -> dict | None:
     except Exception:
         # `kind` column may not exist yet — fall back to title match so the
         # helper stays functional while the NocoDB column is being added.
-        _log.debug("home lookup by kind failed, trying title", exc_info=True)
+        _log.info("home lookup by kind failed, trying title", exc_info=True)
         try:
             rows = client._get_paginated(NOCODB_TABLE_CONVERSATIONS, params={
                 "where": f"(org_id,eq,{org_id})~and(title,eq,{HOME_TITLE})",
@@ -79,12 +79,23 @@ def get_or_create_home_conversation(org_id: int, model: str | None = None) -> di
         )
 
 
-def home_conversation_summary(org_id: int) -> dict[str, Any] | None:
-    """Compact summary for the overview payload."""
+def home_conversation_summary(org_id: int, lazy_create: bool = True) -> dict[str, Any] | None:
+    """Compact summary for the overview payload.
+
+    ``lazy_create=True`` (default) creates the home conversation on first
+    read so the frontend never sees a null panel just because the user
+    hasn't spoken yet.
+    """
     client = NocodbClient()
     convo = _find_home(client, org_id)
     if not convo:
-        return None
+        if not lazy_create:
+            return None
+        try:
+            convo = get_or_create_home_conversation(org_id)
+        except Exception:
+            _log.warning("home conversation lazy-create failed  org=%d", org_id, exc_info=True)
+            return None
     last_at: str | None = None
     try:
         msgs = client._get_paginated("messages", params={
@@ -95,7 +106,7 @@ def home_conversation_summary(org_id: int) -> dict[str, Any] | None:
         if msgs:
             last_at = msgs[0].get("CreatedAt")
     except Exception:
-        _log.debug("home last_message lookup failed  conv=%s", convo.get("Id"), exc_info=True)
+        _log.warning("home last_message lookup failed  conv=%s", convo.get("Id"), exc_info=True)
     return {
         "id": convo.get("Id"),
         "title": convo.get("title") or HOME_TITLE,

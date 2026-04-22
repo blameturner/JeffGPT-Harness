@@ -427,6 +427,15 @@ class ChatAgent(BaseAgent):
         _span("summarise_ms", _t)
 
         _t = time.perf_counter()
+        try:
+            from shared.graph_recall import build_graph_context
+            graph_context = build_graph_context(self.org_id, user_message)
+        except Exception:
+            _log.warning("graph_recall failed  conv=%s", conversation_id, exc_info=True)
+            graph_context = ""
+        _span("graph_recall_ms", _t)
+
+        _t = time.perf_counter()
         payload = build_chat_payload(
             history=history,
             user_message=user_message,
@@ -436,6 +445,7 @@ class ChatAgent(BaseAgent):
             search_note=search_note,
             rag_context=rag_context,
             search_status=search_status,
+            graph_context=graph_context,
         )
         _span("payload_build_ms", _t)
 
