@@ -189,9 +189,12 @@ class NocodbClient:
             "knowledge_enabled": 1 if knowledge_enabled else 0,
         })
 
-    def get_conversation(self, conversation_id: int) -> dict | None:
+    def get_conversation(self, conversation_id: int, org_id: int | None = None) -> dict | None:
+        where = f"(Id,eq,{conversation_id})"
+        if org_id is not None:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         data = self._get("conversations", params={
-            "where": f"(Id,eq,{conversation_id})",
+            "where": where,
             "limit": 1
         })
         records = data.get("list", [])
@@ -207,9 +210,12 @@ class NocodbClient:
             "limit": limit,
         })
 
-    def list_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
+    def list_messages(self, conversation_id: int, limit: int = 500, org_id: int | None = None) -> list[dict]:
+        where = f"(conversation_id,eq,{conversation_id})"
+        if org_id is not None:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         return self._get_paginated("messages", params={
-            "where": f"(conversation_id,eq,{conversation_id})",
+            "where": where,
             "sort": "CreatedAt",
             "limit": limit,
         })
@@ -289,12 +295,19 @@ class NocodbClient:
                 _log.error("message_search_sources write failed  msg=%d idx=%d", message_id, i, exc_info=True)
         return rows
 
-    def list_message_search_sources(self, message_id: int | None = None, conversation_id: int | None = None) -> list[dict]:
+    def list_message_search_sources(
+        self,
+        message_id: int | None = None,
+        conversation_id: int | None = None,
+        org_id: int | None = None,
+    ) -> list[dict]:
         parts = []
         if message_id is not None:
             parts.append(f"(message_id,eq,{message_id})")
         if conversation_id is not None:
             parts.append(f"(conversation_id,eq,{conversation_id})")
+        if org_id is not None:
+            parts.append(f"(org_id,eq,{int(org_id)})")
         params: dict = {"sort": "source_index", "limit": 500}
         if parts:
             params["where"] = "~and".join(parts)
@@ -318,9 +331,12 @@ class NocodbClient:
             "knowledge_enabled": 1 if knowledge_enabled else 0,
         })
 
-    def get_code_conversation(self, conversation_id: int) -> dict | None:
+    def get_code_conversation(self, conversation_id: int, org_id: int | None = None) -> dict | None:
+        where = f"(Id,eq,{conversation_id})"
+        if org_id is not None:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         data = self._get("code_conversations", params={
-            "where": f"(Id,eq,{conversation_id})",
+            "where": where,
             "limit": 1,
         })
         records = data.get("list", [])
@@ -336,9 +352,12 @@ class NocodbClient:
             "limit": limit,
         })
 
-    def list_code_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
+    def list_code_messages(self, conversation_id: int, limit: int = 500, org_id: int | None = None) -> list[dict]:
+        where = f"(conversation_id,eq,{conversation_id})"
+        if org_id is not None:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         return self._get_paginated("code_messages", params={
-            "where": f"(conversation_id,eq,{conversation_id})",
+            "where": where,
             "sort": "CreatedAt",
             "limit": limit,
         })
@@ -374,29 +393,41 @@ class NocodbClient:
             payload["response_style"] = response_style
         return self._post("code_messages", payload)
 
-    def _list_by_conversation(self, table: str, conversation_id: int, limit: int = 200) -> list[dict]:
+    def _list_by_conversation(
+        self,
+        table: str,
+        conversation_id: int,
+        limit: int = 200,
+        org_id: int | None = None,
+    ) -> list[dict]:
         try:
+            where = f"(conversation_id,eq,{conversation_id})"
+            if org_id is not None:
+                where = f"{where}~and(org_id,eq,{int(org_id)})"
             return self._get_paginated(table, params={
-                "where": f"(conversation_id,eq,{conversation_id})",
+                "where": where,
                 "limit": limit,
             })
         except (requests.HTTPError, KeyError):
             _log.debug("_list_by_conversation  table=%s conv=%d returned empty (table may lack column)", table, conversation_id)
             return []
 
-    def list_runs_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
-        return self._list_by_conversation("agent_runs", conversation_id, limit)
+    def list_runs_for_conversation(self, conversation_id: int, limit: int = 200, org_id: int | None = None) -> list[dict]:
+        return self._list_by_conversation("agent_runs", conversation_id, limit, org_id=org_id)
 
-    def list_outputs_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
-        return self._list_by_conversation("agent_outputs", conversation_id, limit)
+    def list_outputs_for_conversation(self, conversation_id: int, limit: int = 200, org_id: int | None = None) -> list[dict]:
+        return self._list_by_conversation("agent_outputs", conversation_id, limit, org_id=org_id)
 
-    def list_tasks_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
-        return self._list_by_conversation("tasks", conversation_id, limit)
+    def list_tasks_for_conversation(self, conversation_id: int, limit: int = 200, org_id: int | None = None) -> list[dict]:
+        return self._list_by_conversation("tasks", conversation_id, limit, org_id=org_id)
 
-    def list_observations_for_conversation(self, conversation_id: int, limit: int = 200) -> list[dict]:
+    def list_observations_for_conversation(self, conversation_id: int, limit: int = 200, org_id: int | None = None) -> list[dict]:
         try:
+            where = f"(conversation_id,eq,{conversation_id})"
+            if org_id is not None:
+                where = f"{where}~and(org_id,eq,{int(org_id)})"
             return self._get_paginated("observations", params={
-                "where": f"(conversation_id,eq,{conversation_id})",
+                "where": where,
                 "limit": limit,
             })
         except requests.HTTPError:

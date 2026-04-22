@@ -459,7 +459,7 @@ class ToolJobQueue:
         job_type: str,
         payload: dict,
         source: str = "",
-        org_id: int = 1,
+        org_id: int | None = None,
         priority: int | None = None,
         depends_on: str = "",
     ) -> str:
@@ -468,7 +468,9 @@ class ToolJobQueue:
             raise ValueError(f"unknown job type: {job_type}")
 
         payload_org = payload.get("org_id") if isinstance(payload, dict) else None
-        org_id = resolve_org_id(org_id if org_id else payload_org)
+        org_id = resolve_org_id(org_id if org_id else payload_org, fallback=0)
+        if org_id <= 0:
+            raise ValueError(f"missing org_id for job type: {job_type}")
 
         if config.dedup_key and not depends_on:
             dedup_val = payload.get(config.dedup_key, "")
@@ -512,7 +514,7 @@ class ToolJobQueue:
                 job_type=item.get("type", "scrape"),
                 payload=item.get("payload", {}),
                 source=item.get("source", ""),
-                org_id=item.get("org_id", 1),
+                org_id=item.get("org_id"),
                 priority=item.get("priority"),
                 depends_on=item.get("depends_on", ""),
             )

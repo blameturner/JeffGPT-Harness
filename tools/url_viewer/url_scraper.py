@@ -90,7 +90,7 @@ async def execute(params: dict, emit) -> ToolResult:
 	if isinstance(raw_urls, str):
 		raw_urls = [raw_urls]
 	query_text = str(params.get("query") or "")
-	org_id = resolve_org_id(params.get("_org_id") or params.get("org_id"))
+	org_id = resolve_org_id(params.get("_org_id") or params.get("org_id"), fallback=0)
 
 	urls: list[str] = []
 	for u in raw_urls:

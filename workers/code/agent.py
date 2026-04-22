@@ -251,7 +251,7 @@ class CodeAgent(BaseAgent):
 
     def _load_workspace(self, conversation_id: int) -> list[dict]:
         try:
-            msgs = self.db.list_code_messages(conversation_id)
+            msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
         except Exception as e:
             _log.error("workspace load failed", exc_info=True)
             return []
@@ -327,7 +327,7 @@ class CodeAgent(BaseAgent):
                 return
         else:
             try:
-                convo = self.db.get_code_conversation(conversation_id)
+                convo = self.db.get_code_conversation(conversation_id, org_id=self.org_id)
                 if not convo:
                     emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
                     return
@@ -342,7 +342,7 @@ class CodeAgent(BaseAgent):
                         _log.warning("code conv=%s  background summary wait timed out after %ds", conversation_id, SUMMARY_WAIT_TIMEOUT)
                 history = [
                     {"role": m["role"], "content": m["content"]}
-                    for m in self.db.list_code_messages(conversation_id)
+                    for m in self.db.list_code_messages(conversation_id, org_id=self.org_id)
                 ]
                 if not self.files:
                     self.files = self._load_workspace(conversation_id)
@@ -696,7 +696,7 @@ class CodeAgent(BaseAgent):
                             break
                     if summary_content:
                         try:
-                            existing_msgs = self.db.list_code_messages(conversation_id)
+                            existing_msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
                             existing_id = None
                             for msg in existing_msgs:
                                 if msg.get("role") == "system" and "[Conversation summary]" in (msg.get("content") or ""):

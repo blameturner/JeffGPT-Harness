@@ -46,11 +46,11 @@ def discovery_suggestions_list(org_id: int, status: str | None = "pending", limi
 
 
 @router.post("/discovery/suggestions/{suggested_id}/approve")
-def discovery_suggestion_approve(suggested_id: int):
+def discovery_suggestion_approve(suggested_id: int, org_id: int):
     """User approves a suggested URL. Mark status=approved and enqueue
     pathfinder_extract immediately (bypass idle gate — this is user-initiated)."""
     client = NocodbClient()
-    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id)
+    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, org_id=org_id)
     if not row:
         return {"status": "not_found", "suggested_id": suggested_id}
 
@@ -84,9 +84,9 @@ def discovery_suggestion_approve(suggested_id: int):
 
 
 @router.post("/discovery/suggestions/{suggested_id}/reject")
-def discovery_suggestion_reject(suggested_id: int, reason: str | None = None):
+def discovery_suggestion_reject(suggested_id: int, org_id: int, reason: str | None = None):
     client = NocodbClient()
-    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id)
+    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, org_id=org_id)
     if not row:
         return {"status": "not_found", "suggested_id": suggested_id}
     try:
@@ -156,12 +156,12 @@ def scraper_start(org_id: int | None = None):
 
 
 @router.post("/scrape-targets/{target_id}/run-now")
-def scrape_target_run_now(target_id: int):
+def scrape_target_run_now(target_id: int, org_id: int):
     tq = get_tool_queue()
     if not tq:
         return {"status": "failed", "error": "tool_queue_unavailable"}
 
-    row = _get_single_row(NocodbClient(), "scrape_targets", target_id)
+    row = _get_single_row(NocodbClient(), "scrape_targets", target_id, org_id=org_id)
     if not row:
         return {"status": "not_found", "target_id": target_id}
 
@@ -267,10 +267,13 @@ def research_agent_next():
 
 # ── Listing / dashboard helpers ───────────────────────────────────────────────
 
-def _get_single_row(client: NocodbClient, table: str, row_id: int) -> dict | None:
+def _get_single_row(client: NocodbClient, table: str, row_id: int, org_id: int | None = None) -> dict | None:
     try:
+        where = f"(Id,eq,{row_id})"
+        if org_id is not None:
+            where = f"{where}~and(org_id,eq,{int(org_id)})"
         rows = client._get(table, params={
-            "where": f"(Id,eq,{row_id})",
+            "where": where,
             "limit": 1,
         }).get("list", [])
         return rows[0] if rows else None
@@ -397,10 +400,10 @@ def research_plans_list(org_id: int, status: str | None = None, limit: int = 50)
 
 
 @router.get("/research-plans/{plan_id}")
-def research_plan_get(plan_id: int):
+def research_plan_get(plan_id: int, org_id: int):
     client = NocodbClient()
     data = client._get("research_plans", params={
-        "where": f"(Id,eq,{plan_id})",
+        "where": f"(Id,eq,{plan_id})~and(org_id,eq,{org_id})",
         "limit": 1,
     })
     rows = data.get("list", [])
@@ -428,18 +431,18 @@ def scrape_targets_list(org_id: int, status: str | None = None, active_only: boo
 
 
 @router.get("/discovery/{row_id}")
-def discovery_get(row_id: int):
+def discovery_get(row_id: int, org_id: int):
     client = NocodbClient()
-    row = _get_single_row(client, "discovery", row_id)
+    row = _get_single_row(client, "discovery", row_id, org_id=org_id)
     if not row:
         return {"status": "not_found", "row": None}
     return {"status": "ok", "row": row}
 
 
 @router.get("/scrape-targets/{target_id}")
-def scrape_target_get(target_id: int):
+def scrape_target_get(target_id: int, org_id: int):
     client = NocodbClient()
-    row = _get_single_row(client, "scrape_targets", target_id)
+    row = _get_single_row(client, "scrape_targets", target_id, org_id=org_id)
     if not row:
         return {"status": "not_found", "row": None}
     return {"status": "ok", "row": row}

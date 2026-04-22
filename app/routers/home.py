@@ -551,7 +551,7 @@ def export_conversation(org_id: int):
     """Download the org's rolling home conversation as markdown."""
     convo = get_or_create_home_conversation(org_id)
     client = NocodbClient()
-    msgs = client.list_messages(convo["Id"])
+    msgs = client.list_messages(convo["Id"], org_id=org_id)
     lines = [f"# {convo.get('title') or 'Home conversation'}", ""]
     for m in msgs:
         role = m.get("role") or "?"

@@ -26,7 +26,12 @@ async def execute(params: dict, emit) -> ToolResult:
         )
 
     from tools._org import resolve_org_id
-    org_id = resolve_org_id(params.get("_org_id"))
+    org_id = resolve_org_id(params.get("_org_id") or params.get("org_id"), fallback=0)
+    if org_id <= 0:
+        return ToolResult(
+            tool=ToolName.RAG_LOOKUP, action_index=0, ok=False,
+            data="Missing org_id for RAG lookup",
+        )
     default_collection = params.get("_collection") or "chat_knowledge"
 
     collections = params.get("collections")

@@ -89,7 +89,7 @@ class ChatAgent(BaseAgent):
             conversation_id = convo["Id"]
             history: list[dict] = []
         else:
-            convo = self.db.get_conversation(conversation_id)
+            convo = self.db.get_conversation(conversation_id, org_id=self.org_id)
             if not convo:
                 emit({"type": "error", "message": f"Conversation {conversation_id} not found"})
                 return
@@ -104,7 +104,7 @@ class ChatAgent(BaseAgent):
                     _log.warning("chat conv=%s  background summary wait timed out after %ds — proceeding without", conversation_id, SUMMARY_WAIT_TIMEOUT)
             history = [
                 {"role": m["role"], "content": m["content"]}
-                for m in self.db.list_messages(conversation_id)
+                for m in self.db.list_messages(conversation_id, org_id=self.org_id)
             ]
         _span("load_convo_ms", _t)
         set_model_usage_context(
@@ -589,7 +589,7 @@ class ChatAgent(BaseAgent):
                             break
                     if summary_content:
                         try:
-                            existing_msgs = self.db.list_messages(conversation_id)
+                            existing_msgs = self.db.list_messages(conversation_id, org_id=self.org_id)
                             existing_id = None
                             for msg in existing_msgs:
                                 if msg.get("role") == "system" and "[Conversation summary]" in (msg.get("content") or ""):

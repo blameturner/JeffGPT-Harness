@@ -99,7 +99,7 @@ def home_conversation_summary(org_id: int, lazy_create: bool = True) -> dict[str
     last_at: str | None = None
     try:
         msgs = client._get_paginated("messages", params={
-            "where": f"(conversation_id,eq,{convo['Id']})",
+            "where": f"(conversation_id,eq,{convo['Id']})~and(org_id,eq,{org_id})",
             "sort": "-CreatedAt",
             "limit": 1,
         })

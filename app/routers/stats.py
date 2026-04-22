@@ -388,6 +388,8 @@ def stats_usage(org_id: int, period: str = "30d"):
                     "limit": len(chat_ids),
                 }).get("list", [])
                 for r in conv_rows:
+                    if int(r.get("org_id") or 0) != int(org_id):
+                        continue
                     title_map[f"chat:{r['Id']}"] = r.get("title") or ""
             if code_ids:
                 conv_rows = db._get("code_conversations", params={
@@ -395,6 +397,8 @@ def stats_usage(org_id: int, period: str = "30d"):
                     "limit": len(code_ids),
                 }).get("list", [])
                 for r in conv_rows:
+                    if int(r.get("org_id") or 0) != int(org_id):
+                        continue
                     title_map[f"code:{r['Id']}"] = r.get("title") or ""
             for c in top_conversations:
                 c["title"] = title_map.get(c.get("conversation_key") or "", "")

@@ -103,10 +103,10 @@ def list_conversations(org_id: int, limit: int = 50):
 
 
 @router.patch("/conversations/{conversation_id}")
-def update_conversation(conversation_id: int, body: ConversationUpdate):
+def update_conversation(conversation_id: int, body: ConversationUpdate, org_id: int):
     try:
         db = NocodbClient()
-        convo = db.get_conversation(conversation_id)
+        convo = db.get_conversation(conversation_id, org_id=org_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Conversation not found")
         updates: dict = {}
@@ -124,18 +124,18 @@ def update_conversation(conversation_id: int, body: ConversationUpdate):
 
 
 @router.get("/conversations/{conversation_id}/summary")
-def conversation_summary(conversation_id: int):
+def conversation_summary(conversation_id: int, org_id: int):
     try:
         db = NocodbClient()
-        convo = db.get_conversation(conversation_id)
+        convo = db.get_conversation(conversation_id, org_id=org_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        messages = db.list_messages(conversation_id)
-        observations = db.list_observations_for_conversation(conversation_id)
-        runs = db.list_runs_for_conversation(conversation_id)
-        outputs = db.list_outputs_for_conversation(conversation_id)
-        tasks = db.list_tasks_for_conversation(conversation_id)
+        messages = db.list_messages(conversation_id, org_id=org_id)
+        observations = db.list_observations_for_conversation(conversation_id, org_id=org_id)
+        runs = db.list_runs_for_conversation(conversation_id, org_id=org_id)
+        outputs = db.list_outputs_for_conversation(conversation_id, org_id=org_id)
+        tasks = db.list_tasks_for_conversation(conversation_id, org_id=org_id)
 
         msg_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
         msg_tokens_out = sum(int(m.get("tokens_output") or 0) for m in messages)
@@ -214,16 +214,16 @@ def conversation_summary(conversation_id: int):
 
 
 @router.get("/conversations/{conversation_id}/messages")
-def get_messages(conversation_id: int):
+def get_messages(conversation_id: int, org_id: int):
     try:
         db = NocodbClient()
-        convo = db.get_conversation(conversation_id)
+        convo = db.get_conversation(conversation_id, org_id=org_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        messages = db.list_messages(conversation_id)
+        messages = db.list_messages(conversation_id, org_id=org_id)
         sources_by_msg: dict[int, list[dict]] = {}
         if any(int(m.get("search_source_count") or 0) > 0 for m in messages):
-            all_sources = db.list_message_search_sources(conversation_id=conversation_id)
+            all_sources = db.list_message_search_sources(conversation_id=conversation_id, org_id=org_id)
             for src in all_sources:
                 mid = src.get("message_id")
                 if mid is not None:
@@ -245,10 +245,10 @@ def get_messages(conversation_id: int):
 
 
 @router.get("/messages/{message_id}/search-sources")
-def get_message_search_sources(message_id: int):
+def get_message_search_sources(message_id: int, org_id: int):
     try:
         db = NocodbClient()
-        sources = db.list_message_search_sources(message_id=message_id)
+        sources = db.list_message_search_sources(message_id=message_id, org_id=org_id)
         for src in sources:
             src["index"] = (src.get("source_index") or 0) + 1
             src["used_in_answer"] = bool(src.get("used_in_answer"))
