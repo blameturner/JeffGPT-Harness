@@ -209,9 +209,11 @@ class NocodbClient:
         # the title check is a fallback until every env has `kind` populated.
         # Strings duplicated from shared/home_conversation.py (HOME_KIND,
         # HOME_TITLE) to avoid a circular import.
+        # `~not(kind,eq,home)` negates the equality match and preserves rows
+        # where `kind` is NULL (NocoDB's `neq` would drop NULLs).
         where = (
             f"(org_id,eq,{org_id})"
-            f"~and(kind,neq,home)"
+            f"~and(~not(kind,eq,home))"
             f"~and(title,neq,Home — ongoing)"
         )
         return self._get_paginated("conversations", params={
