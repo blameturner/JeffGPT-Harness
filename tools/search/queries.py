@@ -166,84 +166,90 @@ def generate_search_queries(intent_dict: dict, message: str | None = None) -> li
     return unique[:3]
 
 
+_RERANK_JUNK_HOSTS = (
+    "pinterest.", "quora.com", "answers.yahoo.com", "ehow.com",
+    "tiktok.com", "instagram.com",
+)
+_RERANK_GOOD_HOSTS = (
+    "wikipedia.org", "github.com", "stackoverflow.com", ".gov", ".edu",
+    "docs.", "developer.", "developers.",
+)
+
+
+def _rerank_token_set(text: str) -> set[str]:
+    return {
+        w for w in re.findall(r"[a-z0-9][\w\-']+", (text or "").lower())
+        if len(w) >= 3
+    }
+
+
 def rerank_candidates(
     candidates: list[dict],
     intent_dict: dict,
     max_candidates: int = 15,
 ) -> list[tuple[dict, int]]:
+    """Heuristic rerank — no LLM call.
+
+    Scores each candidate 1-5 by keyword overlap between the user's entities
+    + any query terms seen on the candidate (title, snippet, host path) and
+    applies small host-based bonuses/penalties. Fast, deterministic.
+    """
     if not candidates:
         return []
 
     head = candidates[:max_candidates]
-    intent_label = intent_dict.get("intent") or "chitchat"
     entities = intent_dict.get("entities") or []
-    entities_str = ", ".join(entities[:5]) if entities else "(none extracted)"
-
-    # Compact listing: title + host path only. Snippets and full URLs blow up
-    # prompt tokens and dominate rerank latency on CPU-bound planners.
-    listing = []
-    for i, c in enumerate(head, start=1):
-        title = (c.get("title") or c.get("url") or "").strip()[:80]
-        raw_url = (c.get("url") or "").strip()
-        try:
-            parsed = urlparse(raw_url)
-            host_path = f"{parsed.netloc}{parsed.path}"[:80]
-        except Exception:
-            host_path = raw_url[:80]
-        listing.append(f"{i}. {title} — {host_path}")
-
-    prompt = (
-        f"Topic: {entities_str}\n"
-        "Rate each candidate 1-5 for likelihood of containing what the user "
-        "wants. 1=off-topic phrase match, 5=clearly on-topic.\n"
-        "Return ONLY a JSON array of integers in the same order, e.g. [5,4,1,3,2,1,1,4].\n\n"
-        + "\n".join(listing) + "\n\nScores:"
-    )
+    entity_terms: set[str] = set()
+    for e in entities:
+        entity_terms |= _rerank_token_set(str(e))
+    # fall back to something non-empty so queries without classifier entities still rank
+    if not entity_terms:
+        for c in head:
+            entity_terms |= _rerank_token_set(c.get("title", ""))
+            if len(entity_terms) >= 8:
+                break
 
     started = time.time()
-    try:
-        _log.info("rerank start  candidates=%d", len(head))
-        raw, _tokens = model_call("tool_planner", prompt, max_tokens=80, temperature=0.0)
-        if not raw:
-            return [(c, 3) for c in candidates]
-    except Exception as e:
-        _log.warning("rerank failed: %s — passing candidates through", e)
-        return [(c, 3) for c in candidates]
-
-    elapsed = round(time.time() - started, 2)
-
-    match = re.search(r"\[[\s\S]*?\]", raw)
-    if not match:
-        _log.warning("rerank: no JSON array in response: %s", raw[:200])
-        return [(c, 3) for c in candidates]
-    try:
-        scores = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        _log.warning("rerank: JSON parse failed: %s", raw[:200])
-        return [(c, 3) for c in candidates]
-    if not isinstance(scores, list):
-        return [(c, 3) for c in candidates]
-
     normalised: list[int] = []
-    for i in range(len(head)):
-        if i < len(scores):
-            try:
-                s = int(scores[i])
-            except (TypeError, ValueError):
-                s = 3
-            s = max(1, min(5, s))
+    for c in head:
+        title = c.get("title", "") or ""
+        snippet = c.get("snippet", "") or ""
+        url = (c.get("url") or "").strip()
+        host = ""
+        path = ""
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc.lower()
+            path = parsed.path.lower()
+        except Exception:
+            pass
+
+        cand_terms = _rerank_token_set(title) | _rerank_token_set(snippet) | _rerank_token_set(path)
+        overlap = len(entity_terms & cand_terms) if entity_terms else 0
+
+        if overlap >= 3:
+            score = 5
+        elif overlap == 2:
+            score = 4
+        elif overlap == 1:
+            score = 3
         else:
-            s = 3
-        normalised.append(s)
+            score = 2
+
+        if any(j in host for j in _RERANK_JUNK_HOSTS):
+            score = max(1, score - 2)
+        if any(g in host for g in _RERANK_GOOD_HOSTS):
+            score = min(5, score + 1)
+
+        normalised.append(score)
 
     tail = candidates[max_candidates:]
-    ranked = list(zip(head, normalised)) + [(c, 3) for c in tail]
-
-    # stable sort preserves searxng order on score ties
+    ranked = list(zip(head, normalised)) + [(c, 2) for c in tail]
     ranked.sort(key=lambda pair: -pair[1])
 
+    elapsed = round(time.time() - started, 3)
     _log.info(
-        "rerank complete  candidates=%d scored=%d kept_hi=%d dropped_lo=%d %.2fs",
+        "rerank heuristic  candidates=%d scored=%d kept_hi=%d dropped_lo=%d %.3fs",
         len(candidates), len(head),
         sum(1 for _, s in ranked if s >= 4),
         sum(1 for _, s in ranked if s <= 1),
@@ -714,41 +720,39 @@ def reformulate_query(
     original_query: str,
     intent_dict: dict,
 ) -> str | None:
+    """Heuristic reformulation — no LLM call.
+
+    Strips filler words, quotes multi-word entities, and falls back to the
+    bare keyword list. Returns None if nothing meaningful differs from the
+    original.
+    """
     entities = intent_dict.get("entities") or []
-    intent = intent_dict.get("intent") or "unknown"
-    entities_str = ", ".join(entities[:5]) if entities else "(none extracted)"
+    quoted = [f'"{e}"' if " " in e else e for e in entities[:4] if e]
 
-    prompt = (
-        f"{build_prompt_date_header()}\n\n"
-        f"The web search query \"{original_query}\" returned no useful "
-        f"results. The user's intent is {intent} and the entities they "
-        f"mentioned are: {entities_str}.\n\n"
-        "Produce ONE simpler search query stripped of filler words, "
-        "quoting proper nouns with double quotes, and focused on the "
-        "entities. Return ONLY the query string — no prose, no quotes "
-        "around the whole thing, no preamble.\n\nSimpler query:"
-    )
-    try:
-        _log.info("query reformulate start")
-        raw, _tokens = model_call("tool_planner", prompt, max_tokens=60, temperature=0.0)
-        if not raw:
-            return None
-    except Exception as e:
-        _log.warning("query reformulation failed: %s", e)
+    keywords = _extract_keywords(original_query)
+    keywords_dedup: list[str] = []
+    seen_kw: set[str] = set()
+    for k in keywords:
+        low = k.lower()
+        if low in seen_kw:
+            continue
+        # drop keywords that are already inside an entity
+        if any(low in e.lower() for e in entities):
+            continue
+        seen_kw.add(low)
+        keywords_dedup.append(k)
+
+    parts = quoted + keywords_dedup[:4]
+    candidate = " ".join(parts).strip()
+    if not candidate:
+        candidate = original_query.strip()
+
+    if not candidate or candidate.lower() == original_query.lower():
+        _log.debug("reformulation produced no change: %r", candidate)
         return None
 
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[^\n]*\n", "", cleaned).rstrip("`").strip()
-    cleaned = cleaned.strip('"\'').strip()
-    cleaned = cleaned.splitlines()[0].strip() if cleaned else ""
-
-    if not cleaned or cleaned.lower() == original_query.lower():
-        _log.debug("reformulation returned empty or unchanged: %r", cleaned)
-        return None
-
-    _log.info("query reformulated  %r -> %r", original_query, cleaned)
-    return cleaned[:200]
+    _log.info("query reformulated (heuristic)  %r -> %r", original_query, candidate)
+    return candidate[:200]
 
 
 def build_failure_context(

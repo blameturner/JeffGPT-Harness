@@ -102,6 +102,12 @@ def start_scheduler() -> BackgroundScheduler:
     return sched
 
 
+def trigger_agent_job(agent_name: str, org_id: int, task: str = "", product: str = "") -> None:
+    """Public entry point for firing a scheduled agent immediately (off-schedule)."""
+    _log.info("manual trigger  agent=%s org=%d", agent_name, org_id)
+    _run_agent_job(agent_name, org_id, task, product)
+
+
 def reload_agent_schedules() -> dict[str, Any]:
     _log.info("reloading agent schedules")
     if _scheduler is None:

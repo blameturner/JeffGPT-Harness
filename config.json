@@ -171,6 +171,14 @@
       "query_model": "tool_planner",
       "classify_model": "scrape_classifier"
     },
+    "home": {
+      "enabled": true,
+      "digest_preface_chars": 2000,
+      "default_chat_model": "chat",
+      "email": { "enabled": false },
+      "calendar": { "enabled": false },
+      "graph": { "enabled": false }
+    },
     "tool_queue": {
       "background_chat_idle_seconds": 30,
       "default_max_attempts": 3,

@@ -289,6 +289,9 @@ NOCODB_TABLE_ENRICHMENT_LOG = "enrichment_log"
 NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS = "suggested_scrape_targets"
 NOCODB_TABLE_MESSAGES = "messages"
 NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
+NOCODB_TABLE_CONVERSATIONS = "conversations"
+NOCODB_TABLE_DAILY_DIGESTS = "daily_digests"
+NOCODB_TABLE_ASSISTANT_QUESTIONS = "assistant_questions"
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 

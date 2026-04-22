@@ -195,7 +195,160 @@ def _background_graph_write(text: str, org_id: int, url: str) -> None:
         _log.warning("search graph write failed  url=%s", url[:120], exc_info=True)
 
 
-_BATCH_PER_PAGE_CHAR_CAP = 3000
+_PASSTHROUGH_CHARS_PER_PAGE = 800
+_SENTENCE_MIN_CHARS = 40
+_SENTENCE_MAX_CHARS = 400
+_HEAD_FALLBACK_CHARS = 600
+_STOPWORD_SET = frozenset(
+    "a an the and or of for to in on at from by with about as is are was were "
+    "be been being it its this that these those what who when where why how "
+    "i you we they he she them us our your their can could should would will "
+    "do does did have has had".split()
+)
+
+
+def _query_terms(query: str, intent_dict: dict) -> set[str]:
+    terms: set[str] = set()
+    for w in re.findall(r"[A-Za-z0-9][\w\-']+", query.lower()):
+        if len(w) >= 3 and w not in _STOPWORD_SET:
+            terms.add(w)
+    for e in intent_dict.get("entities") or []:
+        for w in re.findall(r"[A-Za-z0-9][\w\-']+", str(e).lower()):
+            if len(w) >= 2:
+                terms.add(w)
+    return terms
+
+
+def _heuristic_relevance(text: str, terms: set[str]) -> str:
+    if not terms:
+        return "medium"
+    lower = text.lower()
+    hits = sum(1 for t in terms if t in lower)
+    ratio = hits / len(terms)
+    if ratio >= 0.5 or hits >= 4:
+        return "high"
+    if ratio >= 0.25 or hits >= 2:
+        return "medium"
+    return "low"
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+_JUNK_SENTENCE_HINTS = (
+    "cookie", "subscribe", "sign in", "log in", "click here", "read more",
+    "all rights reserved", "privacy policy", "terms of service",
+    "accept all", "manage preferences",
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Best-effort sentence splitter. Also splits on newlines so scraped text
+    with line-break-separated paragraphs still decomposes.
+    """
+    out: list[str] = []
+    for chunk in text.split("\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = _SENTENCE_SPLIT.split(chunk)
+        for p in parts:
+            p = p.strip()
+            if p:
+                out.append(p)
+    return out
+
+
+def _select_relevant_excerpt(
+    text: str,
+    terms: set[str],
+    entity_terms: set[str],
+    char_budget: int,
+) -> str:
+    """Pick the most query-relevant sentences up to ``char_budget``.
+
+    Scoring per sentence:
+      +2 per entity term hit (distinct) — entities are highest-signal
+      +1 per other query term hit (distinct)
+      +1 bonus if the sentence contains a digit (stats, dates, versions)
+      -3 if the sentence looks like boilerplate/CTA
+
+    Sentences with score <= 0 are skipped unless the doc has *no* positive
+    sentences at all, in which case we fall back to the first chars of text
+    so the main model still gets something.
+    """
+    if not text:
+        return ""
+    if not terms and not entity_terms:
+        return text[:char_budget].strip()
+
+    sentences = _split_sentences(text)
+    scored: list[tuple[int, int, str]] = []  # (score, original_index, sentence)
+    for i, s in enumerate(sentences):
+        if len(s) < _SENTENCE_MIN_CHARS or len(s) > _SENTENCE_MAX_CHARS:
+            continue
+        lower = s.lower()
+        if any(j in lower for j in _JUNK_SENTENCE_HINTS):
+            continue
+        score = 0
+        for t in entity_terms:
+            if t in lower:
+                score += 2
+        for t in terms:
+            if t in entity_terms:
+                continue
+            if t in lower:
+                score += 1
+        if score <= 0:
+            continue
+        if re.search(r"\d", s):
+            score += 1
+        scored.append((score, i, s))
+
+    if not scored:
+        return text[:_HEAD_FALLBACK_CHARS].strip()
+
+    # sort by score desc, then original doc order to keep high-signal early sentences
+    scored.sort(key=lambda t: (-t[0], t[1]))
+
+    picked: list[tuple[int, str]] = []
+    used = 0
+    for score, idx, sent in scored:
+        cost = len(sent) + 1  # joining space
+        if used + cost > char_budget and picked:
+            break
+        picked.append((idx, sent))
+        used += cost
+        if used >= char_budget:
+            break
+
+    # re-sort selected sentences by original position so the excerpt reads naturally
+    picked.sort(key=lambda t: t[0])
+    return " ".join(s for _, s in picked).strip()
+
+
+def _guess_source_type(url: str) -> str:
+    host = ""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return "unknown"
+    if not host:
+        return "unknown"
+    if host.endswith(".gov") or ".gov." in host:
+        return "government"
+    if "wikipedia.org" in host:
+        return "encyclopedic"
+    if any(p in host for p in ("docs.", "developer.", "developers.", "/docs")):
+        return "official_docs"
+    if any(p in host for p in ("stackoverflow.com", "reddit.com", "news.ycombinator", "discourse.")):
+        return "forum"
+    if any(p in host for p in ("arxiv.org", "pubmed", "nature.com", "sciencedirect")):
+        return "research_paper"
+    if any(p in host for p in ("nytimes.com", "bbc.", "reuters.com", "theguardian.", "bloomberg.", "apnews.")):
+        return "news_article"
+    if any(p in host for p in (".shop", "amazon.", "ebay.", "store.")):
+        return "product_page"
+    return "blog_post"
 
 
 def extract_from_pages(
@@ -206,29 +359,17 @@ def extract_from_pages(
     fire_graph_writes: bool = True,
     function_name: str = "search_extraction",
 ) -> list[dict | None]:
+    """Passthrough extractor: no LLM summarisation.
+
+    Runs the heuristic quality gate and content-type classifier, then trims the
+    scraped text to a per-page char budget and forwards it verbatim as the
+    summary. Relevance is scored by query-term overlap. The main model gets
+    the raw scraped excerpts and does the synthesis itself.
+    """
     if not pages:
         return []
 
-    if not is_feature_enabled("search_extraction"):
-        _log.info("search_extraction disabled — returning raw snippets for %d pages", len(pages))
-        results: list[dict | None] = []
-        for page in pages:
-            result = page.get("result", {}) if isinstance(page.get("result"), dict) else {}
-            text = (page.get("text") or "")[:500]
-            if text.strip():
-                results.append({
-                    "summary": text,
-                    "relevance": "medium",
-                    "source_type": "unknown",
-                    "content_type": "UNCLEAR",
-                    "tokens": 0,
-                })
-            else:
-                results.append(None)
-        return results
-
     try:
-        from shared.models import model_call
         from shared.quality import (
             _classify_content_type_heuristic,
             _heuristic_quality_gate,
@@ -237,99 +378,58 @@ def extract_from_pages(
         _log.warning("extraction helpers import failed: %s", e)
         return [None] * len(pages)
 
-    cfg = get_function_config(function_name)
-
+    started = time.time()
     results: list[dict | None] = [None] * len(pages)
-    candidates: list[tuple[int, str, str]] = []
+    terms = _query_terms(query, intent_dict)
+    entity_terms: set[str] = set()
+    for e in intent_dict.get("entities") or []:
+        for w in re.findall(r"[A-Za-z0-9][\w\-']+", str(e).lower()):
+            if len(w) >= 2:
+                entity_terms.add(w)
+    accepted = 0
+    dropped_gate = 0
+    dropped_type = 0
 
     for i, page in enumerate(pages):
         text = page.get("text", "")
         if not text or not text.strip():
             continue
+
         passed, gate_reason, gate_metrics = _heuristic_quality_gate(text)
         if not passed:
+            dropped_gate += 1
             _log.debug("extraction drop  gate=%s metrics=%s", gate_reason, gate_metrics)
             continue
+
         content_type, _cls_signals = _classify_content_type_heuristic(text)
         if content_type not in _ACCEPTABLE_CONTENT_TYPES and content_type not in _SOFT_CONTENT_TYPES:
+            dropped_type += 1
             _log.debug("extraction drop  content_type=%s", content_type)
             continue
-        candidates.append((i, text, content_type))
 
-    if not candidates:
-        _log.info("extract_from_pages  pages=%d candidates=0 (all dropped pre-model)", len(pages))
-        return results
-
-    started = time.time()
-    goal = _extraction_goal_for(intent_dict)
-    pages_block_parts = []
-    for idx, (_, text, _) in enumerate(candidates, 1):
-        excerpt = text[:_BATCH_PER_PAGE_CHAR_CAP]
-        pages_block_parts.append(f"--- PAGE {idx} ---\n{excerpt}")
-    pages_block = "\n\n".join(pages_block_parts)
-
-    prompt = (
-        f"{build_prompt_date_header()}\n\n"
-        f"You are extracting information from {len(candidates)} web pages for a user who asked:\n"
-        f"'{query[:500]}'\n\n"
-        f"GOAL (apply to every page): {goal}\n\n"
-        f"Return ONLY a JSON array with {len(candidates)} objects — one per page in the same "
-        "order as the pages appear below. Each object has these fields:\n"
-        "- summary: the extracted content per the GOAL above\n"
-        '- relevance: "high" | "medium" | "low"\n'
-        '- source_type: one of "official_docs", "news_article", "blog_post", '
-        '"research_paper", "forum", "product_page", "government", "unknown"\n\n'
-        'If a page is genuinely useless, return {"irrelevant": true} for it.\n'
-        "No prose outside the array. First character `[`, last character `]`.\n\n"
-        f"{pages_block}"
-    )
-
-    raw, tokens = model_call(
-        function_name,
-        prompt,
-        max_tokens=cfg.get("max_tokens", 500) * len(candidates),
-    )
-    elapsed = round(time.time() - started, 2)
-
-    if not raw:
-        _log.warning("extract_from_pages  batch empty response (pages=%d %.2fs)", len(candidates), elapsed)
-        return results
-
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned).rstrip("`").strip()
-    array_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if not array_match:
-        _log.warning("extract_from_pages  no JSON array in response: %s", raw[:200])
-        return results
-    try:
-        parsed = json.loads(array_match.group(0))
-    except json.JSONDecodeError:
-        _log.warning("extract_from_pages  JSON parse failed: %s", raw[:200])
-        return results
-
-    if not isinstance(parsed, list):
-        return results
-
-    per_page_tokens = tokens // max(1, len(candidates))
-    for (i, _text, content_type), data in zip(candidates, parsed):
-        if not isinstance(data, dict) or data.get("irrelevant"):
-            continue
-        summary = str(data.get("summary") or "").strip()
+        result = page.get("result", {}) if isinstance(page.get("result"), dict) else {}
+        url = result.get("url", "")
+        summary = _select_relevant_excerpt(
+            text, terms, entity_terms, _PASSTHROUGH_CHARS_PER_PAGE,
+        )
         if not summary:
             continue
+
         results[i] = {
             "summary": summary,
-            "relevance": str(data.get("relevance") or "unknown").lower(),
-            "source_type": str(data.get("source_type") or "unknown").lower(),
+            "relevance": _heuristic_relevance(summary, terms),
+            "source_type": _guess_source_type(url),
             "content_type": content_type,
-            "tokens": per_page_tokens,
+            "tokens": 0,
         }
+        accepted += 1
 
-    kept = sum(1 for r in results if r is not None)
+    elapsed = round(time.time() - started, 2)
     _log.info(
-        "extract_from_pages BATCH  pages=%d candidates=%d accepted=%d tokens=%d %.2fs",
-        len(pages), len(candidates), kept, tokens, elapsed,
+        "extract_from_pages passthrough  pages=%d accepted=%d dropped_gate=%d "
+        "dropped_type=%d chars_per_page=%d %.2fs",
+        len(pages), accepted, dropped_gate, dropped_type,
+        _PASSTHROUGH_CHARS_PER_PAGE, elapsed,
     )
 
     if fire_graph_writes and org_id is not None:
