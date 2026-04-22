@@ -252,6 +252,39 @@ def get_model_url(key: str) -> str | None:
     return None
 
 
+def resolve_model_entry(key: str) -> dict | None:
+    """Resolve a requested model key to a discovered runtime entry.
+
+    Accepts either a concrete discovered role/model id (e.g. ``t1_primary``)
+    or a logical config alias/function name (e.g. ``chat``/``code``) that maps
+    to a role via ``config.json``.
+    """
+    if not key:
+        return None
+
+    entry = MODELS.get(key) or MODELS.get(key.lower())
+    if isinstance(entry, dict) and entry.get("url"):
+        return entry
+
+    try:
+        cfg = get_function_config(key)
+    except KeyError:
+        _log.debug("model alias not found in function config  key=%s", key)
+        return None
+
+    role = str(cfg.get("role") or "").strip()
+    if not role:
+        _log.debug("model alias has no role mapping  key=%s", key)
+        return None
+
+    entry = MODELS.get(role) or MODELS.get(role.lower())
+    if isinstance(entry, dict) and entry.get("url"):
+        return entry
+
+    _log.debug("model alias resolved to missing role  key=%s role=%s", key, role)
+    return None
+
+
 EMBEDDER_URL = os.getenv("SVC_EMBEDDER_URL")
 RERANKER_URL = os.getenv("SVC_RERANKER_URL")
 WHISPER_URL = os.getenv("SVC_WHISPER_URL")

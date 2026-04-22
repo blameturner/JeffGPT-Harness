@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
-from infra.config import MODELS, get_model_url, refresh_models
+from infra.config import MODELS, refresh_models, resolve_model_entry
 from infra.nocodb_client import NocodbClient
 
 _log = logging.getLogger("agent.base")
@@ -41,20 +41,21 @@ class ChatResult:
 
 class BaseAgent:
     def __init__(self, model: str, org_id: int, search_enabled: bool = False):
-        url = get_model_url(model)
-        if not url:
+        entry = resolve_model_entry(model)
+        if not entry:
             refresh_models()
-            url = get_model_url(model)
-        if not url:
+            entry = resolve_model_entry(model)
+        if not entry:
             options = sorted({
                 v["role"] for v in MODELS.values() if isinstance(v, dict)
             })
             raise ValueError(
                 f"Model '{model}' not available. Options: {options}"
             )
-        self.model = model
+        self.model = str(entry.get("model_id") or entry.get("role") or model)
+        self.model_key = model
         self.org_id = org_id
-        self.url = url
+        self.url = str(entry.get("url") or "")
         self.search_enabled = search_enabled
         self._search_mode = "standard"
         self.db = NocodbClient()
