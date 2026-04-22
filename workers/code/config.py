@@ -13,6 +13,19 @@ CODE_STYLES: dict[str, str] = {
 
 CODE_DEFAULT_STYLE = "general"
 
+CODE_STYLE_META: dict[str, dict[str, str]] = {
+    "general":     {"label": "General",      "description": "General code help — answer questions, provide guidance."},
+    "bug_fix":     {"label": "Bug Fix",      "description": "Debug and fix bugs or errors in existing code."},
+    "test":        {"label": "Tests",        "description": "Write or improve tests."},
+    "security":    {"label": "Security",     "description": "Security audit and hardening."},
+    "optimize":    {"label": "Optimize",     "description": "Performance optimization."},
+    "refactor":    {"label": "Refactor",     "description": "Improve code structure without changing behavior."},
+    "document":    {"label": "Document",     "description": "Add or improve documentation."},
+    "new_feature": {"label": "New Feature",  "description": "Build new features from scratch."},
+    "review":      {"label": "Review",       "description": "Code review with specific feedback."},
+    "explain":     {"label": "Explain",      "description": "Explain how the code works."},
+}
+
 CODE_MAX_TOKENS: dict[str, int] = {
     "general": 3000,
     "bug_fix": 2500,
@@ -54,7 +67,16 @@ def code_style_prompt(requested: str | None) -> tuple[str, str]:
 
 
 def list_code_styles() -> list[dict]:
-    return [{"key": k, "prompt": v} for k, v in CODE_STYLES.items()]
+    out: list[dict] = []
+    for k, v in CODE_STYLES.items():
+        meta = CODE_STYLE_META.get(k, {})
+        out.append({
+            "key": k,
+            "label": meta.get("label") or k.replace("_", " ").title(),
+            "description": meta.get("description", ""),
+            "prompt": v,
+        })
+    return out
 
 
 def code_max_tokens(response_style: str | None) -> int:

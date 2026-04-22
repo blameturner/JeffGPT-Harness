@@ -174,18 +174,21 @@ def get_weighted_neighbourhood(
 
     if max_hops == 1:
         pattern = "(a)-[r]-(b)"
+        edge_expr = "r"
     else:
         # 2-hop expansion: seed → direct → second-degree. Direct hops are
         # emitted plus edges between neighbours themselves, giving a richer
-        # local subgraph for synthesis.
+        # local subgraph for synthesis. `r` is a list here, so pick the
+        # terminal edge with last().
         pattern = "(a)-[r*1..2]-(b)"
+        edge_expr = "last(r)"
 
     try:
         result = graph.query(
             "MATCH (seed) WHERE seed.name IN $seeds OR any(alias IN coalesce(seed.aliases, []) WHERE alias IN $seeds) "
             f"MATCH {pattern} "
             "WHERE a = seed OR b = seed "
-            "WITH a, b, last(r) AS edge "
+            f"WITH a, b, {edge_expr} AS edge "
             "RETURN a.name, labels(a)[0], type(edge), b.name, labels(b)[0], "
             "  coalesce(edge.hits, 1) AS hits, coalesce(edge.weight, 1.0) AS weight, "
             "  edge.last_seen AS last_seen, edge.source_chunks AS chunks "

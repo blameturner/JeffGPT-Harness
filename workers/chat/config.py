@@ -150,6 +150,22 @@ CHAT_STYLES: dict[str, str] = {
 
 CHAT_DEFAULT_STYLE = "general"
 
+CHAT_STYLE_META: dict[str, dict[str, str]] = {
+    "general":         {"label": "General",         "description": "Natural, conversational tone — matches the register of the question."},
+    "direct":          {"label": "Direct",          "description": "Lead with the answer. Short, terse, no hedging."},
+    "explanatory":     {"label": "Explanatory",     "description": "Thesis first, then one layer of mechanism per paragraph."},
+    "deep_dive":       {"label": "Deep Dive",       "description": "Internals, edge cases, failure modes — for readers past the basics."},
+    "teacher":         {"label": "Teacher",         "description": "Build a mental model; flag the things people typically trip over."},
+    "architect":       {"label": "Architect",       "description": "Components, boundaries, trade-offs; picks one option."},
+    "strategist":      {"label": "Strategist",      "description": "Options, costs, recommendation, second-order consequences."},
+    "analyst":         {"label": "Analyst",         "description": "Claim-then-evidence; every assertion backed by a specific."},
+    "challenger":      {"label": "Challenger",      "description": "Stress-tests the premise and argues the case not being made."},
+    "first_principles":{"label": "First Principles","description": "Strips to what's load-bearing; rebuilds from foundations."},
+    "cartographer":    {"label": "Cartographer",    "description": "Maps the domain — regions, consensus, active debate, entry points."},
+    "socratic":        {"label": "Socratic",        "description": "One observation, then one sharp question that exposes an assumption."},
+    "consigliere":     {"label": "Consigliere",     "description": "Trusted senior advisor — the call and the uncomfortable truth."},
+}
+
 # Very broad caps — the style prompt itself constrains length; the cap only
 # prevents runaway output on pathological prompts. Models will stop earlier
 # when the answer is done.
@@ -214,4 +230,13 @@ def chat_temperature(response_style: str | None) -> float:
 
 
 def list_chat_styles() -> list[dict]:
-    return [{"key": k, "prompt": v} for k, v in CHAT_STYLES.items()]
+    out: list[dict] = []
+    for k, v in CHAT_STYLES.items():
+        meta = CHAT_STYLE_META.get(k, {})
+        out.append({
+            "key": k,
+            "label": meta.get("label") or k.replace("_", " ").title(),
+            "description": meta.get("description", ""),
+            "prompt": v,
+        })
+    return out
