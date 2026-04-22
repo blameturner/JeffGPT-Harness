@@ -116,11 +116,39 @@ def _run_search_inner(
 
     to_scrape = kept[: budget["max_scrape"]]
     scraped_pages: list[dict] = []
-    for r in to_scrape:
-        text = scrape_page(r["url"], snippet=r.get("snippet", ""))
-        if not text:
-            continue
-        scraped_pages.append({"result": r, "text": text})
+    if to_scrape:
+        import concurrent.futures as _futures
+
+        scrape_started = time.time()
+        workers = min(len(to_scrape), 8)
+        # Preserve input order so downstream rankers stay stable.
+        indexed: list[tuple[int, str | None]] = [(i, None) for i in range(len(to_scrape))]
+        with _futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="scrape"
+        ) as pool:
+            futs = {
+                pool.submit(scrape_page, r["url"], r.get("snippet", "")): i
+                for i, r in enumerate(to_scrape)
+            }
+            for fut in _futures.as_completed(futs):
+                i = futs[fut]
+                try:
+                    text = fut.result()
+                except Exception as e:
+                    _log.warning("scrape error  url=%s error=%s", to_scrape[i]["url"][:80], e)
+                    text = ""
+                indexed[i] = (i, text)
+
+        for i, text in indexed:
+            if not text:
+                continue
+            scraped_pages.append({"result": to_scrape[i], "text": text})
+
+        _log.info(
+            "scrape batch  urls=%d workers=%d ok=%d %.2fs",
+            len(to_scrape), workers, len(scraped_pages),
+            round(time.time() - scrape_started, 2),
+        )
 
     if not scraped_pages:
         _log.warning("scraping failed on all %d candidates", len(to_scrape))

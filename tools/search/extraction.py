@@ -104,7 +104,7 @@ def _extract_one_page(
     # deferred import: shared.quality pulls FalkorDB at import time
     try:
         from shared.quality import (
-            _classify_content_type,
+            _classify_content_type_heuristic,
             _heuristic_quality_gate,
         )
     except Exception as e:
@@ -119,9 +119,7 @@ def _extract_one_page(
         )
         return None
 
-    content_type, _classifier_raw, _classifier_tokens = _classify_content_type(page_text)
-    if content_type is None:
-        content_type = "UNCLEAR"
+    content_type, _classifier_signals = _classify_content_type_heuristic(page_text)
     if content_type not in _ACCEPTABLE_CONTENT_TYPES and content_type not in _SOFT_CONTENT_TYPES:
         _log.debug("extraction drop  content_type=%s", content_type)
         return None
@@ -232,7 +230,7 @@ def extract_from_pages(
     try:
         from shared.models import model_call
         from shared.quality import (
-            _classify_content_type,
+            _classify_content_type_heuristic,
             _heuristic_quality_gate,
         )
     except Exception as e:
@@ -252,9 +250,7 @@ def extract_from_pages(
         if not passed:
             _log.debug("extraction drop  gate=%s metrics=%s", gate_reason, gate_metrics)
             continue
-        content_type, _raw, _cls_tokens = _classify_content_type(text)
-        if content_type is None:
-            content_type = "UNCLEAR"
+        content_type, _cls_signals = _classify_content_type_heuristic(text)
         if content_type not in _ACCEPTABLE_CONTENT_TYPES and content_type not in _SOFT_CONTENT_TYPES:
             _log.debug("extraction drop  content_type=%s", content_type)
             continue
