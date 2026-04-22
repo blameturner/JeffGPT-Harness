@@ -205,22 +205,22 @@ class NocodbClient:
 
     def list_conversations(self, org_id: int, limit: int = 50) -> list[dict]:
         # Exclude the home dashboard's rolling conversation — it's surfaced
-        # via /home/overview, not the chat list. `kind` is the new column;
-        # the title check is a fallback until every env has `kind` populated.
-        # Strings duplicated from shared/home_conversation.py (HOME_KIND,
-        # HOME_TITLE) to avoid a circular import.
-        # `~not(kind,eq,home)` negates the equality match and preserves rows
-        # where `kind` is NULL (NocoDB's `neq` would drop NULLs).
-        where = (
-            f"(org_id,eq,{org_id})"
-            f"~and(~not(kind,eq,home))"
-            f"~and(title,neq,Home — ongoing)"
-        )
-        return self._get_paginated("conversations", params={
-            "where": where,
+        # via /home/overview, not the chat list. Filter in Python rather than
+        # NocoDB's where-clause because NocoDB drops NULL `kind` rows under
+        # both `neq` and `~not(...eq...)`. Strings duplicated from
+        # shared/home_conversation.py (HOME_KIND, HOME_TITLE) to avoid a
+        # circular import.
+        # Over-fetch so the home-row exclusion doesn't shrink the page.
+        rows = self._get_paginated("conversations", params={
+            "where": f"(org_id,eq,{org_id})",
             "sort": "-CreatedAt",
-            "limit": limit,
+            "limit": limit + 1,
         })
+        filtered = [
+            r for r in rows
+            if r.get("kind") != "home" and r.get("title") != "Home — ongoing"
+        ]
+        return filtered[:limit]
 
     def list_messages(self, conversation_id: int, limit: int = 500, org_id: int | None = None) -> list[dict]:
         where = f"(conversation_id,eq,{conversation_id})"
