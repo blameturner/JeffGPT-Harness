@@ -232,17 +232,24 @@ def list_entities_for_resolution(
     min_degree: int = 1,
 ) -> list[dict]:
     """Candidate list for the entity-resolution job: named nodes with at
-    least one edge, returned with their label and degree."""
+    least one edge, returned with their label and degree.
+
+    Uses pattern-size (``size((n)--())``) instead of ``OPTIONAL MATCH +
+    count``; the latter materialises every relationship twice across all
+    named nodes and times out on non-trivial graphs. A FalkorDB query
+    timeout is also set so a worst-case planner decision can't wedge the
+    whole Redis connection."""
     graph = get_graph(org_id)
+    query_timeout_ms = 30_000
     try:
         result = graph.query(
-            "MATCH (n) WHERE n.name IS NOT NULL "
-            "OPTIONAL MATCH (n)-[r]-() "
-            "WITH n, count(r) AS deg "
-            "WHERE deg >= $min_degree "
-            "RETURN labels(n)[0], n.name, coalesce(n.aliases, []) AS aliases, deg "
+            "MATCH (n) "
+            "WHERE n.name IS NOT NULL AND size((n)--()) >= $min_degree "
+            "RETURN labels(n)[0] AS label, n.name AS name, "
+            "coalesce(n.aliases, []) AS aliases, size((n)--()) AS deg "
             "ORDER BY deg DESC LIMIT $limit",
             {"min_degree": int(min_degree), "limit": int(limit)},
+            timeout=query_timeout_ms,
         )
     except Exception:
         _log.warning("list_entities_for_resolution failed  org=%d", org_id, exc_info=True)
