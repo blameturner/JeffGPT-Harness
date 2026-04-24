@@ -230,6 +230,7 @@ def list_entities_for_resolution(
     org_id: int,
     limit: int = 500,
     min_degree: int = 1,
+    timeout_ms: int = 30_000,
 ) -> list[dict]:
     """Candidate list for the entity-resolution job: named nodes with at
     least one edge, returned with their label and degree.
@@ -237,27 +238,41 @@ def list_entities_for_resolution(
     Uses pattern-size (``size((n)--())``) instead of ``OPTIONAL MATCH +
     count``; the latter materialises every relationship twice across all
     named nodes and times out on non-trivial graphs. A FalkorDB query
-    timeout is also set so a worst-case planner decision can't wedge the
-    whole Redis connection."""
+    timeout bounds the call so a worst-case planner decision can't wedge
+    the Redis connection.
+
+    Callers on the chat hot path (``shared.graph_recall``) should pass a
+    tight ``timeout_ms`` (e.g. 3000) so a cold cache doesn't stall a turn;
+    background maintenance uses the default generous window."""
     graph = get_graph(org_id)
-    query_timeout_ms = 30_000
+    # Don't filter by degree in Cypher: FalkorDB evaluates the predicate for
+    # every matching node before applying LIMIT, which defeats the point.
+    # ORDER BY deg DESC + LIMIT naturally drops isolated nodes when limit is
+    # well below the total named-node count; the min_degree filter runs in
+    # Python on the returned rows.
     try:
         result = graph.query(
-            "MATCH (n) "
-            "WHERE n.name IS NOT NULL AND size((n)--()) >= $min_degree "
+            "MATCH (n) WHERE n.name IS NOT NULL "
             "RETURN labels(n)[0] AS label, n.name AS name, "
             "coalesce(n.aliases, []) AS aliases, size((n)--()) AS deg "
             "ORDER BY deg DESC LIMIT $limit",
-            {"min_degree": int(min_degree), "limit": int(limit)},
-            timeout=query_timeout_ms,
+            {"limit": int(limit)},
+            timeout=int(timeout_ms),
         )
     except Exception:
-        _log.warning("list_entities_for_resolution failed  org=%d", org_id, exc_info=True)
+        _log.warning("list_entities_for_resolution failed  org=%d timeout_ms=%d",
+                     org_id, timeout_ms, exc_info=True)
         return []
-    return [
-        {"label": row[0], "name": row[1], "aliases": list(row[2] or []), "degree": int(row[3] or 0)}
-        for row in result.result_set if row and row[1]
-    ]
+    out: list[dict] = []
+    md = int(min_degree)
+    for row in result.result_set:
+        if not row or not row[1]:
+            continue
+        deg = int(row[3] or 0)
+        if deg < md:
+            continue
+        out.append({"label": row[0], "name": row[1], "aliases": list(row[2] or []), "degree": deg})
+    return out
 
 
 def merge_alias(

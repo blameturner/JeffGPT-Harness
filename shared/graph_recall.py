@@ -25,21 +25,22 @@ _log = logging.getLogger("graph.recall")
 _ENTITY_CACHE_TTL_S = 300
 _entity_cache: dict[int, tuple[float, set[str]]] = {}
 _entity_lock = threading.Lock()
+_refresh_inflight: set[int] = set()
+
+_REFRESH_TIMEOUT_MS = 30_000
+_ENTITY_LIMIT = 1000
 
 _MAX_EDGES = 30
 _MAX_CHARS = 1200
 _QUERY_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}")
 
 
-def _load_entity_names(org_id: int) -> set[str]:
-    now = time.time()
-    with _entity_lock:
-        hit = _entity_cache.get(org_id)
-        if hit and now - hit[0] < _ENTITY_CACHE_TTL_S:
-            return hit[1]
+def _fetch_entity_names(org_id: int, timeout_ms: int) -> set[str]:
     try:
         from infra.graph import list_entities_for_resolution
-        entries = list_entities_for_resolution(org_id, limit=2000, min_degree=1)
+        entries = list_entities_for_resolution(
+            org_id, limit=_ENTITY_LIMIT, min_degree=1, timeout_ms=timeout_ms,
+        )
     except Exception:
         _log.warning("graph_recall: entity load failed  org=%d", org_id, exc_info=True)
         entries = []
@@ -52,9 +53,47 @@ def _load_entity_names(org_id: int) -> set[str]:
             a = str(a).strip()
             if a and len(a) >= 2:
                 names.add(a)
-    with _entity_lock:
-        _entity_cache[org_id] = (now, names)
     return names
+
+
+def _background_refresh(org_id: int) -> None:
+    with _entity_lock:
+        if org_id in _refresh_inflight:
+            return
+        _refresh_inflight.add(org_id)
+
+    def _worker():
+        try:
+            names = _fetch_entity_names(org_id, timeout_ms=_REFRESH_TIMEOUT_MS)
+            with _entity_lock:
+                _entity_cache[org_id] = (time.time(), names)
+            _log.info("graph_recall refresh done  org=%d names=%d", org_id, len(names))
+        finally:
+            with _entity_lock:
+                _refresh_inflight.discard(org_id)
+
+    threading.Thread(target=_worker, daemon=True, name=f"graph-recall-refresh-{org_id}").start()
+
+
+def _load_entity_names(org_id: int) -> set[str]:
+    """Chat path is never blocking. Fresh hit → return. Stale hit → return
+    stale, refresh in background. Cold miss → seed cache with an empty set
+    and kick off the background fetch; the current turn skips graph context
+    gracefully, the next turn has it. The background fetch gets the full
+    30s window so it actually completes on a large graph."""
+    now = time.time()
+    with _entity_lock:
+        hit = _entity_cache.get(org_id)
+        if hit and now - hit[0] < _ENTITY_CACHE_TTL_S:
+            return hit[1]
+        if hit is None:
+            # Seed an empty entry so subsequent calls hit the stale path
+            # instead of repeatedly spawning cold-miss refreshes.
+            _entity_cache[org_id] = (0.0, set())
+
+    _background_refresh(org_id)
+    with _entity_lock:
+        return _entity_cache[org_id][1]
 
 
 def invalidate_entity_cache(org_id: int | None = None) -> None:
