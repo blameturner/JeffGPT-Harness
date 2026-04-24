@@ -22,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from infra.config import get_feature
+from infra.config import get_feature, is_feature_enabled
 from infra.nocodb_client import NocodbClient
 from shared import digest_reader, home_questions
 from shared.home_conversation import get_or_create_home_conversation
@@ -62,6 +62,120 @@ def _build_digest_preface(org_id: int) -> str:
     with _preface_lock:
         _preface_cache[org_id] = (now, preface)
     return preface
+
+
+def _build_pa_context(org_id: int) -> str:
+    """Inject top warm topics + open loops so the assistant stays oriented
+    across turns without the user re-briefing it."""
+    if not is_feature_enabled("pa"):
+        return ""
+    try:
+        from shared.pa.memory import list_warm_topics, list_open_loops
+    except Exception:
+        return ""
+    lines: list[str] = []
+    try:
+        topics = list_warm_topics(org_id, limit=3, min_warmth=0.3)
+    except Exception:
+        topics = []
+    if topics:
+        lines.append("CURRENT WARM TOPICS (what the user has been on):")
+        for t in topics:
+            phrase = (t.get("entity_or_phrase") or "").strip()
+            brief = (t.get("background_brief") or "").strip()
+            if brief:
+                lines.append(f"- {phrase}: {brief[:400]}")
+            else:
+                lines.append(f"- {phrase}")
+    try:
+        loops = list_open_loops(org_id, status=None, limit=8) or []
+    except Exception:
+        loops = []
+    open_loops = [lp for lp in loops if lp.get("status") in ("open", "nudged")]
+    if open_loops:
+        lines.append("")
+        lines.append("OPEN LOOPS (things the user said they'd do — reference naturally if relevant, do NOT pivot to these):")
+        for lp in open_loops[:5]:
+            lines.append(f"- {(lp.get('text') or '')[:120]}")
+    if not lines:
+        return ""
+    lines.append("")
+    lines.append("Use this context only when the user's message connects to it. Do not steer to these topics unprompted.")
+    return "\n".join(lines)
+
+
+def _latest_assistant_reply(org_id: int, conversation_id: int) -> tuple[str, int | None]:
+    """Fetch the most recent assistant message for a conversation. Called
+    synchronously from run_home_turn after agent.run_job has committed."""
+    try:
+        client = NocodbClient()
+        msgs = client.list_messages(int(conversation_id), org_id=org_id) or []
+    except Exception:
+        return "", None
+    for m in reversed(msgs):
+        if m.get("role") == "assistant" and (m.get("content") or "").strip():
+            return m.get("content") or "", m.get("Id")
+    return "", None
+
+
+def _run_extractor_async(
+    org_id: int,
+    user_message: str,
+    assistant_reply: str,
+    source_message_id: int | None,
+) -> None:
+    """Runs the PA post-turn extractor in a daemon thread so the response
+    path is unblocked. Best-effort only — the reply text is handed in by the
+    caller to avoid any race with DB persistence."""
+    if not is_feature_enabled("pa"):
+        return
+    if not (assistant_reply or "").strip():
+        return
+
+    def _worker():
+        try:
+            from shared.pa.extractor import extract_and_persist
+            result = extract_and_persist(
+                org_id=org_id,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+                source_message_id=source_message_id,
+            )
+            _log.info(
+                "pa extractor  org=%d loops=+%d/-%d facts=%d topics=%d",
+                org_id,
+                result.get("loops_created", 0),
+                result.get("loops_resolved", 0),
+                result.get("facts_written", 0),
+                result.get("topics_boosted", 0),
+            )
+            _queue_topic_research(org_id, result.get("new_topic_ids") or [])
+        except Exception:
+            _log.warning("pa extractor thread failed  org=%d", org_id, exc_info=True)
+
+    threading.Thread(target=_worker, daemon=True, name=f"pa-extractor-{org_id}").start()
+
+
+def _queue_topic_research(org_id: int, topic_ids: list[int]) -> None:
+    if not topic_ids:
+        return
+    try:
+        from workers.tool_queue import get_tool_queue
+        tq = get_tool_queue()
+    except Exception:
+        return
+    if not tq:
+        return
+    for tid in topic_ids:
+        try:
+            tq.submit(
+                "pa_topic_research",
+                {"org_id": int(org_id), "topic_id": int(tid)},
+                source="pa_extractor",
+                org_id=int(org_id),
+            )
+        except Exception:
+            _log.debug("pa_topic_research enqueue failed  topic=%s", tid, exc_info=True)
 
 
 def invalidate_digest_preface(org_id: int | None = None) -> None:
@@ -117,7 +231,12 @@ def run_home_turn(
             max_tokens = 200
         system_preface = _ACK_SYSTEM
     else:
-        system_preface = _build_digest_preface(org_id)
+        preface = _build_digest_preface(org_id)
+        pa_ctx = _build_pa_context(org_id)
+        if pa_ctx and preface:
+            system_preface = f"{preface}\n\n{pa_ctx}"
+        else:
+            system_preface = pa_ctx or preface
 
     agent = ChatAgent(
         model=model,
@@ -146,6 +265,11 @@ def run_home_turn(
             response_style=response_style,
         )
     finally:
+        if not lightweight and convo.get("Id"):
+            # Read reply synchronously (post-commit) so the extractor
+            # thread never races the DB write.
+            reply, source_msg_id = _latest_assistant_reply(org_id, int(convo["Id"]))
+            _run_extractor_async(org_id, message, reply, source_msg_id)
         if question:
             try:
                 home_questions.mark_answered(

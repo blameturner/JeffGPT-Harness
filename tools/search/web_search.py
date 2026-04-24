@@ -169,6 +169,68 @@ async def _scrape_one(item: dict, extract_cap: int) -> dict:
     }
 
 
+def _pick_window(text: str, query_terms: list[str], cap: int) -> str:
+    """Pick a ``cap``-char window of ``text`` densest in ``query_terms``.
+
+    Falls back to the head when no term matches. Keeps word boundaries so
+    the synthesis model doesn't see fragments.
+    """
+    if not text:
+        return ""
+    if len(text) <= cap:
+        return text
+    if not query_terms:
+        return text[:cap].rsplit(" ", 1)[0]
+
+    lowered = text.lower()
+    best_pos = 0
+    best_hits = 0
+    step = max(200, cap // 4)
+    for start in range(0, max(1, len(text) - cap + 1), step):
+        window = lowered[start:start + cap]
+        hits = sum(window.count(t) for t in query_terms)
+        if hits > best_hits:
+            best_hits = hits
+            best_pos = start
+
+    if best_hits == 0:
+        return text[:cap].rsplit(" ", 1)[0]
+
+    # back up to a sentence/space boundary so we don't slice mid-word
+    start = best_pos
+    if start > 0:
+        boundary = text.rfind(" ", max(0, start - 40), start + 1)
+        if boundary > 0:
+            start = boundary + 1
+    end = min(len(text), start + cap)
+    return text[start:end].rsplit(" ", 1)[0]
+
+
+def _heuristic_relevance(text: str, query_terms: list[str]) -> str:
+    if not text or not query_terms:
+        return "low"
+    lowered = text.lower()
+    unique_hits = sum(1 for t in query_terms if t in lowered)
+    total_hits = sum(lowered.count(t) for t in query_terms)
+    coverage = unique_hits / max(1, len(query_terms))
+    if coverage >= 0.5 and total_hits >= 3:
+        return "high"
+    if coverage >= 0.25 or total_hits >= 2:
+        return "medium"
+    return "low"
+
+
+def _heuristic_summarise(page: dict, query_terms: list[str], cap: int) -> dict:
+    """LLM-free summary for basic mode: best keyword-dense window of the
+    scraped text, plus a relevance tag derived from keyword overlap."""
+    text = page.get("text") or ""
+    if len(text) < 100:
+        return {"summary": text[:cap], "relevance": "low", "source_type": "snippet"}
+    window = _pick_window(text, query_terms, cap)
+    relevance = _heuristic_relevance(window, query_terms)
+    return {"summary": window, "relevance": relevance, "source_type": "article"}
+
+
 def _parse_relevance(text: str) -> tuple[str, str]:
     lines = text.strip().rsplit("\n", 1)
     relevance = "medium"
@@ -476,6 +538,19 @@ async def execute(params: dict, emit) -> ToolResult:
     # Each tier runs scrape → summarise as a unit, and the two tiers run in
     # parallel. This means priority summarisation can start the moment the 2
     # priority pages have scraped, without waiting for the supp tier's fetches.
+    # basic mode extracts heuristic snippets without touching the summariser
+    # LLM. Keep the window tight enough that synthesis sees focused context
+    # but wide enough to actually answer with.
+    from tools.search.queries import _extract_keywords
+    basic_query_terms: list[str] = []
+    if mode == "basic":
+        basic_query_terms = [
+            kw.lower() for kw in _extract_keywords(" ".join(queries))
+            if len(kw) > 2 and not kw.isdigit()
+        ][:12]
+    basic_priority_summary_cap = min(priority_cap, 1800)
+    basic_supp_summary_cap = min(supp_cap, 900)
+
     async def _priority_tier() -> tuple[list[dict], list[dict], list[dict]]:
         if not priority_candidates:
             return [], [], []
@@ -485,6 +560,13 @@ async def execute(params: dict, emit) -> ToolResult:
         with_text = [s for s in scraped_t if s["text"] and len(s["text"]) >= 100]
         if not with_text:
             return scraped_t, [], []
+        if mode == "basic":
+            summaries = [
+                _heuristic_summarise(p, basic_query_terms, basic_priority_summary_cap)
+                for p in with_text
+            ]
+            _log.info("basic priority heuristic  pages=%d", len(with_text))
+            return scraped_t, with_text, summaries
         # Only 2 priority pages by default — run them fully in parallel.
         summaries = list(await asyncio.gather(
             *[_summarise_one(p["url"], p["text"], query_str) for p in with_text]
@@ -499,6 +581,13 @@ async def execute(params: dict, emit) -> ToolResult:
         with_text = [s for s in scraped_t if s["text"] and len(s["text"]) >= 100]
         if not with_text:
             return scraped_t, [], []
+        if mode == "basic":
+            summaries = [
+                _heuristic_summarise(p, basic_query_terms, basic_supp_summary_cap)
+                for p in with_text
+            ]
+            _log.info("basic supp heuristic  pages=%d", len(with_text))
+            return scraped_t, with_text, summaries
         batch_cfg = get_function_config("web_search_summarise_batch")
         batch_max_input = batch_cfg.get("max_input_chars", 14000)
         batches = _build_batches(with_text, batch_max_input, batch_target)

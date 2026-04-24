@@ -325,6 +325,10 @@ NOCODB_TABLE_MESSAGE_SEARCH_SOURCES = "message_search_sources"
 NOCODB_TABLE_CONVERSATIONS = "conversations"
 NOCODB_TABLE_DAILY_DIGESTS = "daily_digests"
 NOCODB_TABLE_ASSISTANT_QUESTIONS = "assistant_questions"
+NOCODB_TABLE_PA_OPEN_LOOPS = "pa_open_loops"
+NOCODB_TABLE_PA_WARM_TOPICS = "pa_warm_topics"
+NOCODB_TABLE_PA_USER_FACTS = "pa_user_facts"
+NOCODB_TABLE_PA_ASSISTANT_MOVES = "pa_assistant_moves"
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 

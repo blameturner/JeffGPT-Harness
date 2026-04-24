@@ -195,6 +195,53 @@ def update_priority(job_id: str, body: PriorityUpdate, request: Request):
     raise HTTPException(status_code=500, detail="Failed to update priority")
 
 
+@router.post("/jobs/{job_id}/run-now")
+def run_job_now(job_id: str, request: Request):
+    """Force a queued job to run immediately: bumps priority to 1, flips
+    ``bypass_idle`` on the payload so chat-idle backoff doesn't hold it,
+    and wakes the worker thread for its type.
+
+    Idempotent-ish: re-pressing on a job that's still queued just refreshes
+    the flags. Fails 409 if the job is running/completed/failed/cancelled —
+    use ``/retry`` for those.
+    """
+    q = _get_queue(request)
+    job = q.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "queued":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is {job.status} — use /retry to re-queue it",
+        )
+    try:
+        db = q._db()
+        payload = dict(job.payload or {})
+        payload["bypass_idle"] = True
+        patch: dict = {
+            "Id": job.nocodb_id,
+            "priority": 1,
+            "payload_json": json.dumps(payload),
+        }
+        if job.nocodb_id:
+            db._patch(NOCODB_TABLE, job.nocodb_id, patch)
+        # Wake the worker thread for this type so it claims the row without
+        # waiting for the next poll.
+        ev = q._wake_events.get(job.type)
+        if ev is not None:
+            ev.set()
+        return {
+            "status": "dispatched",
+            "job_id": job_id,
+            "type": job.type,
+            "priority": 1,
+            "bypass_idle": True,
+        }
+    except Exception as e:
+        _log.warning("run_job_now failed  job=%s", job_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"run-now failed: {e}")
+
+
 @router.post("/jobs/{job_id}/retry")
 def retry_job(job_id: str, request: Request):
     q = _get_queue(request)

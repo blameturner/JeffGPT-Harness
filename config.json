@@ -90,10 +90,11 @@
       "max_iterations": 3,
       "planner_retry_attempts": 5,
       "planner_retry_backoff_s": 8,
-      "planner_timeout_s": 1800,
-      "web_search_per_query_timeout_s": 600,
-      "synthesis_timeout_s": 3600,
-      "critic_timeout_s": 1800,
+      "planner_timeout_s": 3600,
+      "web_search_per_query_timeout_s": 900,
+      "synthesis_timeout_s": 14400,
+      "critic_timeout_s": 5400,
+      "stale_plan_hours": 24,
       "confidence_threshold": 80,
       "search_extraction_model": "research_search_extraction",
       "models": {
@@ -178,6 +179,15 @@
       "email": { "enabled": false },
       "calendar": { "enabled": false },
       "graph": { "enabled": true }
+    },
+    "pa": {
+      "enabled": true,
+      "proactive_min_gap_hours": 4.0,
+      "warmth_half_life_hours": 48.0,
+      "models": {
+        "pa_extractor":       { "role": "exp_rwkv_r",  "temperature": 0.2, "max_tokens": 500, "max_input_chars": 6000, "frequency_penalty": 0.2 },
+        "pa_topic_research":  { "role": "t1_secondary","temperature": 0.3, "max_tokens": 260, "max_input_chars": 4000 }
+      }
     },
     "surfacing": {
       "enabled": false,

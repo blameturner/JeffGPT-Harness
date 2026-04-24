@@ -88,6 +88,16 @@ class SearchRequest(BaseModel):
     n_results: int = 8
 
 
+class LoopResolveRequest(BaseModel):
+    org_id: int
+    note: str = ""
+
+
+class LoopDropRequest(BaseModel):
+    org_id: int
+    reason: str = ""
+
+
 # ---- rate limit --------------------------------------------------------------
 
 _RATE_WINDOW_S = 60.0
@@ -601,6 +611,76 @@ def produce_insight_now(body: InsightTriggerRequest):
     return {"status": "queued", "tool_job_id": job_id}
 
 
+class InsightResearchRequest(BaseModel):
+    focus: str
+    org_id: int | None = None
+
+
+@router.post("/insights/{insight_id}/research")
+def insight_deep_dive(insight_id: int, body: InsightResearchRequest):
+    """Kick off a follow-up research plan scoped to this insight. When the
+    plan completes, its paper is appended to the insight body."""
+    focus = (body.focus or "").strip()
+    if not focus:
+        raise HTTPException(status_code=400, detail="focus is required")
+    from shared import insights as insights_mod
+    insight = insights_mod.get(insight_id)
+    if not insight:
+        raise HTTPException(status_code=404, detail="insight not found")
+    org_id = int(body.org_id or insight.get("org_id") or 0)
+    base_topic = (insight.get("topic") or insight.get("title") or "").strip()
+    topic = f"{base_topic}: {focus}" if base_topic else focus
+
+    from tools.research.research_planner import create_research_plan
+    result = create_research_plan(
+        topic,
+        org_id=org_id,
+        parent_insight_id=insight_id,
+        focus=focus,
+    )
+    status = result.get("status") if isinstance(result, dict) else None
+    if status not in ("queued", "disabled"):
+        raise HTTPException(status_code=500, detail=result.get("error") or "failed to queue plan")
+    return {
+        "status": status,
+        "insight_id": insight_id,
+        "plan_id": result.get("plan_id"),
+        "tool_job_id": result.get("job_id"),
+    }
+
+
+@router.get("/insights/{insight_id}/research")
+def insight_research_list(insight_id: int):
+    """List research plans linked to this insight (primary + follow-ups)."""
+    client = NocodbClient()
+    if "research_plans" not in client.tables:
+        raise HTTPException(status_code=503, detail="research_plans table not provisioned")
+    try:
+        rows = client._get_paginated("research_plans", params={
+            "where": f"(parent_insight_id,eq,{insight_id})",
+            "sort": "-CreatedAt",
+            "limit": 50,
+        })
+    except Exception:
+        _log.warning("insight research list failed  id=%d", insight_id, exc_info=True)
+        rows = []
+    return {
+        "insight_id": insight_id,
+        "plans": [
+            {
+                "plan_id": r.get("Id"),
+                "topic": r.get("topic"),
+                "focus": r.get("focus"),
+                "status": r.get("status"),
+                "confidence_score": r.get("confidence_score"),
+                "completed_at": r.get("completed_at"),
+                "created_at": r.get("CreatedAt"),
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/health")
 def home_health(request: Request, org_id: int = 1):
     """Full dependency check. Returns `ok: true` only if every required piece
@@ -701,4 +781,203 @@ def home_health(request: Request, org_id: int = 1):
         "seconds_since_chat": seconds_since_chat_v,
         "last_digest_at": last_digest_at,
         "last_insight_at": last_insight_at,
+    }
+
+
+# ---- PA memory layer ---------------------------------------------------------
+
+@router.get("/loops")
+def list_loops(org_id: int, status: str | None = "open", limit: int = 50) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import list_open_loops
+    effective_status: str | None = None if status == "all" else status
+    try:
+        loops = list_open_loops(org_id, status=effective_status, limit=min(max(1, limit), 500))
+    except Exception as e:
+        _log.warning("list_loops failed  org=%d status=%s", org_id, status, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"loops": loops}
+
+
+@router.post("/loops/{loop_id}/resolve")
+def resolve_open_loop(loop_id: int, body: LoopResolveRequest) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import list_open_loops, resolve_loop
+    try:
+        rows = list_open_loops(body.org_id, status=None, limit=500)
+    except Exception as e:
+        _log.warning("resolve_loop lookup failed  org=%d id=%d", body.org_id, loop_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not any(int(r.get("Id") or r.get("id") or 0) == int(loop_id) for r in rows):
+        raise HTTPException(status_code=404, detail="loop not found")
+    try:
+        resolve_loop(loop_id, note=body.note)
+    except Exception as e:
+        _log.warning("resolve_loop failed  id=%d", loop_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "resolved", "loop_id": loop_id}
+
+
+@router.post("/loops/{loop_id}/drop")
+def drop_open_loop(loop_id: int, body: LoopDropRequest) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import drop_loop, list_open_loops
+    try:
+        rows = list_open_loops(body.org_id, status=None, limit=500)
+    except Exception as e:
+        _log.warning("drop_loop lookup failed  org=%d id=%d", body.org_id, loop_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not any(int(r.get("Id") or r.get("id") or 0) == int(loop_id) for r in rows):
+        raise HTTPException(status_code=404, detail="loop not found")
+    try:
+        drop_loop(loop_id, reason=body.reason)
+    except Exception as e:
+        _log.warning("drop_loop failed  id=%d", loop_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "dropped", "loop_id": loop_id}
+
+
+@router.get("/topics")
+def list_topics(org_id: int, limit: int = 10) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import list_warm_topics, topic_sources
+    try:
+        topics = list_warm_topics(org_id, limit=min(max(1, limit), 100), min_warmth=0.1)
+    except Exception as e:
+        _log.warning("list_topics failed  org=%d", org_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    out: list[dict] = []
+    for t in topics:
+        try:
+            sources = topic_sources(t)
+        except Exception:
+            _log.warning("topic_sources decode failed  org=%d", org_id, exc_info=True)
+            sources = []
+        item = dict(t)
+        item["sources"] = sources
+        out.append(item)
+    return {"topics": out}
+
+
+@router.get("/facts")
+def list_facts(org_id: int, kind: str | None = None, limit: int = 100) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import list_user_facts
+    try:
+        rows = list_user_facts(org_id, kind=kind, limit=min(max(1, limit), 500))
+    except Exception as e:
+        _log.warning("list_facts failed  org=%d kind=%s", org_id, kind, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    facts = [r for r in rows if (r.get("confidence") != "deleted")]
+    return {"facts": facts}
+
+
+@router.delete("/facts/{fact_id}")
+def delete_fact(fact_id: int, org_id: int) -> dict:
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    from shared.pa.memory import delete_user_fact, list_user_facts
+    try:
+        rows = list_user_facts(org_id, kind=None, limit=500)
+    except Exception as e:
+        _log.warning("delete_fact lookup failed  org=%d id=%d", org_id, fact_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    match = None
+    for r in rows:
+        rid = int(r.get("Id") or r.get("id") or 0)
+        if rid == int(fact_id):
+            match = r
+            break
+    if not match:
+        raise HTTPException(status_code=404, detail="fact not found")
+    if match.get("confidence") == "deleted":
+        raise HTTPException(status_code=409, detail="fact already deleted")
+    try:
+        delete_user_fact(fact_id)
+    except Exception as e:
+        _log.warning("delete_user_fact failed  id=%d", fact_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "deleted", "fact_id": fact_id}
+
+
+class PARunRequest(BaseModel):
+    org_id: int
+    force: bool = True
+
+
+@router.post("/pa/run")
+def pa_run_now(body: PARunRequest) -> dict:
+    """Manually trigger the PA for this org. Skips the 4h global gap by
+    default (the "I'm back at my desk" button). Per-kind cooldowns still
+    apply, so repeated presses won't spam the same move type.
+    """
+    if not is_feature_enabled("pa"):
+        raise HTTPException(status_code=404, detail="pa feature disabled")
+    try:
+        from scheduler import run_pa_for_org
+        result = run_pa_for_org(int(body.org_id), force=bool(body.force))
+    except Exception as e:
+        _log.warning("pa_run_now failed  org=%d", body.org_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return result
+
+
+@router.get("/pa/status")
+def pa_status(org_id: int) -> dict:
+    """Snapshot of PA state for the Home page header: last proactive
+    surface time, whether the 4h auto gap is clear, warm-topic count,
+    open-loop count. Cheap read-only call."""
+    if not is_feature_enabled("pa"):
+        return {"enabled": False}
+    try:
+        from shared.pa.memory import (
+            last_move_at, list_warm_topics, list_open_loops,
+            MOVE_MODE_PROACTIVE,
+        )
+        from shared.pa.picker import PROACTIVE_MIN_GAP_HOURS
+    except Exception:
+        return {"enabled": False}
+
+    last_dt = None
+    try:
+        last_dt = last_move_at(org_id, mode=MOVE_MODE_PROACTIVE)
+    except Exception:
+        last_dt = None
+
+    gap_ready = True
+    seconds_until_ready = 0
+    if last_dt is not None:
+        try:
+            from datetime import datetime, timezone
+            elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            gap_s = PROACTIVE_MIN_GAP_HOURS * 3600
+            if elapsed < gap_s:
+                gap_ready = False
+                seconds_until_ready = int(gap_s - elapsed)
+        except Exception:
+            pass
+
+    try:
+        warm_count = len(list_warm_topics(org_id, limit=50, min_warmth=0.1))
+    except Exception:
+        warm_count = 0
+    try:
+        loops_open = list_open_loops(org_id, status="open", limit=200) or []
+        loops_nudged = list_open_loops(org_id, status="nudged", limit=200) or []
+        open_count = len(loops_open) + len(loops_nudged)
+    except Exception:
+        open_count = 0
+
+    return {
+        "enabled": True,
+        "last_proactive_at": last_dt.isoformat() if last_dt else None,
+        "gap_ready": gap_ready,
+        "seconds_until_auto_ready": seconds_until_ready,
+        "warm_topics": warm_count,
+        "open_loops": open_count,
     }

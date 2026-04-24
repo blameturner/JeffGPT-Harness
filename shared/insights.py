@@ -139,6 +139,69 @@ def get(insight_id: int) -> dict | None:
     return _hydrate(rows[0]) if rows else None
 
 
+def append_research(plan_id: int, paper_content: str, focus: str = "") -> int:
+    """Append a completed research plan's paper to every published insight that
+    links to it (either as primary ``research_plan_id`` or as a ``parent_insight_id``
+    follow-up plan). Returns the number of insights updated."""
+    if not paper_content:
+        return 0
+    client = NocodbClient()
+    if not _table_present(client):
+        return 0
+
+    # Primary link: insights.research_plan_id = plan_id
+    targets: list[dict] = []
+    try:
+        rows = client._get_paginated(INSIGHTS_TABLE, params={
+            "where": f"(research_plan_id,eq,{plan_id})~and(status,eq,{STATUS_PUBLISHED})",
+            "limit": 20,
+        })
+        targets.extend(rows)
+    except Exception:
+        _log.warning("append_research: primary lookup failed  plan_id=%d", plan_id, exc_info=True)
+
+    # Follow-up link: research_plans.parent_insight_id → insight
+    try:
+        plan_rows = client._get("research_plans", params={
+            "where": f"(Id,eq,{plan_id})",
+            "limit": 1,
+        }).get("list", [])
+        parent_id = plan_rows[0].get("parent_insight_id") if plan_rows else None
+        if parent_id:
+            pd = client._get(INSIGHTS_TABLE, params={
+                "where": f"(Id,eq,{int(parent_id)})",
+                "limit": 1,
+            }).get("list", [])
+            if pd and pd[0].get("status") == STATUS_PUBLISHED:
+                targets.append(pd[0])
+    except Exception:
+        _log.warning("append_research: parent lookup failed  plan_id=%d", plan_id, exc_info=True)
+
+    # De-dupe by insight id
+    seen: set[int] = set()
+    updated = 0
+    heading = f"## Follow-up: {focus}" if focus else "## Deeper research (from follow-up plan)"
+    block = f"\n\n---\n\n{heading}\n\n_From research plan #{plan_id}_\n\n{paper_content.strip()}\n"
+    for row in targets:
+        iid = row.get("Id")
+        if not iid or iid in seen:
+            continue
+        seen.add(iid)
+        existing = row.get("body_markdown") or ""
+        if f"research plan #{plan_id}" in existing:
+            continue
+        try:
+            client._patch(INSIGHTS_TABLE, iid, {
+                "Id": iid,
+                "body_markdown": existing + block,
+            })
+            updated += 1
+            _log.info("insight augmented  id=%s plan_id=%d focus=%s", iid, plan_id, focus[:40])
+        except Exception:
+            _log.warning("insight append failed  id=%s plan_id=%d", iid, plan_id, exc_info=True)
+    return updated
+
+
 def latest_created_at(org_id: int) -> str | None:
     """Used by the dispatcher to decide whether to produce a new insight."""
     client = NocodbClient()

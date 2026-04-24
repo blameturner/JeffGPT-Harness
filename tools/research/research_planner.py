@@ -274,9 +274,17 @@ Example shape (structure only, not content):
     return out
 
 
-def create_research_plan(topic: str, org_id: int = 0) -> dict:
+def create_research_plan(
+    topic: str,
+    org_id: int = 0,
+    parent_insight_id: int | None = None,
+    focus: str = "",
+) -> dict:
     """Create a shell research_plans row and queue the planner job.
     Returns immediately with the plan_id so the UI can poll for status.
+
+    If ``parent_insight_id`` is set, the completed paper will be appended to
+    that insight (see ``shared.insights.append_research``).
     """
     from infra.nocodb_client import NocodbClient
     from workers.tool_queue import get_tool_queue
@@ -289,7 +297,7 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
 
     client = NocodbClient()
     try:
-        row = client._post("research_plans", {
+        payload = {
             "org_id": org_id,
             "topic": topic,
             "hypotheses": "[]",
@@ -298,7 +306,12 @@ def create_research_plan(topic: str, org_id: int = 0) -> dict:
             "schema": "{}",
             "iterations": 0,
             "status": "pending",
-        })
+        }
+        if parent_insight_id:
+            payload["parent_insight_id"] = int(parent_insight_id)
+        if focus:
+            payload["focus"] = focus[:500]
+        row = client._post("research_plans", payload)
         plan_id = row.get("Id")
     except Exception as e:
         _log.warning("shell plan save failed  topic=%s  error=%s", topic[:40], e)
@@ -414,3 +427,72 @@ def complete_plan(plan_id: int, status: str = "completed") -> None:
         client._patch("research_plans", plan_id, {"status": status})
     except Exception:
         _log.warning("complete plan failed  id=%d", plan_id)
+
+
+def reap_stale_plans() -> dict:
+    """Mark research_plans rows as failed only when they're truly wedged:
+    in a transient state (generating/searching/synthesizing), with no
+    activity (UpdatedAt) for ``research.stale_plan_hours``, AND no inflight
+    tool_job_queue row for the plan. This leaves legitimate long-running
+    syntheses alone while cleaning up rows orphaned by worker crashes."""
+    from datetime import datetime, timedelta, timezone
+    from infra.nocodb_client import NocodbClient
+
+    stale_hours = float(get_feature("research", "stale_plan_hours", 24) or 24)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_hours)
+
+    client = NocodbClient()
+
+    # Collect plan_ids referenced by any non-terminal tool_job_queue row.
+    active_plan_ids: set[int] = set()
+    try:
+        tool_rows = client._get_paginated("tool_job_queue", params={
+            "where": "(type,in,research_agent,research_planner)"
+                     "~and(status,in,queued,running,retry_scheduled)",
+            "limit": 200,
+        })
+        for tr in tool_rows:
+            raw = tr.get("payload") or ""
+            try:
+                pid = json.loads(raw).get("plan_id") if isinstance(raw, str) else raw.get("plan_id")
+                if pid:
+                    active_plan_ids.add(int(pid))
+            except Exception:
+                continue
+    except Exception:
+        _log.debug("reap: tool_job_queue scan skipped", exc_info=True)
+
+    reaped = 0
+    for state in ("generating", "searching", "synthesizing"):
+        try:
+            rows = client._get_paginated("research_plans", params={
+                "where": f"(status,eq,{state})",
+                "limit": 100,
+            })
+        except Exception:
+            _log.warning("reap: scan failed  state=%s", state, exc_info=True)
+            continue
+        for row in rows:
+            plan_id = row.get("Id")
+            if not plan_id or int(plan_id) in active_plan_ids:
+                continue
+            updated = row.get("UpdatedAt") or row.get("CreatedAt") or ""
+            try:
+                ts = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if ts >= cutoff:
+                continue
+            try:
+                client._patch("research_plans", plan_id, {
+                    "status": "failed",
+                    "error_message": f"reaped: stuck in {state} {stale_hours:g}h+ with no inflight job",
+                })
+                reaped += 1
+                _log.info("research plan reaped  id=%s state=%s age_h=%.1f",
+                          plan_id, state, (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0)
+            except Exception:
+                _log.warning("reap: patch failed  id=%s", plan_id, exc_info=True)
+    return {"status": "ok", "reaped": reaped, "skipped_inflight": len(active_plan_ids)}

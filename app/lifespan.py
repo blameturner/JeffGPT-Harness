@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
         graph_maintenance_job,
         graph_resolve_entities_job,
     )
+    from tools.pa.background import pa_topic_research_job
     tool_queue = ToolJobQueue()
     # Priority tiers (lower = picked first):
     #   3 = graph_extract, research planner + agent
@@ -108,6 +109,10 @@ async def lifespan(app: FastAPI):
     tool_queue.register("graph_maintenance", HandlerConfig(
         handler=graph_maintenance_job,
         max_workers=1, priority_default=5, source="graph_maintenance",
+    ))
+    tool_queue.register("pa_topic_research", HandlerConfig(
+        handler=pa_topic_research_job,
+        max_workers=1, priority_default=5, source="pa",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue
@@ -174,6 +179,18 @@ async def lifespan(app: FastAPI):
                 replace_existing=True,
             )
             _log.info("daily_digest dispatcher scheduled  %02d:%02d UTC", digest_hour, digest_minute)
+
+        from tools.research.research_planner import reap_stale_plans
+        reap_minutes = int(get_feature("research", "reap_interval_minutes", 30) or 30)
+        sched.add_job(
+            reap_stale_plans,
+            IntervalTrigger(minutes=max(5, reap_minutes)),
+            id="research_plan_reaper",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        _log.info("research plan reaper scheduled  every=%dm", reap_minutes)
 
         if get_feature("seed_feedback", "enabled", True):
             seed_hours = int(get_feature("seed_feedback", "run_interval_hours", 6))

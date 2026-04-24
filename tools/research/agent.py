@@ -483,6 +483,12 @@ def _run_research_agent_inner(
                 )
             except Exception:
                 _log.warning("research ingest_output failed  plan_id=%d", plan_id, exc_info=True)
+            try:
+                from shared.insights import append_research
+                focus = str(plan.get("focus") or "").strip()
+                append_research(plan_id, paper_content, focus=focus)
+            except Exception:
+                _log.warning("research append_to_insight failed  plan_id=%d", plan_id, exc_info=True)
 
         return {"status": "completed", "confidence": confidence, "plan_id": plan_id}
     elif new_queries:
@@ -565,6 +571,13 @@ def _run_research_agent_inner(
             "error_message": "No new queries produced before max iterations; completed best-effort",
             "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         })
+        if paper_content:
+            try:
+                from shared.insights import append_research
+                focus = str(plan.get("focus") or "").strip()
+                append_research(plan_id, paper_content, focus=focus)
+            except Exception:
+                _log.warning("research append_to_insight failed  plan_id=%d", plan_id, exc_info=True)
         return {"status": "completed", "confidence": confidence, "plan_id": plan_id, "note": "best_effort_no_new_queries"}
 
 
