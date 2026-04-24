@@ -89,6 +89,48 @@ A:
 """
 
 
+def _queue_loop_question(
+    org_id: int,
+    loop_id: int,
+    loop_text: str,
+    intent: str,
+    when_hint: str,
+) -> None:
+    """Turn a fresh decision/waiting loop into a visible dashboard question.
+    Idempotent per ``context_ref='loop:<id>'``."""
+    try:
+        from shared.home_questions import queue_question_deduped
+    except Exception:
+        return
+    if intent == LOOP_INTENT_DECISION:
+        q = f"You flagged a decision: \"{loop_text}\". Want me to dig in, or is this still on you?"
+        opts = [
+            {"label": "Research this", "value": f"research:{loop_text}"},
+            {"label": "Still thinking", "value": "defer"},
+            {"label": "Already decided", "value": "done"},
+        ]
+        followup = f"enqueue:research:{loop_text}"
+    else:  # LOOP_INTENT_WAITING
+        who = when_hint or "them"
+        q = f"You're waiting on: \"{loop_text}\". Any update from {who}?"
+        opts = [
+            {"label": "No movement", "value": "waiting"},
+            {"label": "Got the answer", "value": "resolved"},
+            {"label": "Drop it", "value": "drop"},
+        ]
+        followup = ""
+    try:
+        queue_question_deduped(
+            org_id=org_id,
+            question_text=q,
+            context_ref=f"loop:{loop_id}",
+            suggested_options=opts,
+            followup_action=followup,
+        )
+    except Exception:
+        _log.debug("pa_extractor: queue_loop_question failed", exc_info=True)
+
+
 def _parse_json(raw: str) -> dict | None:
     if not raw:
         return None
@@ -148,6 +190,7 @@ def extract_and_persist(
             summary["error"] = "json_parse_failed"
             return summary
 
+        questions_queued = 0
         for loop in _as_list(parsed, "new_loops"):
             text = str(loop.get("text", "")).strip()
             if not text:
@@ -163,6 +206,13 @@ def extract_and_persist(
             )
             if res:
                 summary["loops_created"] += 1
+                # Surface a clarifying question for open decisions / external waits.
+                # Cap to 2 per turn so a chatty turn can't flood the dashboard.
+                if questions_queued < 2 and intent in (LOOP_INTENT_DECISION, LOOP_INTENT_WAITING):
+                    loop_id = res.get("Id") or res.get("id")
+                    if loop_id:
+                        _queue_loop_question(org_id, int(loop_id), text, intent, when_hint)
+                        questions_queued += 1
 
         for item in _as_list(parsed, "resolved_loops"):
             match_text = str(item.get("match_text", "")).strip()

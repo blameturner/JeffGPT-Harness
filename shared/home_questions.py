@@ -96,6 +96,45 @@ def queue_question(
         return None
 
 
+def exists_by_context(org_id: int, context_ref: str) -> bool:
+    """Return True if a pending or answered question with this exact
+    ``context_ref`` already exists. Producers use this to avoid spamming
+    duplicates when the same upstream signal fires repeatedly."""
+    if not context_ref:
+        return False
+    client = NocodbClient()
+    if not _table_present(client):
+        return False
+    try:
+        rows = client._get_paginated(NOCODB_TABLE_ASSISTANT_QUESTIONS, params={
+            "where": f"(org_id,eq,{org_id})~and(context_ref,eq,{context_ref})",
+            "limit": 1,
+        })
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def queue_question_deduped(
+    org_id: int,
+    question_text: str,
+    context_ref: str,
+    suggested_options: list[dict] | None = None,
+    followup_action: str = "",
+) -> int | None:
+    """``queue_question`` wrapper that no-ops if a question with the same
+    ``context_ref`` already exists for the org."""
+    if exists_by_context(org_id, context_ref):
+        return None
+    return queue_question(
+        org_id=org_id,
+        question_text=question_text,
+        suggested_options=suggested_options,
+        context_ref=context_ref,
+        followup_action=followup_action,
+    )
+
+
 def list_pending(org_id: int, limit: int = 20) -> list[dict]:
     client = NocodbClient()
     if not _table_present(client):

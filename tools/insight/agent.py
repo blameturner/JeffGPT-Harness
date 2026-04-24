@@ -310,6 +310,33 @@ def _post_to_home_conversation(org_id: int, topic_info: dict, title: str, lead: 
         _log.warning("insight home-convo post failed  insight=%s", insight_id, exc_info=True)
 
 
+def _queue_insight_question(org_id: int, insight_id: int | None, topic: str, title: str) -> None:
+    """Ask the user whether to push further on the new insight."""
+    if not insight_id:
+        return
+    try:
+        from shared.home_questions import queue_question_deduped
+    except Exception:
+        return
+    topic_short = (topic or title or "this").strip()[:120]
+    q = f"New insight on \"{topic_short}\". Want a deeper research pass, or park it?"
+    opts = [
+        {"label": "Deep-dive", "value": f"research:{topic_short}"},
+        {"label": "Just read it", "value": "read"},
+        {"label": "Not interested", "value": "archive"},
+    ]
+    try:
+        queue_question_deduped(
+            org_id=org_id,
+            question_text=q,
+            context_ref=f"insight:{insight_id}",
+            suggested_options=opts,
+            followup_action=f"enqueue:research:{topic_short}",
+        )
+    except Exception:
+        _log.debug("insight: queue_insight_question failed", exc_info=True)
+
+
 def _maybe_queue_research(topic: str, org_id: int) -> dict:
     """Queue a research plan so the next insight cycle has fresher material.
 
@@ -387,6 +414,7 @@ def insight_produce_job(payload: dict | None = None) -> dict:
 
     _post_to_home_conversation(org_id, topic_info, title, lead, insight_id)
     research_result = _maybe_queue_research(topic, org_id)
+    _queue_insight_question(org_id, insight_id, topic, title)
 
     try:
         from shared.surfacing import push_insight
