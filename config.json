@@ -91,6 +91,7 @@
       "planner_retry_attempts": 5,
       "planner_retry_backoff_s": 8,
       "planner_timeout_s": 3600,
+      "planner_fallback_enabled": true,
       "web_search_per_query_timeout_s": 900,
       "synthesis_timeout_s": 14400,
       "critic_timeout_s": 5400,

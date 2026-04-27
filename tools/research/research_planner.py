@@ -10,9 +10,59 @@ from shared.models import model_call
 _log = logging.getLogger("research_planner")
 
 DEFAULT_MAX_QUERIES = 20
-DEFAULT_PLANNER_TIMEOUT_S = 1200
-DEFAULT_PLANNER_RETRY_ATTEMPTS = 3
-DEFAULT_PLANNER_RETRY_BACKOFF_S = 4
+DEFAULT_PLANNER_TIMEOUT_S = 3600
+DEFAULT_PLANNER_RETRY_ATTEMPTS = 5
+DEFAULT_PLANNER_RETRY_BACKOFF_S = 8
+
+
+def _fallback_plan(topic: str, max_queries: int) -> dict:
+    """Deterministic plan used when the LLM planner fails or times out.
+
+    Produces a usable {hypotheses, sub_topics, queries, schema} from the
+    topic itself so the research agent can still go to search instead of
+    wasting the cycle. Quality is lower than an LLM plan, but signal > 0
+    is much better than the previous outcome (a hard fail).
+    """
+    topic_clean = (topic or "").strip()
+    if not topic_clean:
+        return {"error": "empty topic for fallback plan"}
+    n = max(4, min(max_queries, 10))
+    queries = [
+        f'"{topic_clean}"',
+        f'{topic_clean} overview',
+        f'{topic_clean} 2026',
+        f'{topic_clean} alternatives',
+        f'{topic_clean} comparison',
+        f'{topic_clean} pricing',
+        f'{topic_clean} pros and cons',
+        f'{topic_clean} recent news',
+        f'{topic_clean} tradeoffs',
+        f'{topic_clean} architecture',
+    ][:n]
+    return {
+        "hypotheses": [
+            f"{topic_clean} has clear strengths and weaknesses worth surfacing.",
+            f"There are concrete alternatives to {topic_clean} the user should know.",
+            f"{topic_clean} has notable recent developments in the last 12 months.",
+        ],
+        "sub_topics": [
+            f"What {topic_clean} actually is",
+            f"How {topic_clean} compares to alternatives",
+            f"Recent changes to {topic_clean}",
+            f"Practical tradeoffs of {topic_clean}",
+        ],
+        "queries": queries,
+        "schema": {
+            "name": "text",
+            "vendor": "text",
+            "release_year": "numeric",
+            "pricing_model": "text",
+            "primary_use_case": "text",
+            "competitor_count": "numeric",
+            "recent_change_summary": "text",
+        },
+        "_fallback": True,
+    }
 
 
 def _planner_timeout_s() -> int:
@@ -91,6 +141,76 @@ def _extract_json_object(raw: str) -> str:
     return tail
 
 
+def _clean_json_text(s: str) -> str:
+    """Forgiving cleanup for local-model JSON output.
+
+    Local CPU-bound models routinely emit:
+      - trailing commas before } or ]
+      - smart quotes (curly) instead of straight quotes
+      - single-quoted strings instead of double-quoted
+      - unescaped newlines inside strings (we leave alone — handled by parser)
+    This pass catches the easy ones.
+    """
+    if not s:
+        return s
+    # smart quotes → straight
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("‘", "'").replace("’", "'")
+    # trailing commas: ,} or ,]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
+def _salvage_queries(raw: str) -> list[str]:
+    """Last-resort: pull just the queries array out of malformed model output.
+
+    Triggered when full JSON parse fails. Looks for ``"queries"`` followed by
+    a [ ... ] block and extracts the string elements. Even a half-formed
+    response usually has the queries section intact, and queries are the
+    only thing the research agent strictly needs to proceed.
+    """
+    if not raw:
+        return []
+    s = _clean_json_text(_strip_fence(raw))
+    # Find the queries array — try a few common spellings local models produce.
+    for key_re in (r'"queries"\s*:\s*\[', r"'queries'\s*:\s*\[", r"queries\s*:\s*\["):
+        m = re.search(key_re, s, re.IGNORECASE)
+        if not m:
+            continue
+        start = m.end()
+        depth = 1
+        in_str = False
+        escape = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    inner = s[start:i]
+                    # Pull every quoted string out of the array
+                    items = re.findall(r'"((?:[^"\\]|\\.)*)"', inner)
+                    if not items:
+                        items = re.findall(r"'((?:[^'\\]|\\.)*)'", inner)
+                    return [it.strip() for it in items if it.strip()]
+        # unclosed — try whatever we got so far
+        inner = s[start:]
+        items = re.findall(r'"((?:[^"\\]|\\.)*)"', inner)
+        return [it.strip() for it in items if it.strip()][:20]
+    return []
+
+
 def _as_string_list(value) -> list[str]:
     if isinstance(value, str):
         s = value.strip()
@@ -150,6 +270,19 @@ def _normalize_plan_payload(data: dict, max_queries: int, topic: str = "") -> di
     schema = data.get("schema")
     if not isinstance(schema, dict):
         schema = {}
+    # Validate value types — anything outside the allowed set coerces to "text"
+    allowed_types = {"numeric", "text", "date", "percent"}
+    schema = {
+        str(k)[:60]: (str(v).lower() if str(v).lower() in allowed_types else "text")
+        for k, v in schema.items()
+        if k and isinstance(k, str)
+    }
+    # Backfill a default schema if the LLM omitted one. Without this, the
+    # synthesis prompt's "Comparison" section gets nothing to render and
+    # the briefing reads thin.
+    if not schema:
+        schema = _default_schema_for_topic(topic)
+        _log.info("planner: schema empty, applied default for topic=%s", topic[:60])
     if not queries:
         return {"error": "planner produced no valid high-signal queries"}
     return {
@@ -157,6 +290,23 @@ def _normalize_plan_payload(data: dict, max_queries: int, topic: str = "") -> di
         "sub_topics": sub_topics,
         "queries": queries,
         "schema": schema,
+    }
+
+
+def _default_schema_for_topic(topic: str) -> dict:
+    """Generic but useful default — works for almost any product/topic the
+    user is comparing or evaluating. Keys land in the briefing's comparison
+    table; we want enough columns that the table is informative."""
+    return {
+        "name": "text",
+        "vendor": "text",
+        "primary_use_case": "text",
+        "pricing_model": "text",
+        "license": "text",
+        "release_year": "numeric",
+        "recent_change": "text",
+        "key_strength": "text",
+        "key_weakness": "text",
     }
 
 
@@ -239,34 +389,67 @@ Example shape (structure only, not content):
                 attempt, attempts, topic[:40],
             )
         else:
-            candidate = _extract_json_object(result)
             last_raw = result[:500]
-            if not candidate:
-                last_error = "no JSON object in response"
-                _log.warning(
-                    "planner parse failed (no JSON object)  attempt=%d/%d  topic=%s",
-                    attempt, attempts, topic[:40],
-                )
-            else:
+            candidate = _extract_json_object(result)
+            normalized = None
+            if candidate:
+                cleaned = _clean_json_text(candidate)
                 try:
-                    parsed = json.loads(candidate)
+                    parsed = json.loads(cleaned)
                     normalized = _normalize_plan_payload(parsed, max_queries, topic=topic)
-                    if "error" not in normalized:
-                        return normalized
-                    last_error = str(normalized.get("error") or "invalid planner payload")
-                    _log.warning(
-                        "planner payload invalid  attempt=%d/%d  topic=%s  error=%s",
-                        attempt, attempts, topic[:40], last_error,
-                    )
                 except json.JSONDecodeError as e:
-                    last_error = f"invalid JSON: {str(e)[:160]}"
                     _log.warning(
-                        "plan parse failed  attempt=%d/%d  topic=%s  error=%s  chars=%d",
-                        attempt, attempts, topic[:40], e, len(result),
+                        "plan parse failed (will try salvage)  attempt=%d/%d  topic=%s  error=%s",
+                        attempt, attempts, topic[:40], str(e)[:120],
                     )
+            else:
+                _log.warning(
+                    "planner: no JSON object  attempt=%d/%d  topic=%s  raw_head=%s",
+                    attempt, attempts, topic[:40], last_raw[:200],
+                )
+
+            if normalized is None or "error" in (normalized or {}):
+                # Salvage: even half-formed model output usually has the
+                # queries array. Pull it, backfill the rest.
+                salvaged_queries = _salvage_queries(result)
+                if salvaged_queries:
+                    _log.info(
+                        "planner: salvaged %d queries from malformed response  topic=%s",
+                        len(salvaged_queries), topic[:40],
+                    )
+                    normalized = _normalize_plan_payload({
+                        "queries": salvaged_queries,
+                        "hypotheses": [],
+                        "sub_topics": [],
+                        "schema": {},
+                    }, max_queries, topic=topic)
+                    if normalized and "error" not in normalized:
+                        normalized["_salvaged"] = True
+
+            if normalized and "error" not in normalized:
+                return normalized
+            if normalized and "error" in normalized:
+                last_error = str(normalized.get("error") or "invalid planner payload")
+                _log.warning(
+                    "planner payload invalid  attempt=%d/%d  topic=%s  error=%s",
+                    attempt, attempts, topic[:40], last_error,
+                )
+            elif candidate is None or not candidate:
+                last_error = "no JSON object in response"
+            else:
+                last_error = "invalid JSON, salvage produced no queries"
 
         if attempt < attempts and backoff_s > 0:
             time.sleep(backoff_s)
+
+    if get_feature("research", "planner_fallback_enabled", True):
+        _log.warning(
+            "planner failed %d attempts, using deterministic fallback  topic=%s  last_error=%s",
+            attempts, topic[:60], last_error,
+        )
+        fb = _fallback_plan(topic, max_queries)
+        if "error" not in fb:
+            return fb
 
     out = {"error": f"planner failed after {attempts} attempts: {last_error}"}
     if last_raw:
