@@ -310,31 +310,13 @@ def _post_to_home_conversation(org_id: int, topic_info: dict, title: str, lead: 
         _log.warning("insight home-convo post failed  insight=%s", insight_id, exc_info=True)
 
 
-def _queue_insight_question(org_id: int, insight_id: int | None, topic: str, title: str) -> None:
-    """Ask the user whether to push further on the new insight."""
-    if not insight_id:
-        return
-    try:
-        from shared.home_questions import queue_question_deduped
-    except Exception:
-        return
-    topic_short = (topic or title or "this").strip()[:120]
-    q = f"New insight on \"{topic_short}\". Want a deeper research pass, or park it?"
-    opts = [
-        {"label": "Deep-dive", "value": f"research:{topic_short}"},
-        {"label": "Just read it", "value": "read"},
-        {"label": "Not interested", "value": "archive"},
-    ]
-    try:
-        queue_question_deduped(
-            org_id=org_id,
-            question_text=q,
-            context_ref=f"insight:{insight_id}",
-            suggested_options=opts,
-            followup_action=f"enqueue:research:{topic_short}",
-        )
-    except Exception:
-        _log.debug("insight: queue_insight_question failed", exc_info=True)
+# NOTE (2026-04-27): _queue_insight_question removed.
+# The daily_brief producer is now the canonical surface for new insights —
+# it weaves them into the morning brief naturally rather than queuing a
+# separate "want a deep-dive?" question that often went unanswered.
+def _queue_insight_question(org_id: int, insight_id: int | None, topic: str, title: str) -> None:  # noqa: D401, ARG001
+    """No-op shim kept so existing call sites don't crash. Sidelined."""
+    return
 
 
 def _maybe_queue_research(topic: str, org_id: int) -> dict:

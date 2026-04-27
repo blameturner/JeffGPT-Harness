@@ -80,6 +80,20 @@ RULES:
 - A fact must be persistent (not "I'm tired today"). Skip ephemeral.
 - Topics: concrete nouns/projects only; skip pronouns, generic words.
 - All arrays may be empty.
+- MUTE: if the user says they are no longer interested in a topic / asks
+  you to stop bringing it up / has decided to drop it, emit a fact with
+  kind="preference", key="mute:<topic_slug>", value="<short reason>".
+  Example: user says "stop bringing up CuDF, I'm not pursuing it" →
+  {{"kind": "preference", "key": "mute:cuDF", "value": "user dropped pursuit",
+    "confidence": "stated"}}.
+- CORRECTION: if the user is correcting the assistant ("no", "you're wrong
+  about X", "you're conflating X and Y", "stop assuming Z"), emit a fact
+  with kind="constraint", key="avoid:<short tag>", value="<the correction
+  in <= 25 words>". This stops the assistant from making the same mistake
+  again. Example: user says "stop conflating CuDF and Polars, they're
+  unrelated" → {{"kind": "constraint", "key": "avoid:conflating_cudf_polars",
+    "value": "CuDF and Polars are unrelated; do not group them together",
+    "confidence": "stated"}}.
 
 USER:
 {user_message}
@@ -89,46 +103,13 @@ A:
 """
 
 
-def _queue_loop_question(
-    org_id: int,
-    loop_id: int,
-    loop_text: str,
-    intent: str,
-    when_hint: str,
-) -> None:
-    """Turn a fresh decision/waiting loop into a visible dashboard question.
-    Idempotent per ``context_ref='loop:<id>'``."""
-    try:
-        from shared.home_questions import queue_question_deduped
-    except Exception:
-        return
-    if intent == LOOP_INTENT_DECISION:
-        q = f"You flagged a decision: \"{loop_text}\". Want me to dig in, or is this still on you?"
-        opts = [
-            {"label": "Research this", "value": f"research:{loop_text}"},
-            {"label": "Still thinking", "value": "defer"},
-            {"label": "Already decided", "value": "done"},
-        ]
-        followup = f"enqueue:research:{loop_text}"
-    else:  # LOOP_INTENT_WAITING
-        who = when_hint or "them"
-        q = f"You're waiting on: \"{loop_text}\". Any update from {who}?"
-        opts = [
-            {"label": "No movement", "value": "waiting"},
-            {"label": "Got the answer", "value": "resolved"},
-            {"label": "Drop it", "value": "drop"},
-        ]
-        followup = ""
-    try:
-        queue_question_deduped(
-            org_id=org_id,
-            question_text=q,
-            context_ref=f"loop:{loop_id}",
-            suggested_options=opts,
-            followup_action=followup,
-        )
-    except Exception:
-        _log.debug("pa_extractor: queue_loop_question failed", exc_info=True)
+# NOTE (2026-04-27): _queue_loop_question removed. Eager question queueing
+# at extraction time was the "abstract question" failure mode — a loop got
+# created from one chat tangent and immediately surfaced as a dashboard
+# question regardless of context, cooldown, or the user's actual interest.
+# The deterministic tools/anchored_asks producer is now the single owner of
+# question creation; it fires on real episodic state (overdue, stale, etc.)
+# with proper cooldowns and mute filters.
 
 
 def _parse_json(raw: str) -> dict | None:
@@ -190,7 +171,6 @@ def extract_and_persist(
             summary["error"] = "json_parse_failed"
             return summary
 
-        questions_queued = 0
         for loop in _as_list(parsed, "new_loops"):
             text = str(loop.get("text", "")).strip()
             if not text:
@@ -206,13 +186,8 @@ def extract_and_persist(
             )
             if res:
                 summary["loops_created"] += 1
-                # Surface a clarifying question for open decisions / external waits.
-                # Cap to 2 per turn so a chatty turn can't flood the dashboard.
-                if questions_queued < 2 and intent in (LOOP_INTENT_DECISION, LOOP_INTENT_WAITING):
-                    loop_id = res.get("Id") or res.get("id")
-                    if loop_id:
-                        _queue_loop_question(org_id, int(loop_id), text, intent, when_hint)
-                        questions_queued += 1
+                # Question surfacing now happens via tools/anchored_asks on
+                # its own schedule — no eager queueing here.
 
         for item in _as_list(parsed, "resolved_loops"):
             match_text = str(item.get("match_text", "")).strip()

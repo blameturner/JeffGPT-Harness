@@ -224,11 +224,13 @@ def daily_digest_job(payload: dict | None = None) -> dict:
     source_count = sum(len(v) for v in clusters.values())
     nocodb_id = _persist_row(client, org_id, date_str, markdown, len(clusters), source_count)
     embedded = _embed_digest(org_id, date_str, markdown)
-    stale_questions = _queue_stale_loop_questions(org_id)
+    # NOTE (2026-04-27): stale-loop question queueing removed. tools/anchored_asks
+    # is the single owner of question creation; it fires on real loop state with
+    # mute + engagement filters, not on a digest tick.
 
     _log.info(
-        "daily_digest done  org_id=%d date=%s clusters=%d sources=%d nocodb_id=%s embedded=%d stale_q=%d",
-        org_id, date_str, len(clusters), source_count, nocodb_id, embedded, stale_questions,
+        "daily_digest done  org_id=%d date=%s clusters=%d sources=%d nocodb_id=%s embedded=%d",
+        org_id, date_str, len(clusters), source_count, nocodb_id, embedded,
     )
     return {
         "status": "ok",
@@ -238,66 +240,10 @@ def daily_digest_job(payload: dict | None = None) -> dict:
         "sources": source_count,
         "nocodb_id": nocodb_id,
         "embedded_chunks": embedded,
-        "stale_loop_questions": stale_questions,
     }
 
 
-def _queue_stale_loop_questions(org_id: int) -> int:
-    """For open loops untouched beyond the staleness threshold, ask the user
-    for a status update. Capped per run so a backlog doesn't flood home."""
-    try:
-        from shared.pa.memory import list_open_loops, LOOP_STATUS_OPEN, LOOP_STATUS_NUDGED
-        from shared.home_questions import queue_question_deduped
-    except Exception:
-        return 0
-
-    stale_days = float(_cfg("stale_loop_days", 3) or 3)
-    max_per_run = int(_cfg("stale_loop_max_questions", 3) or 3)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
-
-    try:
-        loops = list_open_loops(org_id, status=None, limit=100) or []
-    except Exception:
-        _log.warning("digest: list_open_loops failed  org=%d", org_id, exc_info=True)
-        return 0
-
-    queued = 0
-    for lp in loops:
-        status = lp.get("status")
-        if status not in (LOOP_STATUS_OPEN, LOOP_STATUS_NUDGED):
-            continue
-        updated = lp.get("UpdatedAt") or lp.get("last_seen_at") or lp.get("CreatedAt") or ""
-        try:
-            ts = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        if ts >= cutoff:
-            continue
-        loop_id = lp.get("Id") or lp.get("id")
-        text = (lp.get("text") or "").strip()
-        if not loop_id or not text:
-            continue
-        age_days = int((datetime.now(timezone.utc) - ts).total_seconds() / 86400)
-        q = f"Still on your plate after {age_days}d: \"{text}\". Where's this at?"
-        opts = [
-            {"label": "Done", "value": "resolved"},
-            {"label": "Still working", "value": "nudge"},
-            {"label": "Drop it", "value": "drop"},
-        ]
-        try:
-            qid = queue_question_deduped(
-                org_id=org_id,
-                question_text=q,
-                context_ref=f"loop:{loop_id}:stale",
-                suggested_options=opts,
-                followup_action="",
-            )
-            if qid:
-                queued += 1
-        except Exception:
-            _log.debug("digest: queue stale question failed  loop=%s", loop_id, exc_info=True)
-        if queued >= max_per_run:
-            break
-    return queued
+# NOTE (2026-04-27): _queue_stale_loop_questions removed.
+# Replaced by tools/anchored_asks/agent.py — deterministic, fires on
+# real loop state (overdue, decision_pending > 24h, waiting > 72h),
+# with mute and engagement filters.

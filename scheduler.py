@@ -207,6 +207,175 @@ def _pa_tick() -> None:
         _log.warning("pa tick failed", exc_info=True)
 
 
+def _enumerate_home_orgs() -> list[int]:
+    """Orgs that have a home conversation — the surface the new producers post into."""
+    try:
+        from infra.nocodb_client import NocodbClient
+        client = NocodbClient()
+        if "conversations" not in client.tables:
+            return []
+        rows = client._get_paginated("conversations", params={
+            "where": "(kind,eq,home)",
+            "limit": 200,
+        })
+        if not rows:
+            rows = client._get_paginated("conversations", params={
+                "where": "(title,eq,Home — ongoing)",
+                "limit": 200,
+            })
+        return sorted({int(r.get("org_id") or 0) for r in rows if r.get("org_id")})
+    except Exception:
+        _log.warning("home org enumeration failed", exc_info=True)
+        return []
+
+
+def _anchored_asks_tick() -> None:
+    """5 min before each daily_brief slot; deterministic question producer."""
+    try:
+        from infra.config import is_feature_enabled, get_feature
+        if not is_feature_enabled("pa") or not get_feature("anchored_asks", "enabled", True):
+            return
+        from tools.anchored_asks.agent import run_anchored_asks
+        for org_id in _enumerate_home_orgs():
+            if org_id <= 0:
+                continue
+            try:
+                run_anchored_asks(org_id)
+            except Exception:
+                _log.warning("anchored_asks tick failed  org=%d", org_id, exc_info=True)
+    except Exception:
+        _log.warning("anchored_asks tick top-level failed", exc_info=True)
+
+
+def _daily_brief_tick() -> None:
+    """Long-form briefing producer. Picks a mode variant from time_context."""
+    try:
+        from infra.config import is_feature_enabled, get_feature
+        if not is_feature_enabled("pa") or not get_feature("daily_brief", "enabled", True):
+            return
+        from tools.daily_brief.agent import run_daily_brief
+        for org_id in _enumerate_home_orgs():
+            if org_id <= 0:
+                continue
+            try:
+                run_daily_brief(org_id)
+            except Exception:
+                _log.warning("daily_brief tick failed  org=%d", org_id, exc_info=True)
+    except Exception:
+        _log.warning("daily_brief tick top-level failed", exc_info=True)
+
+
+def _research_seeder_tick() -> None:
+    """Nightly research kickoff. Seeds 1–2 plans for the morning brief."""
+    try:
+        from infra.config import is_feature_enabled, get_feature
+        if not is_feature_enabled("pa") or not get_feature("research_seeder", "enabled", True):
+            return
+        from tools.research_seeder.agent import run_research_seeder
+        for org_id in _enumerate_home_orgs():
+            if org_id <= 0:
+                continue
+            try:
+                run_research_seeder(org_id)
+            except Exception:
+                _log.warning("research_seeder tick failed  org=%d", org_id, exc_info=True)
+    except Exception:
+        _log.warning("research_seeder tick top-level failed", exc_info=True)
+
+
+def _add_brief_jobs(sched: BackgroundScheduler) -> None:
+    """Register the brief / asks / seeder cron jobs.
+
+    Schedule comes from config.json under home.daily_brief.schedule with a
+    safe fallback. Asks fire 5 min before each brief slot; seeder fires nightly.
+    """
+    from infra.config import get_feature
+    tz = get_feature("home", "timezone", "Australia/Sydney")
+    schedule_cfg: dict = get_feature("home", "daily_brief_schedule", {}) or {}
+
+    default_schedule = {
+        "monday_morning":   "30 6 * * 1",
+        "midweek_morning":  "30 6 * * 2-4",
+        "friday_pm":        "30 16 * * 5",
+        "weekday_midday":   "0 14 * * 1-5",
+        "weekend":          "30 9 * * 0,6",
+    }
+    schedule = {**default_schedule, **schedule_cfg}
+
+    asks_offset = int(get_feature("home", "anchored_asks_lead_minutes", 5) or 5)
+    seeder_cron = get_feature("home", "research_seeder_cron", "0 22 * * *")
+
+    for slot_name, cron_expr in schedule.items():
+        try:
+            brief_trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
+            sched.add_job(
+                _daily_brief_tick,
+                brief_trigger,
+                id=f"daily_brief_{slot_name}",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            asks_trigger = _shifted_cron(cron_expr, -asks_offset, tz)
+            if asks_trigger is not None:
+                sched.add_job(
+                    _anchored_asks_tick,
+                    asks_trigger,
+                    id=f"anchored_asks_{slot_name}",
+                    max_instances=1,
+                    coalesce=True,
+                    replace_existing=True,
+                )
+        except Exception:
+            _log.warning("brief schedule registration failed  slot=%s expr=%s", slot_name, cron_expr, exc_info=True)
+
+    try:
+        sched.add_job(
+            _research_seeder_tick,
+            CronTrigger.from_crontab(seeder_cron, timezone=tz),
+            id="research_seeder_nightly",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+    except Exception:
+        _log.warning("research_seeder schedule registration failed", exc_info=True)
+
+
+def _shifted_cron(cron_expr: str, minute_offset: int, tz: str):
+    """Return a CronTrigger for ``cron_expr`` shifted by ``minute_offset``.
+
+    Only shifts by minutes (the only practical case for our offsets, ≤ 60).
+    Falls back to ``None`` if the shift would require crossing hour/day
+    boundaries for an unusual expression — caller logs and continues.
+    """
+    parts = cron_expr.split()
+    if len(parts) < 5:
+        return None
+    minute_str, hour_str, dom, mon, dow = parts[0], parts[1], parts[2], parts[3], parts[4]
+    try:
+        minute = int(minute_str)
+        hour = int(hour_str)
+    except ValueError:
+        # Wildcards or ranges in minute/hour — don't try to shift.
+        return None
+    new_minute = minute + minute_offset
+    new_hour = hour
+    while new_minute < 0:
+        new_minute += 60
+        new_hour -= 1
+    while new_minute >= 60:
+        new_minute -= 60
+        new_hour += 1
+    if new_hour < 0 or new_hour > 23:
+        return None
+    shifted = f"{new_minute} {new_hour} {dom} {mon} {dow}"
+    try:
+        return CronTrigger.from_crontab(shifted, timezone=tz)
+    except Exception:
+        return None
+
+
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
     sched = BackgroundScheduler(timezone="UTC")
@@ -225,6 +394,11 @@ def start_scheduler() -> BackgroundScheduler:
         _log.info("pa proactive tick scheduled (20 min interval)")
     except Exception:
         _log.warning("pa tick registration failed", exc_info=True)
+    try:
+        _add_brief_jobs(sched)
+        _log.info("daily_brief / anchored_asks / research_seeder jobs registered")
+    except Exception:
+        _log.warning("brief job registration failed", exc_info=True)
     _scheduler = sched
     return sched
 

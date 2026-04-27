@@ -3,6 +3,22 @@
 Each move is a pure function returning a :class:`MoveCandidate` or ``None``.
 ``None`` means "no fresh input right now — skip"; all failure modes collapse
 to that same signal so the picker can treat moves uniformly.
+
+NOTE (2026-04-27): All four move functions below are SIDELINED — they are
+no longer wired into ``shared.pa.picker._MOVES``. They were the source of
+"abstract questions about topics the user never cared about" because they
+fired off graph shape (sparse_concepts, shortest paths) and raw warmth
+rather than episodic state. Their replacements:
+
+- ``closure`` → ``tools/anchored_asks/agent.py`` — deterministic, fires on
+  real loop state (overdue events, decisions older than 24h, waits older
+  than 72h, overdue todos).
+- ``serendipity``, ``connect``, ``news_watch`` → folded into the
+  ``daily_brief`` producer's "worth a look" section, gated on warm-topic
+  recency (≤ 7d) and engagement signals.
+
+The functions are kept so the framework can be reintroduced under stricter
+triggers later if useful.
 """
 from __future__ import annotations
 

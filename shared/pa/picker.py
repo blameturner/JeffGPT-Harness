@@ -38,10 +38,13 @@ COOLDOWNS: dict[str, float] = {
 }
 
 _MOVES: list[tuple[str, callable]] = [
-    (MOVE_KIND_CLOSURE, closure),
-    (MOVE_KIND_CONNECT, connect),
-    (MOVE_KIND_NEWS, news_watch),
-    (MOVE_KIND_SERENDIPITY, serendipity),
+    # NOTE: emptied 2026-04-27 as part of the personal-assistant redesign.
+    # The graph-shape-driven moves (serendipity, connect) and the warmth-only
+    # news_watch produced "abstract questions about topics the user never
+    # cared about". Closure was replaced by the deterministic
+    # tools/anchored_asks producer which fires on real loop state, not on a
+    # picker tick. This list is intentionally empty; the picker framework
+    # remains for future moves that pass the "useful, not novelty" bar.
 ]
 
 

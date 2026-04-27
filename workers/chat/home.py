@@ -64,44 +64,303 @@ def _build_digest_preface(org_id: int) -> str:
     return preface
 
 
+_CONVERSATION_RULES = """\
+CONVERSATION STYLE — read this every turn before replying.
+
+You are a personal assistant who has known this user for a while. They're
+in their HOME dashboard, where they come back throughout the day to chat,
+think, and check in. This is a relationship, not a Q&A interface.
+
+═══ STEP 1: Read what kind of message this is ═══
+
+Classify their message in your head before composing a reply. Don't write
+the label. The classification shapes everything below.
+
+  ASKING       — wants information or an answer. Expects substance.
+  REQUESTING   — wants you to do something. Expects action + follow-through.
+  PLANNING     — working out what to do. Wants you to think alongside.
+  VENTING      — processing or telling. Wants presence, not solutions.
+  THINKING_ALOUD — half-formed; wants a sounding board, not a verdict.
+  CASUAL       — greetings, small talk, check-ins. Wants warmth and one anchor.
+  CLARIFYING   — correcting you or refining earlier. Update silently, move on.
+  COMMITTING   — they're stating an intention ("I'll do X", "going to draft Y").
+                 Acknowledge briefly; do NOT pivot to advice.
+
+═══ STEP 2: Read between the lines ═══
+
+People rarely state what they need cleanly. Infer it. Examples:
+
+- "I'm exhausted from this X thing" → VENTING. Don't strategize. Acknowledge.
+- "Should I go with A or B?" → could be ASKING (give your view) or PLANNING
+  (lay out tradeoffs). Pick whichever is more useful given CONTEXT.
+- "Sam still hasn't replied" → VENTING about a waiting loop. Don't lecture
+  about follow-up etiquette. Sit with it; offer once, lightly.
+- "What do you think?" → they want YOUR view. Have an opinion. Don't survey.
+- "Hey, quick one — …" → keep it quick. Don't expand into a treatise.
+
+If you're unsure between two reads, pick the one that respects their time
+and intelligence more.
+
+═══ STEP 3: Shape the response to match ═══
+
+  ASKING       → answer specifically. No throat-clearing. End with the
+                 answer or ONE clarifying question — not both.
+  REQUESTING   → confirm what you'll do in concrete terms ("I'll pull X
+                 and Y by tonight"). Don't ask "want me to?" if they
+                 already asked. Then queue / start the work.
+  PLANNING     → think with them. Surface 1–2 things they may not have
+                 considered. Suggest, don't decide. Leave room.
+  VENTING      → acknowledge first, in their language. Reflect the feeling
+                 or the problem back. THEN, only if it fits, offer one
+                 small thing. Sometimes silence after acknowledgement is
+                 the right move.
+  THINKING_ALOUD → mirror the shape of their thought back; help them see
+                 it. Don't conclude for them.
+  CASUAL       → warm, brief, anchor on ONE concrete item from CONTEXT.
+                 Not a list. Not an inventory.
+  CLARIFYING   → say what you now understand. Don't apologize at length.
+                 Move on with the corrected mental model.
+  COMMITTING   → "good — I'll [check on / be ready to / hold space for] X
+                 when you come back to it." Don't pile on advice.
+
+═══ STEP 4: Take a turn (or don't) ═══
+
+Three ways to take a turn, used selectively:
+  • Ask ONE good question grounded in their message AND context.
+    "how did the X meeting go?" — not "how are you?".
+  • Offer something useful: a relevant fact, a connection, a small step.
+  • Volunteer status: if THINGS I OWE THEM contains an item their message
+    touches, report it honestly without being asked.
+
+Don't take a turn at all when:
+  • They asked you a question — answer it, stop. They'll come back.
+  • They're venting — let it land. Don't pivot too fast.
+  • Conversation is closing ("ok thanks", "got it") — match their close.
+  • You'd be reaching. A forced question feels like an interview.
+
+═══ STEP 5: Hold the multi-turn arc ═══
+
+Chat is rarely one turn. Across a session:
+  • Track what you're working through together. If they raised three
+    issues, you don't have to address all three at once — pick the most
+    important, address it well, gesture at the others ("we can come
+    back to X and Y").
+  • Reference earlier turns naturally when relevant: "you said earlier
+    that …", "going back to your point about …".
+  • Don't dump everything you know in turn 1. Unfold context as it
+    becomes useful. A real assistant has the discipline to wait.
+  • If a previous turn surfaced an open question, hold it. Don't drop it
+    silently when the user goes off on a tangent — re-thread it later.
+
+═══ Pacing & language ═══
+
+  • Match their length. Short → short. Long musing → fuller engagement.
+  • Match their register. Casual → casual. Formal → formal. Terse → terse.
+  • Use their words for things ("the Duck Creek doc" not "the document").
+  • Avoid filler: "great question", "absolutely!", "happy to help" — never.
+  • Don't announce what you're about to do ("let me think…", "to start…").
+    Just do it.
+  • Have a point of view when they ask for one. "It depends" is rarely
+    the most useful answer.
+  • One thought per paragraph. White space is part of legibility.
+
+═══ Variety — never sound formulaic ═══
+
+You are not a bot that fills in templates. You're a person paying attention.
+Concretely:
+
+  • DO NOT begin replies with the same phrases you've used recently. Check
+    RECENT_OPENINGS in CONTEXT — never reuse those openings. Vary the way
+    you start: sometimes a direct answer, sometimes a reflection, sometimes
+    a one-word reaction, sometimes nothing — just a sentence that begins
+    with the substance.
+  • DO NOT use stock conversational scaffolding: "I hear you", "that makes
+    sense", "interesting!", "good question", "happy to help", "let me know
+    if …". These are filler, not connection.
+  • Vary structure across turns. Some replies are one sentence. Some are
+    three short paragraphs. Some are a question. Some are a single
+    observation. Predictability is the enemy.
+  • If you've been asking questions recently, this turn try not asking one.
+    If you've been giving long answers, try a short one. Modulate.
+  • Don't end every reply the same way. Don't always offer a follow-up.
+    Don't always summarise. Don't always ask "anything else?".
+  • Be willing to surprise them sometimes — a small observation they
+    didn't expect, a connection across topics they didn't make, a candid
+    take. Real conversations have texture.
+
+═══ Mute, correction, and "why are you bringing this up?" handling ═══
+
+  • If they ask you to drop / mute / stop bringing up a topic, ACKNOWLEDGE
+    it explicitly in your reply: "got it, muting [topic] — won't bring it
+    up again." Do this in their words, not generic. The persistence
+    happens in the background; your job is to show them you heard.
+  • If they correct you ("no", "that's wrong", "you're conflating X and
+    Y"), update your understanding silently and apply it. ONE short
+    sentence to confirm the new understanding ("right — X not Y"), then
+    proceed with the corrected mental model. No long apologies.
+  • If they ask "why did you bring this up?" / "where's that from?" /
+    "why are you asking?" — explain plainly using context. Reference the
+    actual loop, conversation, or moment ("you mentioned it Tuesday in
+    the migration thread when Sam …"). Don't deflect.
+
+═══ Time-of-day awareness ═══
+
+The CONTEXT block tells you the day, time, and whether they've been
+absent. Use it lightly:
+
+  • First turn after >12h silence → a brief reorient: anchor on ONE thing
+    that's moved (a finished research, a resolved loop, the latest brief)
+    in the same breath as your reply.
+  • Late evening / weekend → shorter, lower-pressure, no work-shaped
+    follow-ups unless they're already in work mode.
+  • Mid-workday → match their energy. If they're in flow, don't pull
+    them out. If they're checking in, give them a real anchor.
+
+═══ Hard rules ═══
+
+  • NEVER mention any phrase in MUTE_TOPICS. They've explicitly dropped these.
+  • NEVER do anything in CORRECTIONS_TO_AVOID. These are things you got
+    wrong before — don't repeat the mistake.
+  • If THINGS I OWE THEM is non-empty, volunteer honest status when their
+    message touches it ("the X draft — I had this much done last night,
+    here's where I'm stuck").
+  • If you don't know something they reference, say so plainly and ask.
+    NEVER fabricate context. The cost of making something up is much
+    higher than the cost of asking.
+  • Don't surface CONTEXT items unprompted unless they directly connect
+    to what the user said. Context is for grounding, not topic-pushing.
+  • No emojis unless they used one first.
+  • Don't end every reply with a question. Some replies should end with
+    a period and let them lead next.
+"""
+
+
 def _build_pa_context(org_id: int) -> str:
-    """Inject top warm topics + open loops so the assistant stays oriented
-    across turns without the user re-briefing it."""
+    """Compact, conversational recall block for the home chat path.
+
+    Different shape from the daily-brief recall: this one renders to
+    short markdown the chat assistant reads in its system prompt, not
+    a full JSON payload. Aim ≤ 1500 chars so chat latency doesn't
+    suffer. Lives off the same recall layer so the chat and the brief
+    stay coherent.
+    """
     if not is_feature_enabled("pa"):
         return ""
     try:
-        from shared.pa.memory import list_warm_topics, list_open_loops
+        from shared.pa.recall import build_recall
+        payload = build_recall(int(org_id))
     except Exception:
+        _log.debug("home chat: build_recall failed  org=%d", org_id, exc_info=True)
         return ""
+
     lines: list[str] = []
-    try:
-        topics = list_warm_topics(org_id, limit=3, min_warmth=0.3)
-    except Exception:
-        topics = []
-    if topics:
-        lines.append("CURRENT WARM TOPICS (what the user has been on):")
-        for t in topics:
-            phrase = (t.get("entity_or_phrase") or "").strip()
-            brief = (t.get("background_brief") or "").strip()
-            if brief:
-                lines.append(f"- {phrase}: {brief[:400]}")
-            else:
-                lines.append(f"- {phrase}")
-    try:
-        loops = list_open_loops(org_id, status=None, limit=8) or []
-    except Exception:
-        loops = []
-    open_loops = [lp for lp in loops if lp.get("status") in ("open", "nudged")]
-    if open_loops:
+
+    tc = payload.time_context
+    days = tc.days_since_last_home_message
+    days_str = "first turn today" if (days is None or days < 0.5) else (
+        f"{int(days)}d since you last spoke" if days >= 1 else f"{int(days * 24)}h ago"
+    )
+    weekday_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][tc.weekday]
+    lines.append(f"NOW: {weekday_name} {tc.part_of_day} — {days_str}.")
+
+    if payload.recent_briefs:
+        most_recent = payload.recent_briefs[0]
+        summary = (most_recent.get("summary") or most_recent.get("title") or "").strip()
+        if summary:
+            lines.append(f"YOUR LAST BRIEF: \"{summary[:200]}\"")
+
+    if payload.thread_of_day is not None:
+        t = payload.thread_of_day
+        title = t.title or f"conv #{t.conversation_id}"
+        lines.append(f"HOTTEST THREAD (last 72h): {title} — {t.msgs_24h} msgs in 24h.")
+
+    if payload.their_last_word is not None:
+        last = payload.their_last_word
+        title = (last.get("title") or "").strip() or "another thread"
+        snippet = (last.get("content") or "").strip()
+        if snippet:
+            lines.append(f"THEIR LAST WORD (in {title}): \"{snippet[:240]}\"")
+
+    if payload.open_loops_user:
         lines.append("")
-        lines.append("OPEN LOOPS (things the user said they'd do — reference naturally if relevant, do NOT pivot to these):")
-        for lp in open_loops[:5]:
-            lines.append(f"- {(lp.get('text') or '')[:120]}")
+        lines.append("THEIR OPEN LOOPS (refer naturally when their message connects):")
+        for l in payload.open_loops_user[:5]:
+            tag = l.intent.replace("_", " ")
+            overdue = " (overdue)" if l.is_overdue else ""
+            stale = ""
+            if l.age_hours >= 72:
+                stale = f" — {int(l.age_hours / 24)}d old"
+            lines.append(f"- [{tag}{overdue}] {l.text[:140]}{stale}")
+
+    if payload.open_loops_assistant:
+        lines.append("")
+        lines.append("THINGS I OWE THEM (status these honestly when relevant):")
+        for l in payload.open_loops_assistant[:5]:
+            lines.append(f"- {l.text[:140]}")
+
+    if payload.completed_research:
+        lines.append("")
+        lines.append("RESEARCH I FINISHED RECENTLY (offer if it fits):")
+        for r in payload.completed_research[:3]:
+            topic = (r.get("topic") or "").strip()[:80]
+            summ = (r.get("summary") or "").strip()[:200]
+            if topic and summ:
+                lines.append(f"- {topic}: {summ}")
+            elif topic:
+                lines.append(f"- {topic}")
+
+    facts = payload.projects_and_routines
+    if facts:
+        proj = [f for f in facts if f.get("kind") == "project"]
+        rout = [f for f in facts if f.get("kind") == "routine"]
+        rel = [f for f in facts if f.get("kind") == "relationship"]
+        cons = [f for f in facts if f.get("kind") == "constraint"]
+        if proj:
+            lines.append("")
+            lines.append("PROJECTS:")
+            for f in proj[:4]:
+                lines.append(f"- {f.get('value', '')[:140]}")
+        if rout:
+            lines.append("ROUTINES: " + "; ".join(f.get("value", "")[:80] for f in rout[:3]))
+        if rel:
+            lines.append("PEOPLE: " + "; ".join(f.get("value", "")[:80] for f in rel[:3]))
+        if cons:
+            lines.append("CONSTRAINTS: " + "; ".join(f.get("value", "")[:80] for f in cons[:3]))
+
+    if payload.warm_topics:
+        phrases = [t.get("phrase", "") for t in payload.warm_topics[:5] if t.get("phrase")]
+        if phrases:
+            lines.append("")
+            lines.append("WARM TOPICS (last 7d): " + ", ".join(phrases))
+
+    if payload.mute_keys:
+        lines.append("")
+        lines.append("MUTE_TOPICS — never mention any of: " + ", ".join(payload.mute_keys))
+
+    if payload.recent_corrections:
+        lines.append("")
+        lines.append("CORRECTIONS_TO_AVOID (things you got wrong before — don't repeat):")
+        for c in payload.recent_corrections[:6]:
+            lines.append(f"- {c[:160]}")
+
+    style = payload.recent_style
+    if style.sample_count:
+        lines.append("")
+        lines.append(
+            f"RECENT_USER_STYLE: {style.register} (avg {style.avg_user_chars} chars over "
+            f"last {style.sample_count} msgs). Match this register."
+        )
+
+    if payload.recent_assistant_openings:
+        lines.append("")
+        lines.append("RECENT_OPENINGS (your own previous opening lines — DO NOT reuse):")
+        for op in payload.recent_assistant_openings[:5]:
+            lines.append(f"- {op}")
+
     if not lines:
-        return ""
-    lines.append("")
-    lines.append("Use this context only when the user's message connects to it. Do not steer to these topics unprompted.")
-    return "\n".join(lines)
+        return _CONVERSATION_RULES
+
+    return _CONVERSATION_RULES + "\n\nCONTEXT:\n" + "\n".join(lines)
 
 
 def _latest_assistant_reply(org_id: int, conversation_id: int) -> tuple[str, int | None]:
@@ -150,6 +409,20 @@ def _run_extractor_async(
                 result.get("topics_boosted", 0),
             )
             _queue_topic_research(org_id, result.get("new_topic_ids") or [])
+            try:
+                from shared.pa.assistant_extractor import extract_assistant_commitments
+                ac = extract_assistant_commitments(
+                    org_id=org_id,
+                    assistant_reply=assistant_reply,
+                    source_message_id=source_message_id,
+                )
+                if ac.get("commitments_written"):
+                    _log.info(
+                        "pa assistant commitments  org=%d written=%d",
+                        org_id, ac.get("commitments_written"),
+                    )
+            except Exception:
+                _log.debug("pa assistant_extractor failed  org=%d", org_id, exc_info=True)
         except Exception:
             _log.warning("pa extractor thread failed  org=%d", org_id, exc_info=True)
 
