@@ -1,5 +1,5 @@
 {
-  "models": {},
+  "models": { "http_timeout_s": 2400 },
   "features": {
     "chat": {
       "enabled": true,
@@ -88,21 +88,23 @@
       "planner_enabled": true,
       "agent_enabled": true,
       "max_queries": 20,
-      "max_iterations": 3,
       "planner_retry_attempts": 5,
       "planner_retry_backoff_s": 8,
       "planner_timeout_s": 3600,
       "planner_fallback_enabled": true,
       "web_search_per_query_timeout_s": 900,
-      "synthesis_timeout_s": 14400,
-      "critic_timeout_s": 5400,
+      "section_timeout_s": 1800,
+      "doc_type_timeout_s": 300,
+      "reviewer_timeout_s": 2400,
       "stale_plan_hours": 24,
-      "confidence_threshold": 80,
       "search_extraction_model": "research_search_extraction",
       "models": {
-        "research_planner":          { "role": "t1_secondary", "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 10000 },
-        "research_agent":            { "role": "t1_secondary", "temperature": 0.3, "max_tokens": 20000, "max_input_chars": 30000 },
-        "research_search_extraction": { "role": "exp_rwkv_r",   "temperature": 0.2, "max_tokens": 500,   "max_input_chars": 12000, "frequency_penalty": 0.2 }
+        "research_planner":           { "role": "t3_tool",     "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 12000 },
+        "research_doc_type":          { "role": "t3_tool",     "temperature": 0.1, "max_tokens": 60,    "max_input_chars": 2000 },
+        "research_section_writer":    { "role": "t1_secondary","temperature": 0.3, "max_tokens": 6000,  "max_input_chars": 32000 },
+        "research_reviewer":          { "role": "t1_secondary","temperature": 0.2, "max_tokens": 12000, "max_input_chars": 64000 },
+        "research_agent":             { "role": "t1_secondary","temperature": 0.3, "max_tokens": 20000, "max_input_chars": 30000 },
+        "research_search_extraction": { "role": "exp_rwkv_r",  "temperature": 0.2, "max_tokens": 500,   "max_input_chars": 12000, "frequency_penalty": 0.2 }
       }
     },
     "graph_extract": {

@@ -229,6 +229,140 @@ def research_complete(plan_id: int):
     return {"status": "ok", "plan_id": plan_id}
 
 
+class ResearchOpRequest(BaseModel):
+    params: dict = {}
+
+
+@router.post("/research/{plan_id}/ops/{kind}")
+def research_op_invoke(plan_id: int, kind: str, body: ResearchOpRequest | None = None):
+    """Generic post-build operation invoker.
+
+    `kind` is one of the keys in ``ASYNC_OPS`` or ``SYNC_OPS`` in
+    ``tools.research.operations``. Sync ops run inline; async ops are queued.
+    The frontend POSTs JSON like ``{"params": {"section_title": "..."}}``.
+    """
+    from fastapi import HTTPException
+    from tools.research.operations import ASYNC_OPS, SYNC_OPS, run_research_op
+
+    params = (body.params if body else {}) or {}
+
+    if kind in SYNC_OPS:
+        return run_research_op({"plan_id": plan_id, "kind": kind, "params": params})
+
+    if kind not in ASYNC_OPS:
+        raise HTTPException(status_code=400, detail=f"unknown op kind: {kind}")
+
+    tq = get_tool_queue()
+    if not tq:
+        raise HTTPException(status_code=503, detail="tool_queue_unavailable")
+
+    org_id = 1
+    try:
+        row = NocodbClient()._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+        plan = row.get("list", [])[0] if row.get("list") else None
+        if plan:
+            org_id = resolve_org_id(plan.get("org_id"))
+    except Exception:
+        _log.warning("research_op org lookup failed  plan_id=%d  kind=%s", plan_id, kind, exc_info=True)
+    if org_id <= 0:
+        org_id = 1
+
+    job_id = tq.submit(
+        "research_op",
+        {"plan_id": plan_id, "kind": kind, "params": params},
+        source=f"research_op_{kind}",
+        priority=3,
+        org_id=org_id,
+    )
+    return {"status": "queued", "plan_id": plan_id, "kind": kind, "job_id": job_id}
+
+
+@router.get("/research/{plan_id}/artifacts")
+def research_artifacts(plan_id: int):
+    """Return all stashed artifacts for a plan (slide_deck, email_tldr,
+    qa_pack, action_plan, fact_check, citation_audit, …).
+
+    Artifacts live inside the existing ``schema`` JSON column under the
+    reserved ``_artifacts`` key — no dedicated DB column required.
+    """
+    import json as _json
+    from fastapi import HTTPException
+    row = NocodbClient()._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+    plan = row.get("list", [])[0] if row.get("list") else None
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan not found")
+    raw_schema = plan.get("schema") or "{}"
+    try:
+        schema = _json.loads(raw_schema) if isinstance(raw_schema, str) else (raw_schema or {})
+    except (_json.JSONDecodeError, TypeError):
+        schema = {}
+    arts = schema.get("_artifacts") if isinstance(schema, dict) else {}
+    return {"plan_id": plan_id, "artifacts": arts if isinstance(arts, dict) else {}}
+
+
+@router.get("/research/doc-types")
+def research_doc_types():
+    """Catalog of supported document types — frontend uses this to drive the
+    new-paper picker and the reframe selector."""
+    from tools.research.agent import DOC_TYPES, DEFAULT_DOC_TYPE
+    return {
+        "default": DEFAULT_DOC_TYPE,
+        "types": [
+            {"key": k, "opener": v["opener"], "closer": v["closer"], "tone": v["tone"]}
+            for k, v in DOC_TYPES.items()
+        ],
+    }
+
+
+@router.post("/research/{plan_id}/start")
+def research_start(plan_id: int):
+    """Invoke a deferred (hidden) research plan — clears its hidden type and
+    queues the planner job that will then run the agent inline."""
+    from tools.research.research_planner import start_research_plan
+    return start_research_plan(plan_id)
+
+
+class ResearchReviewRequest(BaseModel):
+    instructions: str = ""
+
+
+@router.post("/research/{plan_id}/review")
+def research_review(plan_id: int, body: ResearchReviewRequest | None = None):
+    """Trigger an explicit review pass on an already-completed research paper.
+
+    A reviewer model reads the paper (with the user's optional ``instructions``
+    folded in) and emits per-section revision notes; the writer rebuilds the
+    affected sections and the new paper replaces the old. Runs async via the
+    tool queue so a long review never blocks the request.
+    """
+    from fastapi import HTTPException
+    tq = get_tool_queue()
+    if not tq:
+        raise HTTPException(status_code=503, detail="tool_queue_unavailable")
+
+    instructions = (body.instructions if body else "") or ""
+
+    org_id = 1
+    try:
+        row = NocodbClient()._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+        plan = row.get("list", [])[0] if row.get("list") else None
+        if plan:
+            org_id = resolve_org_id(plan.get("org_id"))
+    except Exception:
+        _log.warning("research_review org lookup failed plan_id=%d", plan_id, exc_info=True)
+    if org_id <= 0:
+        org_id = 1
+
+    job_id = tq.submit(
+        "research_review",
+        {"plan_id": plan_id, "org_id": org_id, "instructions": instructions},
+        source="research_review",
+        priority=3,
+        org_id=org_id,
+    )
+    return {"status": "queued", "plan_id": plan_id, "job_id": job_id}
+
+
 @router.post("/research/agent/run")
 def research_agent_run(req: ResearchAgentRequest):
     tq = get_tool_queue()

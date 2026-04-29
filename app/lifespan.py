@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
 
     from workers.tool_queue import HandlerConfig, ToolJobQueue, _set_instance
     from tools.graph_extract import _handle_graph_extract
-    from tools.research.agent import run_research_agent
+    from tools.research.agent import run_research_agent, review_research_paper
     from tools.research.research_planner import run_research_planner_job
     from tools.enrichment.scraper import scrape_page_job
     from tools.enrichment.summariser import summarise_page_job
@@ -62,6 +62,17 @@ async def lifespan(app: FastAPI):
     tool_queue.register("research_agent", HandlerConfig(
         handler=lambda p: run_research_agent(p["plan_id"]),
         max_workers=1, priority_default=3, source="research_agent",
+    ))
+    tool_queue.register("research_review", HandlerConfig(
+        handler=lambda p: review_research_paper(p["plan_id"], p.get("instructions", "")),
+        max_workers=1, priority_default=3, source="research_review",
+    ))
+    from tools.research.operations import run_research_op
+    # Allow two ops in flight (e.g. user fires fact_check + slide_deck) without
+    # one blocking the other.
+    tool_queue.register("research_op", HandlerConfig(
+        handler=run_research_op,
+        max_workers=2, priority_default=3, source="research_op",
     ))
     tool_queue.register("summarise_page", HandlerConfig(
         handler=summarise_page_job,

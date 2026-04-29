@@ -462,12 +462,18 @@ def create_research_plan(
     org_id: int = 0,
     parent_insight_id: int | None = None,
     focus: str = "",
+    defer_run: bool = False,
 ) -> dict:
-    """Create a shell research_plans row and queue the planner job.
+    """Create a shell research_plans row and (optionally) queue the planner job.
     Returns immediately with the plan_id so the UI can poll for status.
 
     If ``parent_insight_id`` is set, the completed paper will be appended to
     that insight (see ``shared.insights.append_research``).
+
+    If ``defer_run`` is True, the row is created with ``type="hidden"`` and
+    NO planner job is queued. The plan sits as a draft until a caller invokes
+    ``start_research_plan(plan_id)``. This is the path used by auto-spawned
+    insight follow-ups so the UI can hide them until the user opts in.
     """
     from infra.nocodb_client import NocodbClient
     from workers.tool_queue import get_tool_queue
@@ -490,6 +496,8 @@ def create_research_plan(
             "iterations": 0,
             "status": "pending",
         }
+        if defer_run:
+            payload["type"] = "hidden"
         if parent_insight_id:
             payload["parent_insight_id"] = int(parent_insight_id)
         if focus:
@@ -499,6 +507,9 @@ def create_research_plan(
     except Exception as e:
         _log.warning("shell plan save failed  topic=%s  error=%s", topic[:40], e)
         return {"status": "failed", "error": str(e)[:200]}
+
+    if defer_run:
+        return {"status": "deferred", "plan_id": plan_id}
 
     tq = get_tool_queue()
     if tq:
@@ -569,6 +580,49 @@ def run_research_planner_job(plan_id: int) -> dict:
     from tools.research.agent import run_research_agent
     _log.info("Running research agent inline for plan_id %d (queries=%d)", plan_id, len(queries))
     return run_research_agent(plan_id)
+
+
+def start_research_plan(plan_id: int) -> dict:
+    """Invoke a deferred (hidden) research plan: clear the hidden type and
+    queue the planner job that will generate queries and run the agent."""
+    from infra.nocodb_client import NocodbClient
+    from workers.tool_queue import get_tool_queue
+    from tools._org import resolve_org_id
+
+    client = NocodbClient()
+    try:
+        plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
+        plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
+    except Exception as e:
+        return {"status": "failed", "error": str(e)[:200], "plan_id": plan_id}
+    if not plan:
+        return {"status": "not_found", "plan_id": plan_id}
+
+    org_id = resolve_org_id(plan.get("org_id"))
+    try:
+        # Use None (NULL) rather than "" — if the column is a SingleSelect
+        # without an empty option, an empty string would 400.
+        client._patch("research_plans", plan_id, {"type": None, "status": "pending"})
+    except Exception as e:
+        _log.warning("start_research_plan: clear type failed  plan_id=%d  error=%s", plan_id, e)
+
+    tq = get_tool_queue()
+    if not tq:
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": "tool_queue_unavailable",
+        })
+        return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
+
+    job_id = tq.submit(
+        "research_planner",
+        {"plan_id": plan_id, "org_id": org_id},
+        source="research_api",
+        priority=3,
+        org_id=org_id,
+    )
+    _log.info("Started deferred research plan plan_id=%d job_id=%s", plan_id, job_id)
+    return {"status": "queued", "plan_id": plan_id, "job_id": job_id}
 
 
 def get_next_plan() -> dict | None:

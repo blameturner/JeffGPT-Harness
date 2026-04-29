@@ -332,15 +332,17 @@ def _maybe_queue_research(topic: str, org_id: int) -> dict:
         _log.error("insight: research_planner import failed — auto-research skipped", exc_info=True)
         return {"status": "import_failed"}
     try:
-        result = create_research_plan(topic, org_id=org_id)
+        # Auto-spawned from an insight: stays hidden in the UI until the user
+        # explicitly invokes it (see start_research_plan).
+        result = create_research_plan(topic, org_id=org_id, defer_run=True)
     except Exception as e:
         _log.error("insight: create_research_plan failed  topic=%s err=%s", topic[:80], e, exc_info=True)
         return {"status": "exception", "error": str(e)[:200]}
-    if isinstance(result, dict) and result.get("status") == "queued":
-        _log.info("insight: research plan queued  plan_id=%s job=%s topic=%s",
-                  result.get("plan_id"), result.get("job_id"), topic[:60])
+    if isinstance(result, dict) and result.get("status") in ("queued", "deferred"):
+        _log.info("insight: research plan %s  plan_id=%s topic=%s",
+                  result.get("status"), result.get("plan_id"), topic[:60])
     else:
-        _log.warning("insight: research plan not queued  topic=%s result=%s", topic[:60], result)
+        _log.warning("insight: research plan not created  topic=%s result=%s", topic[:60], result)
     return result if isinstance(result, dict) else {"status": "unknown"}
 
 
