@@ -74,8 +74,10 @@ def list_items(
 
 
 def _normalize_row(r: dict) -> dict:
+    row_id = r.get("Id")
     return {
-        "id": r.get("Id"),
+        "id": row_id,
+        "Id": row_id,
         "conversation_id": r.get("conversation_id"),
         "org_id": r.get("org_id"),
         "category": r.get("category") or "fact",
