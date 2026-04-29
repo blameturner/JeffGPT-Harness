@@ -558,14 +558,28 @@ class ToolJobQueue:
 
     def _dispatch_to_huey(self, job: ToolJob, worker_id: str) -> bool:
         try:
-            from infra.huey_runtime import enqueue_tool_job, is_huey_consumer_running
+            from infra.huey_runtime import enqueue_tool_job, is_huey_consumer_running, get_huey
             if not is_huey_consumer_running():
+                _log.error(
+                    "queue %s: huey consumer NOT RUNNING — cannot dispatch  job=%s  type=%s",
+                    worker_id, job.job_id[:12], job.type,
+                )
                 return False
             ok = enqueue_tool_job(job.job_id)
             if ok:
+                # Surface Huey backlog so a job sitting "running" in NocoDB
+                # without handler logs is recognisably a Huey-backlog issue
+                # rather than a silently-stuck handler.
+                pending = "?"
+                try:
+                    h = get_huey()
+                    if h is not None:
+                        pending = str(h.pending_count())
+                except Exception:
+                    pass
                 _log.info(
-                    "queue %s: DISPATCHED  job=%s  type=%s  org=%d",
-                    worker_id, job.job_id[:12], job.type, job.org_id,
+                    "queue %s: DISPATCHED  job=%s  type=%s  org=%d  huey_pending_after=%s",
+                    worker_id, job.job_id[:12], job.type, job.org_id, pending,
                 )
                 self._emit_event({
                     "type": "job_dispatched",
@@ -579,19 +593,30 @@ class ToolJobQueue:
 
     def execute_claimed_job(self, job_id: str) -> dict:
         """Execute a previously-claimed running job. Called by Huey worker tasks."""
+        worker_id = threading.current_thread().name
+        _log.info("huey-pickup %s: PICKED UP  job=%s", worker_id, job_id[:12])
         job = self.get_job(job_id)
         if not job:
+            _log.warning("huey-pickup %s: job %s NOT FOUND in queue", worker_id, job_id[:12])
             return {"status": "not_found", "job_id": job_id}
         if job.status != "running":
+            _log.warning(
+                "huey-pickup %s: job %s SKIPPED  status=%s (expected running — was the row reset by stale reaper?)",
+                worker_id, job_id[:12], job.status,
+            )
             return {"status": "skipped", "reason": f"status_{job.status}", "job_id": job_id}
         config = self._handlers.get(job.type)
         if not config:
+            _log.error(
+                "huey-pickup %s: job %s NO HANDLER for type=%s — registered=%s",
+                worker_id, job_id[:12], job.type, list(self._handlers.keys()),
+            )
             job.status = "failed"
             job.error = f"no handler for job type {job.type}"[:500]
             job.completed_at = datetime.now(timezone.utc).isoformat()
             self._persist_update(job)
             return {"status": "failed", "job_id": job_id, "error": job.error}
-        return self._execute_job(job, config, threading.current_thread().name)
+        return self._execute_job(job, config, worker_id)
 
     def _execute_job(self, job: ToolJob, config: HandlerConfig, worker_id: str) -> dict:
         t0 = time.time()
@@ -603,8 +628,20 @@ class ToolJobQueue:
             try:
                 from shared.models import model_usage_scope
 
+                _log.info(
+                    "queue %s: HANDLER START  job=%s  type=%s  attempt=%d/%d  payload_keys=%s",
+                    worker_id, job.job_id[:12], job.type, attempts, max_attempts,
+                    sorted((job.payload or {}).keys()),
+                )
+                handler_t0 = time.time()
                 with model_usage_scope(org_id=job.org_id, source=f"tool_queue:{job.type}"):
                     result = config.handler(job.payload)
+                handler_elapsed = round(time.time() - handler_t0, 1)
+                _log.info(
+                    "queue %s: HANDLER RETURN  job=%s  type=%s  %.1fs  result_status=%s",
+                    worker_id, job.job_id[:12], job.type, handler_elapsed,
+                    (result or {}).get("status") if isinstance(result, dict) else "<non-dict>",
+                )
                 result = result or {}
                 status_val = str((result.get("status") if isinstance(result, dict) else "") or "").lower()
                 if status_val in {"failed", "error"}:
@@ -741,6 +778,13 @@ class ToolJobQueue:
                     "graph_extract": 4,               # 20m — LLM inference 7-16min
                     "research_planner": research_planner_dynamic_mult,
                     "research_agent": research_agent_dynamic_mult,
+                    # research_review and research_op share research_agent's
+                    # workload profile — both can fire multiple bounded LLM
+                    # calls + web search per job. Without an entry here the
+                    # reaper resets them mid-flight every ~5 minutes and the
+                    # row never reaches "completed".
+                    "research_review": research_agent_dynamic_mult,
+                    "research_op": research_agent_dynamic_mult,
                     "scrape_page": 3,                 # 15m — fetch + chunk + embed
                     "pathfinder_extract": 3,          # 15m — fetch + link extract
                     "summarise_page": 3,              # 15m — summariser LLM

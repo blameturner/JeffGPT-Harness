@@ -310,7 +310,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 HUEY_ENABLED = _env_bool("HUEY_ENABLED", True)
 HUEY_SQLITE_PATH = os.getenv("HUEY_SQLITE_PATH", "/app/data/huey_queue.db")
-HUEY_CONSUMER_WORKERS = int(os.getenv("HUEY_CONSUMER_WORKERS", "1"))
+# Huey runs every tool-queue handler. With 1 worker, a long research_agent
+# job blocks every other handler (research_op, research_review, scrape, etc.)
+# from making progress — they sit as "running" in NocoDB but their handler is
+# actually waiting in Huey's internal queue with no log output. Defaulting
+# to 3 lets a long synthesis run alongside ops and scrapers.
+HUEY_CONSUMER_WORKERS = int(os.getenv("HUEY_CONSUMER_WORKERS", "3"))
 HUEY_TASK_RETRIES = int(os.getenv("HUEY_TASK_RETRIES", "2"))
 HUEY_TASK_RETRY_DELAY_S = int(os.getenv("HUEY_TASK_RETRY_DELAY_S", "5"))
 

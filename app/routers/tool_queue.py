@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from infra.config import HUEY_CONSUMER_WORKERS, HUEY_ENABLED, HUEY_SQLITE_PATH
-from infra.huey_runtime import get_huey, is_huey_consumer_running
+from infra.huey_runtime import get_huey, get_huey_health, is_huey_consumer_running
 from workers.tool_queue import NOCODB_TABLE
 
 _log = logging.getLogger("main.tool_queue")
@@ -24,13 +24,32 @@ def _get_queue(request: Request):
 
 
 def _huey_status() -> dict:
-    return {
+    h = get_huey()
+    pending: int | str = "?"
+    scheduled: int | str = "?"
+    if h is not None:
+        try:
+            pending = h.pending_count()
+        except Exception:
+            pending = "error"
+        try:
+            scheduled = h.scheduled_count()
+        except Exception:
+            scheduled = "error"
+    out = {
         "enabled": bool(HUEY_ENABLED),
         "consumer_running": is_huey_consumer_running(),
         "workers": int(HUEY_CONSUMER_WORKERS or 1),
         "sqlite_path": HUEY_SQLITE_PATH,
-        "queue_ready": bool(get_huey() is not None),
+        "queue_ready": bool(h is not None),
+        "pending_count": pending,
+        "scheduled_count": scheduled,
     }
+    try:
+        out["health"] = get_huey_health()
+    except Exception:
+        out["health"] = {"error": "health probe unavailable"}
+    return out
 
 
 def _scheduler_status(request: Request) -> dict:

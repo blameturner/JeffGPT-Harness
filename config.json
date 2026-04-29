@@ -101,7 +101,7 @@
       "models": {
         "research_planner":           { "role": "t3_tool",     "temperature": 0.2, "max_tokens": 4000,  "max_input_chars": 12000 },
         "research_doc_type":          { "role": "t3_tool",     "temperature": 0.1, "max_tokens": 60,    "max_input_chars": 2000 },
-        "research_section_writer":    { "role": "t1_secondary","temperature": 0.3, "max_tokens": 6000,  "max_input_chars": 32000 },
+        "research_section_writer":    { "role": "t1_secondary","temperature": 0.3, "max_tokens": 4000,  "max_input_chars": 32000 },
         "research_reviewer":          { "role": "t1_secondary","temperature": 0.2, "max_tokens": 12000, "max_input_chars": 64000 },
         "research_agent":             { "role": "t1_secondary","temperature": 0.3, "max_tokens": 20000, "max_input_chars": 30000 },
         "research_search_extraction": { "role": "exp_rwkv_r",  "temperature": 0.2, "max_tokens": 500,   "max_input_chars": 12000, "frequency_penalty": 0.2 }

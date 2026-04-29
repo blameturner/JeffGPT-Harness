@@ -496,10 +496,15 @@ def create_research_plan(
             "iterations": 0,
             "status": "pending",
         }
-        if defer_run:
-            payload["type"] = "hidden"
         if parent_insight_id:
             payload["parent_insight_id"] = int(parent_insight_id)
+        # ANY plan whose origin is an insight is tagged so the UI can hide
+        # it from the main research feed and surface it only on the parent
+        # insight's page. The tag is cleared by ``start_research_plan`` when
+        # the user explicitly invokes a deferred plan, or it stays for the
+        # life of the row when the plan was created from a manual deep-dive.
+        if parent_insight_id or defer_run:
+            payload["type"] = "pending insight"
         if focus:
             payload["focus"] = focus[:500]
         row = client._post("research_plans", payload)

@@ -66,18 +66,24 @@ def _load_artifacts(plan: dict) -> dict:
     return arts if isinstance(arts, dict) else {}
 
 
-def _save_artifact(client, plan_id: int, plan: dict, kind: str, text: str) -> None:
+def _save_artifact(client, plan_id: int, plan: dict, kind: str, text: str) -> bool:
+    """Persist an artifact into ``schema._artifacts``. Returns True on success.
+
+    Raises on patch failure so the calling op surfaces the problem instead of
+    returning a misleading 'completed' status.
+    """
     schema = _load_schema(plan)
-    arts = schema.get("_artifacts") if isinstance(schema.get("_artifacts"), dict) else {}
+    existing_arts = schema.get("_artifacts")
+    arts = existing_arts if isinstance(existing_arts, dict) else {}
     arts[kind] = {
         "text": text,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
     }
     schema["_artifacts"] = arts
-    try:
-        client._patch("research_plans", plan_id, {"schema": json.dumps(schema)})
-    except Exception:
-        _log.warning("save_artifact: patch failed plan_id=%d kind=%s", plan_id, kind, exc_info=True)
+    client._patch("research_plans", plan_id, {"schema": json.dumps(schema)})
+    _log.info("research op artifact saved  plan_id=%d  kind=%s  chars=%d",
+              plan_id, kind, len(text))
+    return True
 
 
 def _section_split(paper_md: str):
@@ -307,6 +313,8 @@ def expand_section(plan_id: int, section_title: str, target_words: int = 1800) -
         return {"status": "failed", "error": "writer timeout/error"}
     new_paper = _replace_section(paper, section_title, sec)
     client._patch("research_plans", plan_id, {"paper_content": new_paper})
+    _log.info("research op completed  plan_id=%d  kind=expand_section  section=%s  chars=%d",
+              plan_id, section_title, len(new_paper))
     return {"status": "completed", "plan_id": plan_id, "kind": "expand_section", "section": section_title}
 
 
@@ -341,6 +349,8 @@ def add_new_section(plan_id: int, heading: str, brief: str = "",
         # Default: insert just before ## Sources, or append if no Sources block
         new_paper = _insert_section_before(paper, "Sources", sec)
     client._patch("research_plans", plan_id, {"paper_content": new_paper})
+    _log.info("research op completed  plan_id=%d  kind=add_section  heading=%s  chars=%d",
+              plan_id, heading, len(new_paper))
     return {"status": "completed", "plan_id": plan_id, "kind": "add_section", "heading": heading}
 
 
@@ -413,10 +423,15 @@ PAPER (excerpt):
         return {"status": "failed", "error": "writer error"}
     new_paper = _insert_section_before(paper, "Sources", sec)
     merged = list(existing) + [q for q in new_queries if q not in existing]
-    client._patch("research_plans", plan_id, {
-        "paper_content": new_paper,
-        "queries": json.dumps(merged),
-    })
+    # Save paper_content first so even if the queries field is rejected the
+    # new section is durably persisted.
+    client._patch("research_plans", plan_id, {"paper_content": new_paper})
+    _log.info("research op completed  plan_id=%d  kind=add_fresh_sources  new_queries=%d  chars=%d",
+              plan_id, len(new_queries), len(new_paper))
+    try:
+        client._patch("research_plans", plan_id, {"queries": json.dumps(merged)})
+    except Exception:
+        _log.warning("add_fresh_sources: queries patch failed plan_id=%d", plan_id, exc_info=True)
     return {"status": "completed", "plan_id": plan_id, "kind": "add_fresh_sources",
             "new_queries": new_queries}
 
@@ -474,6 +489,8 @@ Output the reframed paper in full as raw Markdown. No preamble, no closing summa
     if not new_paper:
         return {"status": "failed", "error": "empty"}
     client._patch("research_plans", plan_id, {"paper_content": new_paper})
+    _log.info("research op completed  plan_id=%d  kind=reframe  audience=%s  chars=%d",
+              plan_id, audience, len(new_paper))
     return {"status": "completed", "plan_id": plan_id, "kind": "reframe", "audience": audience}
 
 
@@ -519,6 +536,8 @@ Output the resized paper in full as raw Markdown."""
     if not new_paper:
         return {"status": "failed", "error": "empty"}
     client._patch("research_plans", plan_id, {"paper_content": new_paper})
+    _log.info("research op completed  plan_id=%d  kind=resize  target_words=%d  chars=%d",
+              plan_id, target_words, len(new_paper))
     return {"status": "completed", "plan_id": plan_id, "kind": "resize", "target_words": target_words}
 
 
@@ -685,17 +704,50 @@ SYNC_OPS = {
 
 
 def run_research_op(payload: dict) -> dict:
-    """Tool-queue handler. payload: {plan_id, kind, params}"""
+    """Tool-queue handler. payload: {plan_id, kind, params}.
+
+    Logs at every step: entry, dispatch, model call boundaries inside the op,
+    and exit. A job sitting at 'running' in the queue table with NO log line
+    matching ``research_op:<kind>:<plan_id> START`` means the handler never
+    started — check Huey consumer status.
+    """
+    import time as _time
     plan_id = payload.get("plan_id")
     kind = payload.get("kind")
     params = payload.get("params") or {}
+    tag = f"research_op:{kind}:{plan_id}"
+
     if not plan_id or not kind:
+        _log.error("%s INVALID PAYLOAD  payload_keys=%s", tag, sorted((payload or {}).keys()))
         return {"status": "failed", "error": "missing plan_id or kind"}
+
     fn = ASYNC_OPS.get(kind) or SYNC_OPS.get(kind)
     if not fn:
+        _log.error(
+            "%s UNKNOWN KIND  registered_async=%s  registered_sync=%s",
+            tag, sorted(ASYNC_OPS.keys()), sorted(SYNC_OPS.keys()),
+        )
         return {"status": "failed", "error": f"unknown op kind: {kind}"}
+
+    _log.info("%s START  params=%s", tag, {k: (v if not isinstance(v, str) or len(v) < 80 else v[:80] + "…")
+                                              for k, v in params.items()})
+    t0 = _time.time()
     try:
-        return fn(int(plan_id), params)
+        result = fn(int(plan_id), params)
     except Exception as e:
-        _log.error("research_op uncaught error  plan_id=%s kind=%s", plan_id, kind, exc_info=True)
+        elapsed = round(_time.time() - t0, 1)
+        _log.error("%s UNCAUGHT  %.1fs  err=%s", tag, elapsed, e, exc_info=True)
         return {"status": "failed", "error": str(e)[:300], "plan_id": plan_id, "kind": kind}
+
+    elapsed = round(_time.time() - t0, 1)
+    if not isinstance(result, dict):
+        _log.warning("%s NON-DICT RESULT  %.1fs  result=%r", tag, elapsed, result)
+        return {"status": "failed", "error": "op returned non-dict", "plan_id": plan_id, "kind": kind}
+
+    status = result.get("status")
+    if status in ("completed", "ok"):
+        _log.info("%s DONE  %.1fs  status=%s", tag, elapsed, status)
+    else:
+        _log.warning("%s FAILED  %.1fs  status=%s  error=%s",
+                     tag, elapsed, status, result.get("error"))
+    return result

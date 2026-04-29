@@ -221,20 +221,46 @@ def _patch_or_log(client, plan_id: int, patch: dict, label: str) -> None:
     try:
         client._patch("research_plans", plan_id, patch)
     except Exception:
-        _log.debug("research_plans patch failed  plan_id=%d  label=%s", plan_id, label, exc_info=True)
+        # WARNING (not DEBUG) so a silent NocoDB rejection during status
+        # transitions actually surfaces in logs.
+        _log.warning(
+            "research_plans patch failed  plan_id=%d  label=%s  fields=%s",
+            plan_id, label, list(patch.keys()), exc_info=True,
+        )
 
 
 def _call_with_timeout(fn, timeout_s: float, label: str):
-    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"research-{label}")
+    """Run ``fn`` in a worker thread with a hard timeout; log boundaries.
+
+    Logs INVOKE before submission and RETURN/TIMEOUT/ERROR on completion,
+    so a job stuck inside an LLM HTTP call is identifiable from the logs:
+    you'll see `INVOKE label=section:Background timeout=1800s` followed by
+    no return line until the model responds (or times out at the bound).
+    """
+    import time as _time
+    _log.info("call %s INVOKE  timeout=%ds", label, int(timeout_s))
+    t0 = _time.time()
+    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"research-{label[:24]}")
     try:
         fut = ex.submit(fn)
         try:
-            return fut.result(timeout=timeout_s)
+            result = fut.result(timeout=timeout_s)
+            elapsed = round(_time.time() - t0, 1)
+            # Tuple from model_call is (text, tokens). Log a size hint without dumping content.
+            size_hint = ""
+            if isinstance(result, tuple) and result and isinstance(result[0], str):
+                size_hint = f"  out_chars={len(result[0])}"
+            elif isinstance(result, tuple) and len(result) >= 2:
+                size_hint = f"  out_meta={result[1]!r}"
+            _log.info("call %s RETURN  %.1fs%s", label, elapsed, size_hint)
+            return result
         except _futures.TimeoutError:
-            _log.warning("%s timeout after %ds", label, timeout_s)
+            elapsed = round(_time.time() - t0, 1)
+            _log.warning("call %s TIMEOUT  %.1fs (cap=%ds)", label, elapsed, int(timeout_s))
             return None
         except Exception as e:
-            _log.warning("%s failed  error=%s", label, str(e)[:200])
+            elapsed = round(_time.time() - t0, 1)
+            _log.warning("call %s ERROR  %.1fs  err=%s", label, elapsed, str(e)[:200])
             return None
     finally:
         ex.shutdown(wait=False)
@@ -269,14 +295,15 @@ def _fetch_corpus(topic: str, queries: list[str], org_id: int) -> tuple[str, lis
     blocks: list[str] = []
     sources: list[dict] = []
     seen_urls: set[str] = set()
-    for q in queries:
+    _log.info("corpus FETCH START  topic=%r  n_queries=%d", topic[:80], len(queries))
+    for idx, q in enumerate(queries, start=1):
         res = _call_with_timeout(
             lambda q=q: run_web_search(
                 q, org_id=org_id, intent_dict=intent,
                 extraction_function_name=extraction_function_name,
             ),
             timeout_s,
-            "search",
+            f"search[{idx}/{len(queries)}]:{q[:40]}",
         )
         if not res:
             continue
@@ -295,7 +322,12 @@ def _fetch_corpus(topic: str, queries: list[str], org_id: int) -> tuple[str, lis
             if url:
                 seen_urls.add(url)
             sources.append(s)
-    return "\n\n".join(blocks), sources
+    out_corpus = "\n\n".join(blocks)
+    _log.info(
+        "corpus FETCH DONE  topic=%r  blocks=%d  sources=%d  chars=%d",
+        topic[:80], len(blocks), len(sources), len(out_corpus),
+    )
+    return out_corpus, sources
 
 
 # ── doc-type detection ──────────────────────────────────────────────────────
@@ -358,7 +390,7 @@ DOCUMENT TONE: {spec['tone']}
 TARGET LENGTH: ~{target_words} words of substantive prose. Stay close to the target — too short reads thin, too long reads padded.
 
 {hyp_block}AVAILABLE SOURCE MATERIAL (use ONLY this; never fabricate facts or URLs):
-{corpus[:30000]}
+{corpus[:24000]}
 {rev_block}
 RULES:
 - Output Markdown starting with `## {section_title}`. Do NOT output the document title, executive summary, or any other section — just this one.
@@ -372,25 +404,59 @@ RULES:
 
 def _write_section(*, topic: str, doc_type: str, section_title: str, section_role: str,
                    corpus: str, hypotheses: list[str], target_words: int,
-                   revision_note: str | None = None) -> str | None:
+                   revision_note: str | None = None,
+                   attempts: int = 2) -> str | None:
+    """Write one section. Retries once with progressively smaller settings if
+    the first attempt times out, errors, or returns empty text.
+
+    The first attempt uses the full target_words and corpus[:30000]. The
+    retry shortens to ~2/3 length and 16000 chars of corpus and a tighter
+    output cap, which dramatically increases the chance of success on a
+    slow / context-constrained local model.
+    """
     timeout_s = _research_timeout("section_timeout_s", DEFAULT_SECTION_TIMEOUT_S)
-    prompt = _section_prompt(
-        topic=topic, doc_type=doc_type, section_title=section_title,
-        section_role=section_role, corpus=corpus, hypotheses=hypotheses,
-        target_words=target_words, revision_note=revision_note,
-    )
-    res = _call_with_timeout(
-        lambda: model_call("research_section_writer", prompt, temperature=0.3),
-        timeout_s,
-        f"section:{section_title[:30]}",
-    )
-    if not res:
-        return None
-    try:
-        text, _ = res
-    except (TypeError, ValueError):
-        return None
-    return (text or "").strip() or None
+    last_err = "unknown"
+    for n in range(1, attempts + 1):
+        if n == 1:
+            this_target = target_words
+            this_corpus = corpus[:30000]
+            this_max_tokens: int | None = None
+        else:
+            this_target = max(400, (target_words * 2) // 3)
+            this_corpus = corpus[:16000]
+            this_max_tokens = 3000
+            _log.warning(
+                "section %r retry %d/%d — shrinking (target=%d words, corpus=%d chars, max_tokens=%d)",
+                section_title[:40], n, attempts, this_target, len(this_corpus), this_max_tokens,
+            )
+        prompt = _section_prompt(
+            topic=topic, doc_type=doc_type, section_title=section_title,
+            section_role=section_role, corpus=this_corpus, hypotheses=hypotheses,
+            target_words=this_target, revision_note=revision_note,
+        )
+        kwargs: dict = {"temperature": 0.3}
+        if this_max_tokens:
+            kwargs["max_tokens"] = this_max_tokens
+        res = _call_with_timeout(
+            lambda: model_call("research_section_writer", prompt, **kwargs),
+            timeout_s,
+            f"section[{n}/{attempts}]:{section_title[:30]}",
+        )
+        if not res:
+            last_err = "timeout_or_error"
+            continue
+        try:
+            text, _ = res
+        except (TypeError, ValueError):
+            last_err = "bad_tuple"
+            continue
+        text = (text or "").strip()
+        if text:
+            return text
+        last_err = "empty"
+    _log.warning("section %r FAILED after %d attempts  last_err=%s",
+                 section_title[:40], attempts, last_err)
+    return None
 
 
 def _write_executive_summary(*, topic: str, doc_type: str, body_md: str,
@@ -535,11 +601,20 @@ def _build_sources(sources: list[dict]) -> str:
 def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
                  hypotheses: list[str], sub_topics: list[str], org_id: int,
                  revision_notes: dict[str, str] | None = None) -> tuple[str, list[dict]]:
-    """Section-by-section synthesis. Each LLM call is bounded.
+    """Section-by-section synthesis. Each LLM call is bounded and retried.
 
-    `revision_notes` (review pass): dict {section_title: instruction} appended
-    to the writer prompt for that section; sections without notes are still
-    rebuilt from the corpus, so the paper stays internally consistent.
+    Pipeline:
+      1. Verify we have queries and a non-empty corpus (raises RuntimeError if not).
+      2. Write opener, body sections, comparison, closer — each with retries.
+      3. Decide if the paper is good enough to save:
+            - Body must have ≥1 substantive section (cannot be all empty).
+            - If both opener and closer failed, abort.
+         If neither holds, raise RuntimeError so the caller marks failed
+         rather than save junk.
+      4. Write takeaways + executive summary using whatever body content
+         actually succeeded.
+      5. Assemble. Sections that failed are simply omitted; the paper still
+         flows because each section was independent prose.
     """
     revision_notes = revision_notes or {}
     spec = DOC_TYPES.get(doc_type) or DOC_TYPES[DEFAULT_DOC_TYPE]
@@ -554,24 +629,27 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
     opener = _write_section(
         topic=topic, doc_type=doc_type, section_title=spec["opener"],
         section_role=f"Establish the {spec['opener'].lower()} for the rest of the document.",
-        corpus=corpus, hypotheses=hypotheses, target_words=600,
+        corpus=corpus, hypotheses=hypotheses, target_words=500,
         revision_note=revision_notes.get(spec["opener"]),
     ) or ""
 
-    # 2. Body — one section per sub_topic
+    # 2. Body — one section per sub_topic. Track which succeeded.
     body_pieces: list[str] = []
+    body_failed: list[str] = []
     for sub in (sub_topics or []):
         sec = _write_section(
             topic=topic, doc_type=doc_type, section_title=sub,
             section_role=f"Cover '{sub}' as a substantive body section of the document.",
-            corpus=corpus, hypotheses=hypotheses, target_words=900,
+            corpus=corpus, hypotheses=hypotheses, target_words=700,
             revision_note=revision_notes.get(sub),
         )
         if sec:
             body_pieces.append(sec)
+        else:
+            body_failed.append(sub)
     body = "\n\n".join(body_pieces)
 
-    # 3. Comparison (if schema provided)
+    # 3. Comparison (if schema provided) — never critical, fine if it drops
     comparison = _write_comparison(topic, schema, corpus) or ""
 
     # 4. Closer (gets opener+body so it can synthesise the spine)
@@ -579,9 +657,34 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
     closer = _write_section(
         topic=topic, doc_type=doc_type, section_title=spec["closer"],
         section_role=f"Synthesise the body into the {spec['closer'].lower()}.",
-        corpus=closer_corpus, hypotheses=hypotheses, target_words=700,
+        corpus=closer_corpus, hypotheses=hypotheses, target_words=600,
         revision_note=revision_notes.get(spec["closer"]),
     ) or ""
+
+    # ── Sanity gate: don't save a junk paper ────────────────────────────
+    n_body_total = len(sub_topics or [])
+    n_body_ok = len(body_pieces)
+    if n_body_total > 0 and n_body_ok == 0:
+        raise RuntimeError(
+            f"all {n_body_total} body sections failed — local model unavailable or overloaded; "
+            "no paper saved"
+        )
+    if not opener and not closer and n_body_ok < 2:
+        raise RuntimeError(
+            f"opener and closer both failed and only {n_body_ok} body section(s) succeeded — "
+            "insufficient content to assemble a paper"
+        )
+
+    # Log what dropped so the user has visibility on partial success
+    if body_failed:
+        _log.warning(
+            "build_paper: body sections that failed and will be omitted: %s",
+            ", ".join(repr(s) for s in body_failed),
+        )
+    if not opener:
+        _log.warning("build_paper: opener section %r failed and will be omitted", spec["opener"])
+    if not closer:
+        _log.warning("build_paper: closer section %r failed and will be omitted", spec["closer"])
 
     # 5. Takeaways + Recommendation (closing)
     full_body = "\n\n".join(p for p in (opener, body, comparison, closer) if p)
@@ -601,7 +704,18 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
     for piece in (exec_summary, opener, body, comparison, closer, takeaways, sources_md):
         if piece and piece.strip():
             parts.append(piece.strip())
-    return "\n\n".join(parts), sources
+    paper = "\n\n".join(parts)
+    _log.info(
+        "build_paper DONE  body_ok=%d/%d  opener=%s  closer=%s  takeaways=%s  exec_summary=%s  comparison=%s  total_chars=%d",
+        n_body_ok, n_body_total,
+        "ok" if opener else "MISSING",
+        "ok" if closer else "MISSING",
+        "ok" if takeaways else "MISSING",
+        "ok" if exec_summary else "MISSING",
+        "ok" if comparison else "skipped",
+        len(paper),
+    )
+    return paper, sources
 
 
 # ── public entry points ─────────────────────────────────────────────────────
@@ -644,16 +758,47 @@ def run_research_agent(plan_id: int) -> dict:
             })
             return {"status": "failed", "plan_id": plan_id, "error": "empty paper"}
 
-        # Persist doc_type by stashing it back in schema (no DB column needed).
+        # Save paper_content FIRST in its own patch — if any later metadata
+        # field is rejected (column missing, type mismatch, oversize, etc.) the
+        # paper is still durably persisted and the user does not lose it.
+        try:
+            client._patch("research_plans", plan_id, {"paper_content": paper})
+            _log.info("research paper saved  plan_id=%d  chars=%d", plan_id, len(paper))
+        except Exception as save_exc:
+            _log.error(
+                "research paper save failed  plan_id=%d  paper_chars=%d  err=%s",
+                plan_id, len(paper), save_exc, exc_info=True,
+            )
+            # Try a fallback minimal patch with just the error
+            try:
+                client._patch("research_plans", plan_id, {
+                    "status": "failed",
+                    "error_message": f"paper save failed: {str(save_exc)[:300]}",
+                })
+            except Exception:
+                pass
+            return {"status": "failed", "plan_id": plan_id, "error": f"paper save failed: {str(save_exc)[:200]}"}
+
+        # Now metadata. Each piece in its own patch so a single rejection does
+        # not lose the rest. Failures here are warnings, not fatal — the paper
+        # is already saved.
         schema_to_save = dict(schema or {})
         schema_to_save["_doc_type"] = doc_type
-        client._patch("research_plans", plan_id, {
-            "status": "completed",
-            "paper_content": paper,
-            "schema": json.dumps(schema_to_save),
-            "iterations": iterations + 1,
-            "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-        })
+        for label, fields in (
+            ("status_complete", {
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            }),
+            ("iterations", {"iterations": iterations + 1}),
+            ("schema", {"schema": json.dumps(schema_to_save)}),
+        ):
+            try:
+                client._patch("research_plans", plan_id, fields)
+            except Exception:
+                _log.warning(
+                    "research metadata patch failed  plan_id=%d  label=%s",
+                    plan_id, label, exc_info=True,
+                )
 
         try:
             from workers.post_turn import ingest_output
