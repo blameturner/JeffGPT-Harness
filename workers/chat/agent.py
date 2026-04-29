@@ -436,6 +436,18 @@ class ChatAgent(BaseAgent):
         _span("graph_recall_ms", _t)
 
         _t = time.perf_counter()
+        try:
+            from workers.chat.memory import get_pinned_for_prompt
+            memory_budget = int(convo.get("memory_token_budget") or 0) or None
+            chat_memory_block = get_pinned_for_prompt(
+                conversation_id=conversation_id,
+                org_id=self.org_id,
+                token_budget=memory_budget,
+            )
+        except Exception:
+            _log.warning("chat conv=%s  memory fetch failed", conversation_id, exc_info=True)
+            chat_memory_block = ""
+        system_note = (convo.get("system_note") or "").strip()
         payload = build_chat_payload(
             history=history,
             user_message=user_message,
@@ -446,6 +458,8 @@ class ChatAgent(BaseAgent):
             rag_context=rag_context,
             search_status=search_status,
             graph_context=graph_context,
+            chat_memory=chat_memory_block,
+            system_note=system_note,
         )
         _span("payload_build_ms", _t)
 
@@ -622,6 +636,47 @@ class ChatAgent(BaseAgent):
                 _log.error("chat conv=%s  [4/4] summary FAILED", conversation_id, exc_info=True)
             finally:
                 summary_ev.set()  # must set even on failure or next turn blocks forever
+
+            # Structured memory extraction — proposes facts/decisions/threads
+            # for the user to review in the Properties tab. Runs every N turns
+            # to avoid hammering the model. Items are written as status="proposed".
+            try:
+                from workers.chat.memory import (
+                    extract_structured_delta,
+                    list_items,
+                    persist_extracted_delta,
+                    DEFAULT_EXTRACT_EVERY_N_TURNS,
+                )
+                cadence = int(convo.get("memory_extract_every_n_turns") or 0) or DEFAULT_EXTRACT_EVERY_N_TURNS
+                turn_count = len([m for m in full_history if m.get("role") in ("user", "assistant")])
+                if cadence > 0 and turn_count > 0 and turn_count % cadence == 0:
+                    _t_mem = time.perf_counter()
+                    older_text = ""
+                    for m in full_history[-(cadence * 2):]:
+                        role = m.get("role", "user")
+                        content = m.get("content") or ""
+                        if role in ("user", "assistant"):
+                            older_text += f"{role}: {content[:1500]}\n\n"
+                    existing = list_items(
+                        conversation_id=conversation_id,
+                        org_id=self.org_id,
+                        limit=100,
+                    )
+                    delta = extract_structured_delta(older_text, existing)
+                    if delta:
+                        n = persist_extracted_delta(
+                            conversation_id=conversation_id,
+                            org_id=self.org_id,
+                            delta=delta,
+                        )
+                        _log.info(
+                            "chat conv=%s  memory: %d items proposed  %.2fs",
+                            conversation_id, n, time.perf_counter() - _t_mem,
+                        )
+                    else:
+                        _log.info("chat conv=%s  memory: extraction returned no delta", conversation_id)
+            except Exception:
+                _log.warning("chat conv=%s  memory extract FAILED", conversation_id, exc_info=True)
 
             # Reset the idle clock now that the full turn window (including summarising)
             # is closed.  The backoff timer only starts from this point — not from when

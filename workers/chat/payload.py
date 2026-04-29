@@ -28,10 +28,16 @@ def build_chat_payload(
     rag_context: str,
     search_status: str = "",
     graph_context: str = "",
+    chat_memory: str = "",
+    system_note: str = "",
 ) -> list[dict]:
     payload: list[dict] = []
     payload.append({"role": "system", "content": BASE_SYSTEM_PROMPT})
     payload.append({"role": "system", "content": build_temporal_context()})
+    if system_note and system_note.strip():
+        payload.append({"role": "system", "content": f"[chat_system_note] {system_note.strip()}"})
+    if chat_memory:
+        payload.append({"role": "system", "content": chat_memory})
     if system:
         payload.append({"role": "system", "content": system})
 

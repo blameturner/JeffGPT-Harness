@@ -9,8 +9,9 @@
         "keep_recent_exchanges": 3
       },
       "models": {
-        "chat":           { "role": "t1_secondary" },
-        "chat_summarise": { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500, "max_input_chars": 16000, "frequency_penalty": 0.2 }
+        "chat":                { "role": "t1_secondary" },
+        "chat_summarise":      { "role": "exp_rwkv_r", "temperature": 0.1, "max_tokens": 500, "max_input_chars": 16000, "frequency_penalty": 0.2 },
+        "chat_memory_extract": { "role": "t3_tool",    "temperature": 0.2, "max_tokens": 1500, "max_input_chars": 16000 }
       }
     },
     "code": {
@@ -240,7 +241,7 @@
       "tick_minutes": 10,
       "chat_idle_hours": 2,
       "fallback_hours": 12,
-      "auto_research": true,
+      "auto_research": false,
       "models": {
         "insight_topic_picker": { "role": "t3_tool",    "temperature": 0.3, "max_tokens": 500,  "max_input_chars": 6000 },
         "insight_synthesis":    { "role": "t1_primary", "temperature": 0.3, "max_tokens": 3500, "max_input_chars": 28000 },
@@ -251,9 +252,23 @@
       "background_chat_idle_seconds": 30,
       "default_max_attempts": 3,
       "default_retry_backoff_seconds": 5,
-      "fairness_cadence_claims": 2,
-      "fairness_scan_limit": 200,
-      "type_starvation_override_seconds": 180,
+      "queue_jumpers": {
+        "research_planner": true,
+        "research_agent": true,
+        "summarise_page": false,
+        "graph_extract": false,
+        "scrape_page": false,
+        "pathfinder_extract": false,
+        "extract_relationships": false,
+        "discover_agent_run": false,
+        "daily_digest": false,
+        "seed_feedback": false,
+        "corpus_maintenance": false,
+        "insight_produce": false,
+        "graph_resolve_entities": false,
+        "graph_maintenance": false,
+        "pa_topic_research": false
+      },
       "job_type_max_attempts": {
         "summarise_page": 3,
         "scrape_page": 2,

@@ -4,7 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.schemas import ConversationUpdate
+from app.schemas import ConversationUpdate, ChatMemoryItemCreate, ChatMemoryItemUpdate
 from infra.nocodb_client import NocodbClient
 from workers.chat.agent import ChatAgent
 from shared.jobs import STORE, run_in_background
@@ -114,12 +114,205 @@ def update_conversation(conversation_id: int, body: ConversationUpdate, org_id: 
             updates["title"] = body.title.strip() or "Untitled"
         if body.contextual_grounding_enabled is not None:
             updates["contextual_grounding_enabled"] = bool(body.contextual_grounding_enabled)
+        if body.system_note is not None:
+            updates["system_note"] = body.system_note.strip()[:2000]
+        if body.default_response_style is not None:
+            from workers.chat.config import CHAT_STYLES, CHAT_DEFAULT_STYLE
+            key = (body.default_response_style or "").strip().lower()
+            updates["default_response_style"] = key if key in CHAT_STYLES else CHAT_DEFAULT_STYLE
+        if body.polish_pass_default is not None:
+            updates["polish_pass_default"] = bool(body.polish_pass_default)
+        if body.strict_grounding_default is not None:
+            updates["strict_grounding_default"] = bool(body.strict_grounding_default)
+        if body.ask_back_default is not None:
+            updates["ask_back_default"] = bool(body.ask_back_default)
+        if body.memory_extract_every_n_turns is not None:
+            updates["memory_extract_every_n_turns"] = max(0, min(50, int(body.memory_extract_every_n_turns)))
+        if body.memory_token_budget is not None:
+            updates["memory_token_budget"] = max(0, min(8000, int(body.memory_token_budget)))
+        if body.saved_fragments_json is not None:
+            import json as _json
+            updates["saved_fragments_json"] = _json.dumps(body.saved_fragments_json)[:8000]
         if not updates:
             return convo
         return db.update_conversation(conversation_id, updates)
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---- chat memory endpoints --------------------------------------------------
+
+@router.get("/conversations/{conversation_id}/memory")
+def list_chat_memory(
+    conversation_id: int,
+    org_id: int,
+    status: str | None = None,
+    category: str | None = None,
+    pinned_only: bool = False,
+):
+    """List structured memory items. Default returns all items grouped by status.
+
+    Query params:
+      status      — filter to one of `proposed`, `active`, `rejected`
+      category    — filter to `fact`, `decision`, or `thread`
+      pinned_only — return only pinned items
+    """
+    from workers.chat.memory import list_items
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id, org_id=org_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        items = list_items(
+            conversation_id=conversation_id,
+            org_id=org_id,
+            status=status,
+            category=category,
+            pinned_only=pinned_only,
+        )
+        grouped = {"fact": [], "decision": [], "thread": []}
+        proposed_count = 0
+        for it in items:
+            cat = it.get("category") or "fact"
+            if cat in grouped:
+                grouped[cat].append(it)
+            if it.get("status") == "proposed":
+                proposed_count += 1
+        return {
+            "items": items,
+            "grouped": grouped,
+            "counts": {
+                "total": len(items),
+                "facts": len(grouped["fact"]),
+                "decisions": len(grouped["decision"]),
+                "threads": len(grouped["thread"]),
+                "proposed": proposed_count,
+                "pinned": sum(1 for it in items if it.get("pinned")),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("list_chat_memory failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/conversations/{conversation_id}/memory")
+def add_chat_memory(conversation_id: int, body: ChatMemoryItemCreate, org_id: int):
+    from workers.chat.memory import add_item, CATEGORIES, STATUS_ACTIVE, STATUS_PROPOSED, STATUS_REJECTED
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id, org_id=org_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if body.category not in CATEGORIES:
+            raise HTTPException(status_code=400, detail=f"category must be one of {CATEGORIES}")
+        if body.status not in (STATUS_ACTIVE, STATUS_PROPOSED, STATUS_REJECTED):
+            raise HTTPException(status_code=400, detail="invalid status")
+        item = add_item(
+            conversation_id=conversation_id,
+            org_id=org_id,
+            category=body.category,
+            text=body.text,
+            pinned=body.pinned,
+            status=body.status,
+            source_message_id=body.source_message_id,
+            confidence=body.confidence,
+        )
+        if not item:
+            raise HTTPException(status_code=500, detail="memory add failed")
+        return {"item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("add_chat_memory failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/conversations/{conversation_id}/memory/{item_id}")
+def update_chat_memory(conversation_id: int, item_id: int, body: ChatMemoryItemUpdate, org_id: int):
+    from workers.chat.memory import update_item
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id, org_id=org_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        changes = body.model_dump(exclude_none=True)
+        if not changes:
+            raise HTTPException(status_code=400, detail="no fields to update")
+        item = update_item(item_id, **changes)
+        if not item:
+            raise HTTPException(status_code=404, detail="memory item not found")
+        return {"item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("update_chat_memory failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/conversations/{conversation_id}/memory/{item_id}")
+def delete_chat_memory(conversation_id: int, item_id: int, org_id: int):
+    from workers.chat.memory import delete_item
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id, org_id=org_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        ok = delete_item(item_id)
+        if not ok:
+            raise HTTPException(status_code=500, detail="delete failed")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("delete_chat_memory failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/conversations/{conversation_id}/memory/extract")
+def trigger_memory_extract(conversation_id: int, org_id: int):
+    """Manually trigger structured extraction over the current conversation.
+
+    Useful when the user has just edited messages or wants a fresh sweep.
+    Items are written as `status="proposed"` for review.
+    """
+    from workers.chat.memory import (
+        extract_structured_delta,
+        list_items,
+        persist_extracted_delta,
+    )
+    try:
+        db = NocodbClient()
+        convo = db.get_conversation(conversation_id, org_id=org_id)
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = db.list_messages(conversation_id, org_id=org_id)
+        older_text = ""
+        for m in messages[-30:]:
+            role = m.get("role") or "user"
+            if role not in ("user", "assistant"):
+                continue
+            content = (m.get("content") or "")[:1500]
+            older_text += f"{role}: {content}\n\n"
+        if not older_text.strip():
+            return {"persisted": 0, "note": "no content to extract from"}
+        existing = list_items(conversation_id=conversation_id, org_id=org_id, limit=200)
+        delta = extract_structured_delta(older_text, existing)
+        persisted = 0
+        if delta:
+            persisted = persist_extracted_delta(
+                conversation_id=conversation_id,
+                org_id=org_id,
+                delta=delta,
+            )
+        return {"persisted": persisted, "delta": delta or {}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.error("trigger_memory_extract failed", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

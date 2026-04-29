@@ -564,27 +564,11 @@ def run_research_planner_job(plan_id: int) -> dict:
         client._patch("research_plans", plan_id, {"status": "failed", "error_message": str(e)[:500]})
         return {"status": "failed", "error": str(e)[:200], "plan_id": plan_id}
 
-    tq = get_tool_queue()
-    if tq:
-        from tools._org import resolve_org_id
-        plan_org_id = resolve_org_id(plan.get("org_id"))
-        job_id = tq.submit(
-            "research_agent",
-            {"plan_id": plan_id, "org_id": plan_org_id},
-            source="research_planner",
-            priority=3,
-            org_id=plan_org_id,
-        )
-        _log.info("Queued research agent job %s for plan_id %d", job_id, plan_id)
-    else:
-        _log.error("Tool queue unavailable for research agent enqueue plan_id=%d", plan_id)
-        client._patch("research_plans", plan_id, {
-            "status": "failed",
-            "error_message": "tool_queue_unavailable",
-        })
-        return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
-
-    return {"status": "generating", "plan_id": plan_id, "query_count": len(queries)}
+    # Run the agent inline in this same job — avoids a second queue hop where
+    # the agent job would sit pending behind unrelated work.
+    from tools.research.agent import run_research_agent
+    _log.info("Running research agent inline for plan_id %d (queries=%d)", plan_id, len(queries))
+    return run_research_agent(plan_id)
 
 
 def get_next_plan() -> dict | None:

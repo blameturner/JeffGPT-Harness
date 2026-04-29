@@ -500,26 +500,10 @@ def _run_research_agent_inner(
             "queries": updated_queries
         })
 
-        from workers.tool_queue import get_tool_queue
-        tq = get_tool_queue()
-        if tq:
-            job_id = tq.submit(
-                "research_agent",
-                {"plan_id": plan_id, "org_id": org_id},
-                source="research_agent_iteration",
-                priority=3,
-                org_id=org_id,
-            )
-            _log.info("Re-queued research agent job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
-        else:
-            _log.error("Tool queue unavailable during research iteration  plan_id=%d", plan_id)
-            client._patch("research_plans", plan_id, {
-                "status": "failed",
-                "error_message": "tool_queue_unavailable",
-            })
-            return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
-
-        return {"status": "needs_more_research", "confidence": confidence, "new_queries": new_queries, "plan_id": plan_id}
+        # Iterate inline rather than re-queueing — keeps the whole research
+        # run within a single tool-queue job so it always finishes.
+        _log.info("Iterating research agent inline for plan_id %d (iter=%d)", plan_id, iterations + 1)
+        return run_research_agent(plan_id)
     else:
         if iterations + 1 < max_iterations:
             fallback_queries = _fallback_queries_from_gaps(topic, gap_analysis)
@@ -533,30 +517,11 @@ def _run_research_agent_inner(
                     "queries": json.dumps(merged),
                     "error_message": "critic produced no new_search_requirements; generated fallback queries",
                 })
-                from workers.tool_queue import get_tool_queue
-                tq = get_tool_queue()
-                if tq:
-                    job_id = tq.submit(
-                        "research_agent",
-                        {"plan_id": plan_id, "org_id": org_id},
-                        source="research_agent_fallback_iteration",
-                        priority=3,
-                        org_id=org_id,
-                    )
-                    _log.info("Re-queued research agent fallback job %s for plan_id %d (iter=%d)", job_id, plan_id, iterations + 1)
-                    return {
-                        "status": "needs_more_research",
-                        "confidence": confidence,
-                        "new_queries": fallback_queries,
-                        "plan_id": plan_id,
-                        "note": "fallback_queries_generated",
-                    }
-                _log.error("Tool queue unavailable for fallback iteration  plan_id=%d", plan_id)
-                client._patch("research_plans", plan_id, {
-                    "status": "failed",
-                    "error_message": "tool_queue_unavailable",
-                })
-                return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
+                _log.info(
+                    "Iterating research agent inline (fallback queries) plan_id=%d iter=%d",
+                    plan_id, iterations + 1,
+                )
+                return run_research_agent(plan_id)
 
         # Final fallback: preserve synthesized markdown as best-effort completion
         # instead of failing hard with an unusable row.
