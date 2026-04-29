@@ -156,7 +156,7 @@
     },
     "pathfinder": {
       "enabled": true,
-      "dispatch_interval_seconds": 120,
+      "dispatch_interval_seconds": 2400,
       "same_host_only": true,
       "max_links_per_seed": 100
     },
