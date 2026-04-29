@@ -24,11 +24,13 @@ from typing import Any
 
 from infra.config import get_feature, is_feature_enabled
 from infra.graph import (
+    MAINTENANCE_QUERY_TIMEOUT_MS,
     decay_edges,
     get_graph,
     list_entities_for_resolution,
     merge_alias,
     prune_orphans,
+    run_query,
 )
 from shared.models import model_call
 from tools._org import resolve_org_id
@@ -209,10 +211,12 @@ def _co_occurrence_pass(org_id: int, min_shared_chunks: int = 2, edge_limit: int
     edges between pairs of entities that frequently appear together."""
     graph = get_graph(org_id)
     try:
-        result = graph.query(
+        result = run_query(
+            graph,
             "MATCH (a)-[r]->(b) WHERE r.source_chunks IS NOT NULL "
             "RETURN a.name, labels(a)[0], b.name, labels(b)[0], r.source_chunks "
-            "LIMIT 5000"
+            "LIMIT 5000",
+            timeout_ms=MAINTENANCE_QUERY_TIMEOUT_MS,
         )
     except Exception:
         _log.warning("co-occurrence scan failed  org=%d", org_id, exc_info=True)
@@ -244,7 +248,8 @@ def _co_occurrence_pass(org_id: int, min_shared_chunks: int = 2, edge_limit: int
         if a_name == b_name:
             continue
         try:
-            graph.query(
+            run_query(
+                graph,
                 f"MATCH (a:`{a_label}` {{name: $a_name}}) "
                 f"MATCH (b:`{b_label}` {{name: $b_name}}) "
                 "MERGE (a)-[r:CO_OCCURS_WITH]-(b) "
@@ -252,6 +257,7 @@ def _co_occurrence_pass(org_id: int, min_shared_chunks: int = 2, edge_limit: int
                 "ON MATCH SET r.hits = coalesce(r.hits,0) + $count, "
                 "  r.weight = coalesce(r.weight,0) + $count * 0.5",
                 {"a_name": a_name, "b_name": b_name, "count": int(count)},
+                timeout_ms=MAINTENANCE_QUERY_TIMEOUT_MS,
             )
             added += 1
         except Exception:

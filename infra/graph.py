@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from time import perf_counter
 
 import falkordb
 
@@ -29,6 +30,9 @@ _log = logging.getLogger("graph")
 client = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
 
 MAX_SOURCE_CHUNKS_PER_EDGE = 25
+DEFAULT_QUERY_TIMEOUT_MS = 5_000
+CHAT_QUERY_TIMEOUT_MS = 1_200
+MAINTENANCE_QUERY_TIMEOUT_MS = 30_000
 
 
 def _now_iso() -> str:
@@ -38,6 +42,11 @@ def _now_iso() -> str:
 def get_graph(org_id: int):
     name = scoped_graph(org_id)
     return client.select_graph(name)
+
+
+def run_query(graph, query: str, params: dict | None = None, timeout_ms: int = DEFAULT_QUERY_TIMEOUT_MS):
+    """Bound all graph calls so a slow planner decision cannot wedge callers."""
+    return graph.query(query, params or {}, timeout=max(1, int(timeout_ms)))
 
 
 def write_relationship(
@@ -100,7 +109,7 @@ def write_relationship(
         graph_name, conversation_id, source_chunk_id,
     )
     try:
-        result = graph.query(query, params)
+        result = run_query(graph, query, params, timeout_ms=DEFAULT_QUERY_TIMEOUT_MS)
         _log.info(
             "write ok  nodes_created=%d rels_created=%d props_set=%d graph=%s",
             result.nodes_created, result.relationships_created,
@@ -111,7 +120,7 @@ def write_relationship(
             "write failed  (%s)-[%s]->(%s)  graph=%s",
             from_name, relationship, to_name, graph_name, exc_info=True,
         )
-        raise
+        return
 
 
 def get_sparse_concepts(org_id: int, limit: int = 10, max_degree: int = 3) -> list[str]:
@@ -119,7 +128,8 @@ def get_sparse_concepts(org_id: int, limit: int = 10, max_degree: int = 3) -> li
         return []
     try:
         graph = get_graph(org_id)
-        result = graph.query(
+        result = run_query(
+            graph,
             "MATCH (n:Concept) "
             "OPTIONAL MATCH (n)-[r]-() "
             "WITH n, count(r) AS deg "
@@ -128,6 +138,7 @@ def get_sparse_concepts(org_id: int, limit: int = 10, max_degree: int = 3) -> li
             "ORDER BY deg ASC "
             "LIMIT $limit",
             {"max_degree": int(max_degree), "limit": int(limit)},
+            timeout_ms=3_000,
         )
     except Exception:
         _log.warning("get_sparse_concepts failed org=%s", org_id, exc_info=True)
@@ -141,9 +152,11 @@ def get_connections(org_id: int, node_name: str) -> list[dict]:
     """Deprecated 1-hop getter kept for backwards compatibility."""
     graph = get_graph(org_id)
     try:
-        result = graph.query(
+        result = run_query(
+            graph,
             "MATCH (a {name: $name})-[r]->(b) RETURN a.name, type(r), b.name",
             {"name": node_name},
+            timeout_ms=2_000,
         )
     except Exception:
         _log.error("get_connections failed  node=%s", node_name, exc_info=True)
@@ -159,6 +172,7 @@ def get_weighted_neighbourhood(
     seed_names: list[str],
     max_hops: int = 2,
     edge_limit: int = 80,
+    timeout_ms: int = CHAT_QUERY_TIMEOUT_MS,
 ) -> list[dict]:
     """Weighted expansion from one or more seed nodes.
 
@@ -168,40 +182,70 @@ def get_weighted_neighbourhood(
     if not seed_names:
         return []
     graph = get_graph(org_id)
-    seeds = [s for s in {str(n).strip() for n in seed_names} if s]
+    seeds = list(dict.fromkeys(str(n).strip() for n in seed_names if str(n).strip()))
     if not seeds:
         return []
 
-    if max_hops == 1:
-        pattern = "(a)-[r]-(b)"
-        edge_expr = "r"
-    else:
-        # 2-hop expansion: seed → direct → second-degree. Direct hops are
-        # emitted plus edges between neighbours themselves, giving a richer
-        # local subgraph for synthesis. `r` is a list here, so pick the
-        # terminal edge with last().
-        pattern = "(a)-[r*1..2]-(b)"
-        edge_expr = "last(r)"
-
-    try:
-        result = graph.query(
-            "MATCH (seed) WHERE seed.name IN $seeds OR any(alias IN coalesce(seed.aliases, []) WHERE alias IN $seeds) "
-            f"MATCH {pattern} "
-            "WHERE a = seed OR b = seed "
-            f"WITH a, b, {edge_expr} AS edge "
-            "RETURN a.name, labels(a)[0], type(edge), b.name, labels(b)[0], "
+    if max_hops <= 1:
+        query = (
+            "MATCH (seed) "
+            "WHERE seed.name IN $seeds OR any(alias IN coalesce(seed.aliases, []) WHERE alias IN $seeds) "
+            "MATCH (seed)-[edge]-(nbr) "
+            "RETURN seed.name, labels(seed)[0], type(edge), nbr.name, labels(nbr)[0], "
             "  coalesce(edge.hits, 1) AS hits, coalesce(edge.weight, 1.0) AS weight, "
             "  edge.last_seen AS last_seen, edge.source_chunks AS chunks "
             "ORDER BY hits DESC, weight DESC "
-            "LIMIT $limit",
-            {"seeds": seeds, "limit": int(edge_limit)},
+            "LIMIT $limit"
+        )
+    else:
+        # 2-hop expansion stays seed-anchored, but emits the terminal edge so
+        # callers get both direct and second-degree context.
+        query = (
+            "MATCH (seed) "
+            "WHERE seed.name IN $seeds OR any(alias IN coalesce(seed.aliases, []) WHERE alias IN $seeds) "
+            "MATCH p=(seed)-[r*1..2]-(other) "
+            "WITH nodes(p) AS ns, last(r) AS edge "
+            "RETURN ns[size(ns)-2].name, labels(ns[size(ns)-2])[0], "
+            "  type(edge), ns[size(ns)-1].name, labels(ns[size(ns)-1])[0], "
+            "  coalesce(edge.hits, 1) AS hits, coalesce(edge.weight, 1.0) AS weight, "
+            "  edge.last_seen AS last_seen, edge.source_chunks AS chunks "
+            "ORDER BY hits DESC, weight DESC "
+            "LIMIT $limit"
+        )
+
+    def _run(active_seeds: list[str], limit: int):
+        p = {"seeds": active_seeds, "limit": int(limit)}
+        return run_query(graph, query, p, timeout_ms=timeout_ms)
+
+    try:
+        t0 = perf_counter()
+        result = _run(seeds, edge_limit)
+        elapsed_ms = int((perf_counter() - t0) * 1000)
+        _log.debug(
+            "get_weighted_neighbourhood ok  seeds=%d max_hops=%d edges=%d elapsed_ms=%d",
+            len(seeds), max_hops, len(result.result_set), elapsed_ms,
         )
     except Exception:
-        _log.warning(
-            "get_weighted_neighbourhood failed  seeds=%s max_hops=%d",
-            seeds[:3], max_hops, exc_info=True,
-        )
-        return []
+        # Timeout fallback: retry a narrower query so chat can still proceed.
+        fallback_seeds = seeds[:3]
+        fallback_limit = min(int(edge_limit), 20)
+        try:
+            if len(fallback_seeds) != len(seeds) or fallback_limit != int(edge_limit):
+                t0 = perf_counter()
+                result = _run(fallback_seeds, fallback_limit)
+                elapsed_ms = int((perf_counter() - t0) * 1000)
+                _log.warning(
+                    "get_weighted_neighbourhood fallback ok  seeds=%s -> %s max_hops=%d limit=%d elapsed_ms=%d",
+                    seeds[:3], fallback_seeds, max_hops, fallback_limit, elapsed_ms,
+                )
+            else:
+                raise
+        except Exception:
+            _log.warning(
+                "get_weighted_neighbourhood failed  seeds=%s max_hops=%d timeout_ms=%d",
+                seeds[:3], max_hops, timeout_ms, exc_info=True,
+            )
+            return []
 
     out: list[dict] = []
     seen: set[tuple] = set()
@@ -230,7 +274,7 @@ def list_entities_for_resolution(
     org_id: int,
     limit: int = 500,
     min_degree: int = 1,
-    timeout_ms: int = 30_000,
+    timeout_ms: int = MAINTENANCE_QUERY_TIMEOUT_MS,
 ) -> list[dict]:
     """Candidate list for the entity-resolution job: named nodes with at
     least one edge, returned with their label and degree.
@@ -251,13 +295,14 @@ def list_entities_for_resolution(
     # well below the total named-node count; the min_degree filter runs in
     # Python on the returned rows.
     try:
-        result = graph.query(
+        result = run_query(
+            graph,
             "MATCH (n) WHERE n.name IS NOT NULL "
             "RETURN labels(n)[0] AS label, n.name AS name, "
             "coalesce(n.aliases, []) AS aliases, size((n)--()) AS deg "
             "ORDER BY deg DESC LIMIT $limit",
             {"limit": int(limit)},
-            timeout=int(timeout_ms),
+            timeout_ms=timeout_ms,
         )
     except Exception:
         _log.warning("list_entities_for_resolution failed  org=%d timeout_ms=%d",
@@ -300,19 +345,23 @@ def merge_alias(
     # in pure Cypher, so rewiring is done more carefully in Python below.
     # Fetch edges first, recreate, delete.
     try:
-        out_edges = graph.query(
+        out_edges = run_query(
+            graph,
             f"MATCH (x:`{label}` {{name: $alias}})-[r]->(y) "
             "RETURN type(r), y.name, labels(y)[0], "
             "  coalesce(r.hits,1), coalesce(r.weight,1.0), "
             "  coalesce(r.source_chunks, []), r.first_seen, r.last_seen",
             {"alias": alias},
+            timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
         ).result_set
-        in_edges = graph.query(
+        in_edges = run_query(
+            graph,
             f"MATCH (x)-[r]->(y:`{label}` {{name: $alias}}) "
             "RETURN type(r), x.name, labels(x)[0], "
             "  coalesce(r.hits,1), coalesce(r.weight,1.0), "
             "  coalesce(r.source_chunks, []), r.first_seen, r.last_seen",
             {"alias": alias},
+            timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
         ).result_set
     except Exception:
         _log.error("merge_alias: edge read failed  alias=%s -> %s", alias, canonical, exc_info=True)
@@ -322,7 +371,8 @@ def merge_alias(
     for row in out_edges:
         rel, other, other_label, hits, weight, chunks, first_seen, last_seen = row
         try:
-            graph.query(
+            run_query(
+                graph,
                 f"MATCH (c:`{label}` {{name: $canonical}}) "
                 f"MATCH (y:`{other_label}` {{name: $other}}) "
                 f"MERGE (c)-[r:`{rel}`]->(y) "
@@ -338,6 +388,7 @@ def merge_alias(
                     "hits": int(hits), "weight": float(weight),
                     "chunks": list(chunks or []),
                 },
+                timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
             )
             moved += 1
         except Exception:
@@ -346,7 +397,8 @@ def merge_alias(
     for row in in_edges:
         rel, other, other_label, hits, weight, chunks, first_seen, last_seen = row
         try:
-            graph.query(
+            run_query(
+                graph,
                 f"MATCH (x:`{other_label}` {{name: $other}}) "
                 f"MATCH (c:`{label}` {{name: $canonical}}) "
                 f"MERGE (x)-[r:`{rel}`]->(c) "
@@ -362,6 +414,7 @@ def merge_alias(
                     "hits": int(hits), "weight": float(weight),
                     "chunks": list(chunks or []),
                 },
+                timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
             )
             moved += 1
         except Exception:
@@ -370,15 +423,19 @@ def merge_alias(
 
     # Update alias list on canonical node + delete alias node.
     try:
-        graph.query(
+        run_query(
+            graph,
             f"MATCH (c:`{label}` {{name: $canonical}}) "
             "SET c.aliases = CASE WHEN $alias IN coalesce(c.aliases, []) "
             "  THEN c.aliases ELSE coalesce(c.aliases, []) + [$alias] END",
             {"canonical": canonical, "alias": alias},
+            timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
         )
-        graph.query(
+        run_query(
+            graph,
             f"MATCH (x:`{label}` {{name: $alias}}) DETACH DELETE x",
             {"alias": alias},
+            timeout_ms=DEFAULT_QUERY_TIMEOUT_MS,
         )
     except Exception:
         _log.error("merge_alias: finalise failed  alias=%s -> %s", alias, canonical, exc_info=True)
@@ -393,13 +450,17 @@ def decay_edges(org_id: int, factor: float = 0.9, drop_below: float = 0.2) -> di
     below ``drop_below``. Run monthly by the maintenance job."""
     graph = get_graph(org_id)
     try:
-        graph.query(
+        run_query(
+            graph,
             "MATCH ()-[r]->() SET r.weight = coalesce(r.weight, 1.0) * $factor",
             {"factor": float(factor)},
+            timeout_ms=MAINTENANCE_QUERY_TIMEOUT_MS,
         )
-        dropped = graph.query(
+        dropped = run_query(
+            graph,
             "MATCH ()-[r]->() WHERE coalesce(r.weight, 1.0) < $threshold DELETE r RETURN count(r)",
             {"threshold": float(drop_below)},
+            timeout_ms=MAINTENANCE_QUERY_TIMEOUT_MS,
         )
     except Exception:
         _log.error("decay_edges failed  org=%d", org_id, exc_info=True)
@@ -419,7 +480,7 @@ def prune_orphans(org_id: int) -> dict:
     """Delete nodes with degree 0. Entity resolution often leaves these."""
     graph = get_graph(org_id)
     try:
-        graph.query("MATCH (n) WHERE NOT (n)--() DELETE n")
+        run_query(graph, "MATCH (n) WHERE NOT (n)--() DELETE n", timeout_ms=MAINTENANCE_QUERY_TIMEOUT_MS)
     except Exception:
         _log.error("prune_orphans failed  org=%d", org_id, exc_info=True)
         return {"status": "failed"}

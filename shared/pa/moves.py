@@ -152,7 +152,7 @@ def connect(org_id: int) -> MoveCandidate | None:
         return None
 
     try:
-        from infra.graph import get_graph
+        from infra.graph import get_graph, run_query
         graph = get_graph(org_id)
     except Exception:
         _log.debug("connect: get_graph unavailable  org=%d", org_id, exc_info=True)
@@ -173,7 +173,7 @@ def connect(org_id: int) -> MoveCandidate | None:
             _, a = names[i]
             _, b = names[j]
             try:
-                res = graph.query(cypher, {"a": a, "b": b})
+                res = run_query(graph, cypher, {"a": a, "b": b}, timeout_ms=1_500)
             except Exception:
                 _log.debug("connect: graph query failed  a=%r b=%r", a, b, exc_info=True)
                 continue
