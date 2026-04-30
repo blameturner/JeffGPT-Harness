@@ -61,6 +61,39 @@ def load_platform_config() -> dict:
 PLATFORM: dict = load_platform_config()
 
 
+def reload_platform_config() -> dict:
+    """Re-read config.json and replace PLATFORM in place. Used by /admin/config
+    so PATCH edits take effect immediately for callers reading via get_feature."""
+    global PLATFORM
+    fresh = load_platform_config()
+    PLATFORM.clear()
+    PLATFORM.update(fresh)
+    return PLATFORM
+
+
+def write_feature_section(section: str, value: dict) -> None:
+    """Atomically replace ``features.<section>`` in config.json on disk and
+    reload PLATFORM. Caller is responsible for whitelisting/validation.
+
+    Writes to a tmp file in the same directory and renames so a crash mid-
+    write cannot leave the config truncated.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("section value must be a dict")
+    config_path = Path(__file__).parent.parent / "config.json"
+    with open(config_path) as f:
+        cfg = json.load(f)
+    cfg.setdefault("features", {})
+    cfg["features"][section] = value
+    tmp = config_path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    tmp.replace(config_path)
+    reload_platform_config()
+    _log.info("config patched  section=%s  keys=%s", section, sorted(value.keys()))
+
+
 def get_function_config(function_name: str) -> dict:
     cfg = PLATFORM.get("models", {}).get(function_name)
     if cfg:

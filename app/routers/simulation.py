@@ -40,13 +40,25 @@ class CreateSimulationRequest(BaseModel):
     org_id: int | None = None
 
 
+def _parse_json_field(raw, default):
+    if raw in (None, ""):
+        return default
+    if not isinstance(raw, str):
+        return raw if raw is not None else default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
 def _row_to_api(row: dict, include_transcript: bool = False) -> dict:
-    participants = row.get("participants_json")
-    if isinstance(participants, str):
-        try:
-            participants = json.loads(participants or "[]")
-        except Exception:
-            participants = []
+    participants = _parse_json_field(row.get("participants_json"), [])
+    if not isinstance(participants, list):
+        participants = []
+    transcript = _parse_json_field(row.get("transcript_json"), [])
+    if not isinstance(transcript, list):
+        transcript = []
+
     out = {
         "sim_id": row.get("Id"),
         "title": row.get("title") or "",
@@ -54,19 +66,15 @@ def _row_to_api(row: dict, include_transcript: bool = False) -> dict:
         "scenario": row.get("scenario") or "",
         "participants": participants,
         "max_turns": row.get("max_turns"),
+        "turn_count": len(transcript),
+        "created_at": row.get("CreatedAt") or "",
         "started_at": row.get("started_at") or "",
         "completed_at": row.get("completed_at") or "",
         "error": row.get("error") or "",
         "org_id": row.get("org_id"),
     }
     if include_transcript:
-        transcript = row.get("transcript_json")
-        if isinstance(transcript, str):
-            try:
-                transcript = json.loads(transcript or "[]")
-            except Exception:
-                transcript = []
-        out["transcript"] = transcript or []
+        out["transcript"] = transcript
         out["debrief"] = row.get("debrief") or ""
     return out
 
