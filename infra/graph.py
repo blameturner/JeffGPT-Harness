@@ -29,6 +29,9 @@ _log = logging.getLogger("graph")
 client = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
 
 MAX_SOURCE_CHUNKS_PER_EDGE = 25
+# Shared timeout used by background graph maintenance jobs. Kept as a module
+# constant for import compatibility with older callers.
+MAINTENANCE_QUERY_TIMEOUT_MS = 15_000
 
 
 def _now_iso() -> str:
@@ -38,6 +41,22 @@ def _now_iso() -> str:
 def get_graph(org_id: int):
     name = scoped_graph(org_id)
     return client.select_graph(name)
+
+
+def run_query(graph, query: str, params: dict | None = None, timeout_ms: int | None = None):
+    """Compatibility query wrapper used by maintenance and PA graph callers.
+
+    FalkorDB's Python client accepts `timeout` in milliseconds on newer
+    versions. On older versions the kwarg may not exist, so we retry without
+    it instead of failing import/startup paths.
+    """
+    params = params or {}
+    if timeout_ms is None:
+        return graph.query(query, params)
+    try:
+        return graph.query(query, params, timeout=int(timeout_ms))
+    except TypeError:
+        return graph.query(query, params)
 
 
 def write_relationship(
