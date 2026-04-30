@@ -90,6 +90,56 @@ def list_agents(org_id: int, limit: int = 200):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/agents/{agent_name}")
+def get_agent_detail(agent_name: str, org_id: int):
+    """Full agent metadata. Used by the agent-detail panel: persona, model,
+    prompt template, status, schedule hints. Strips internal-only fields."""
+    try:
+        db = NocodbClient()
+        row = db.get_agent(agent_name, org_id=org_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="agent not found")
+    keep = {
+        "Id", "name", "display_name", "description", "persona",
+        "system_prompt_template", "model", "status",
+        "max_runs_per_day", "max_tokens_per_day", "max_concurrent_runs",
+        "CreatedAt", "UpdatedAt",
+    }
+    return {"agent": {k: v for k, v in row.items() if k in keep}}
+
+
+@router.get("/agents/{agent_name}/runs")
+def list_agent_runs(agent_name: str, org_id: int, limit: int = 20):
+    """Recent runs for an agent. Status, summary, tokens, duration — enough
+    for the UI to show 'last 20 runs' without loading every event row."""
+    try:
+        db = NocodbClient()
+        rows = db._get_paginated("agent_runs", params={
+            "where": f"(org_id,eq,{org_id})~and(agent_name,eq,{agent_name})",
+            "sort": "-CreatedAt",
+            "limit": min(max(1, limit), 100),
+        })
+    except Exception as e:
+        _log.warning("list_agent_runs failed  agent=%s org=%d", agent_name, org_id, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    runs = [
+        {
+            "id": r.get("Id"),
+            "status": r.get("status"),
+            "summary": (r.get("summary") or "")[:500],
+            "duration_seconds": r.get("duration_seconds"),
+            "tokens_input": r.get("tokens_input"),
+            "tokens_output": r.get("tokens_output"),
+            "conversation_id": r.get("conversation_id"),
+            "created_at": r.get("CreatedAt"),
+        }
+        for r in rows
+    ]
+    return {"agent_name": agent_name, "runs": runs}
+
+
 @router.post("/scheduler/reload")
 def scheduler_reload():
     from scheduler import reload_agent_schedules

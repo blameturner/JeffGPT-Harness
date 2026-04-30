@@ -32,6 +32,16 @@ _log = logging.getLogger("harvest.runner")
 
 _TABLE = "harvest_runs"
 
+# Cap kept events so artifacts_json doesn't unbound-grow on a 2000-page run.
+# The Live drawer only needs the recent tail.
+_EVENT_LOG_MAX = 200
+
+# Hard cap on the in-memory walker-overflow buffer. The seeding step trims to
+# `features.harvest.suggestions_max_per_run` (default 50) anyway, so anything
+# beyond a few hundred is wasted memory. Belt-and-braces against a runaway
+# walker on a link-heavy site.
+_WALKED_OVERFLOW_MAX = 500
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -42,6 +52,30 @@ def _patch(client: NocodbClient, run_id: int, fields: dict) -> None:
         client._patch(_TABLE, run_id, fields)
     except Exception:
         _log.warning("harvest_runs patch failed run=%d fields=%s", run_id, list(fields), exc_info=True)
+
+
+def _patch_progress(client: NocodbClient, run_id: int, counters: dict,
+                    events_tail: list[dict] | None = None) -> None:
+    """Progress patch that also writes the recent event tail into
+    artifacts_json["events"]. Reads the row first so we don't clobber
+    any per-policy artifacts the persister has accumulated."""
+    fields = dict(counters)
+    if events_tail is not None:
+        try:
+            rows = client._get(_TABLE, params={"where": f"(Id,eq,{run_id})", "limit": 1}).get("list", [])
+            row = rows[0] if rows else {}
+            raw = row.get("artifacts_json") or "{}"
+            try:
+                arts = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (json.JSONDecodeError, TypeError):
+                arts = {}
+            if not isinstance(arts, dict):
+                arts = {}
+            arts["events"] = list(events_tail)[-_EVENT_LOG_MAX:]
+            fields["artifacts_json"] = json.dumps(arts)
+        except Exception:
+            _log.warning("event-log merge failed run=%d", run_id, exc_info=True)
+    _patch(client, run_id, fields)
 
 
 def _load_run(run_id: int) -> tuple[NocodbClient, dict | None]:
@@ -482,6 +516,12 @@ def run_harvest(run_id: int) -> dict:
     source_table = _params(run).get("table") or ""
     source_table = source_table.strip() or None
 
+    # Tail buffer of per-URL events for the Live drawer. Flushed into
+    # artifacts_json["events"] on every progress patch so the API can
+    # serve a recent log without re-reading per-row state.
+    event_log: list[dict] = []
+    walked_overflow: list[str] = []  # URLs the walker discovered but couldn't enqueue
+
     while queue and time.time() < deadline:
         url, depth = queue.popleft()
         if url in visited:
@@ -507,32 +547,47 @@ def run_harvest(run_id: int) -> dict:
         else:
             failed += 1
 
-        # Periodic progress patch + yield slot every N URLs so chat /
-        # higher-priority background jobs can preempt the LLM during a
-        # long crawl. Tunable via features.harvest.yield_every_n_urls /
-        # yield_pause_s in config.json.
+        event_log.append({
+            "ts": _now_iso(),
+            "url": url[:300],
+            "outcome": outcome,
+            "depth": depth,
+        })
+        if len(event_log) > _EVENT_LOG_MAX:
+            event_log = event_log[-_EVENT_LOG_MAX:]
+
+        # Periodic progress patch + yield slot. Default cadence is every 3
+        # URLs (was 10) so the Live UI updates promptly. Tunable via
+        # features.harvest.yield_every_n_urls / yield_pause_s in config.json.
         try:
             from infra.config import get_feature
-            yield_every = int(get_feature("harvest", "yield_every_n_urls", 10) or 10)
-            yield_pause = float(get_feature("harvest", "yield_pause_s", 2) or 2)
+            yield_every = int(get_feature("harvest", "yield_every_n_urls", 3) or 3)
+            yield_pause = float(get_feature("harvest", "yield_pause_s", 1) or 1)
         except Exception:
-            yield_every, yield_pause = 10, 2.0
+            yield_every, yield_pause = 3, 1.0
         if yield_every > 0 and fetched % yield_every == 0:
-            _patch(client, run_id, {
+            _patch_progress(client, run_id, {
                 "urls_fetched": fetched,
                 "urls_persisted": persisted_count,
+                "urls_unchanged": unchanged_count,
+                "urls_skipped": skipped_count,
                 "urls_failed": failed,
-            })
+            }, events_tail=event_log)
             if yield_pause > 0:
                 time.sleep(yield_pause)
 
         # Enqueue children only if we still have headroom for them.
+        # Anything past headroom becomes a candidate for the suggestions
+        # bridge — pathfinder will pick those up.
         if children and policy.walk_enabled and depth + 1 < policy.walk_max_depth:
             headroom = policy.max_pages - (len(visited) + len(queue))
-            if headroom > 0:
-                for c in children[:headroom]:
-                    if c not in visited:
-                        queue.append((c, depth + 1))
+            for i, c in enumerate(children):
+                if c in visited:
+                    continue
+                if i < headroom:
+                    queue.append((c, depth + 1))
+                elif len(walked_overflow) < _WALKED_OVERFLOW_MAX:
+                    walked_overflow.append(c)
 
     # 3. Single flush for artifacts mode — avoids quadratic
     #    read-modify-write on harvest_runs.artifacts_json per item.
@@ -544,6 +599,20 @@ def run_harvest(run_id: int) -> dict:
             )
         except Exception:
             _log.warning("harvest artifact flush failed run=%d", run_id, exc_info=True)
+
+    # 4. Bridge: feed candidate URLs into pathfinder via suggested_scrape_targets.
+    #    Walker overflow is the cheapest signal — URLs the harvest found but
+    #    couldn't process this run because of max_pages / max_depth. Pathfinder
+    #    then promotes them through the existing approve flow.
+    seeded_suggestions = 0
+    if walked_overflow:
+        try:
+            seeded_suggestions = _seed_suggestions_from_overflow(
+                client=client, run_id=run_id, policy_name=policy.name,
+                org_id=org_id, urls=walked_overflow,
+            )
+        except Exception:
+            _log.warning("suggestion seeding failed run=%d", run_id, exc_info=True)
 
     elapsed = round(time.time() - t0, 1)
     # Status logic:
@@ -557,7 +626,9 @@ def run_harvest(run_id: int) -> dict:
     else:
         final_status = "failed"
 
-    _patch(client, run_id, {
+    # Final write also pushes the residual event tail into artifacts_json so
+    # the Live drawer has a complete record after status flips terminal.
+    _patch_progress(client, run_id, {
         "status": final_status,
         "urls_fetched": fetched,
         "urls_persisted": persisted_count,
@@ -565,17 +636,91 @@ def run_harvest(run_id: int) -> dict:
         "urls_skipped": skipped_count,
         "urls_failed": failed,
         "finished_at": _now_iso(),
-    })
+    }, events_tail=event_log)
     _log.info(
-        "harvest:%s:%d DONE %.1fs  fetched=%d persisted=%d unchanged=%d skipped=%d failed=%d",
+        "harvest:%s:%d DONE %.1fs  fetched=%d persisted=%d unchanged=%d skipped=%d failed=%d seeded=%d",
         policy.name, run_id, elapsed,
-        fetched, persisted_count, unchanged_count, skipped_count, failed,
+        fetched, persisted_count, unchanged_count, skipped_count, failed, seeded_suggestions,
     )
     return {
         "status": final_status, "run_id": run_id,
         "fetched": fetched, "persisted": persisted_count,
         "unchanged": unchanged_count, "skipped": skipped_count, "failed": failed,
+        "seeded_suggestions": seeded_suggestions,
     }
+
+
+def _seed_suggestions_from_overflow(*, client: NocodbClient, run_id: int,
+                                    policy_name: str, org_id: int,
+                                    urls: list[str]) -> int:
+    """Write walked-but-unfetched URLs into ``suggested_scrape_targets`` so
+    pathfinder picks them up. Capped (default 50/run) and dedup'd against
+    rows that already exist for this org.
+
+    Disable per-run by setting ``features.harvest.seed_suggestions=false``.
+    """
+    if not urls:
+        return 0
+    try:
+        from infra.config import get_feature, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
+        if not bool(get_feature("harvest", "seed_suggestions", True)):
+            return 0
+        cap = int(get_feature("harvest", "suggestions_max_per_run", 50) or 50)
+    except Exception:
+        from infra.config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
+        cap = 50
+
+    # Dedup within the candidate list first (preserve walker order).
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for u in urls:
+        if not isinstance(u, str) or not u.startswith("http"):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        candidates.append(u)
+        if len(candidates) >= cap:
+            break
+
+    if not candidates:
+        return 0
+
+    # Skip URLs already known to suggested_scrape_targets for this org
+    # (cheap check: one batched lookup, not a per-URL round trip).
+    table = NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS
+    existing: set[str] = set()
+    try:
+        rows = client._get_paginated(
+            table,
+            params={"where": f"(org_id,eq,{org_id})", "limit": 1000},
+        )
+        existing = {str(r.get("url") or "").strip() for r in rows if r.get("url")}
+    except Exception:
+        _log.warning("suggestion dedup lookup failed", exc_info=True)
+
+    written = 0
+    reason = f"discovered by harvest run #{run_id} ({policy_name})"
+    for u in candidates:
+        if u in existing:
+            continue
+        try:
+            client._post(table, {
+                "org_id": org_id,
+                "url": u,
+                "title": u[:200],
+                "query": f"harvest:{policy_name}",
+                "relevance": "medium",
+                "score": 60,
+                "reason": reason,
+                "status": "pending",
+            })
+            written += 1
+        except Exception:
+            _log.warning("suggestion insert failed url=%s", u[:120], exc_info=True)
+    if written:
+        _log.info("harvest:%s:%d seeded %d suggestion(s) into pathfinder", policy_name, run_id, written)
+    return written
 
 
 def finalise_harvest(run_id: int) -> dict:

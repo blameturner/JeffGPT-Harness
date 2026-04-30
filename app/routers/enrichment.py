@@ -29,6 +29,163 @@ class ResearchAgentRequest(BaseModel):
 
 
 
+def _domain_of(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except Exception:
+        host = ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _canonicalise_url(url: str) -> str:
+    """Strip well-known tracking params + fragment so `?utm=…` variants
+    collapse onto the same scrape target. Used by the dedupe helper.
+    """
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    if not url:
+        return ""
+    DROP = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "ref_src", "ref_url",
+        "yclid", "_ga", "_gl", "igshid", "spm",
+    }
+    try:
+        p = urlparse(url)
+        kept = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k not in DROP]
+        return urlunparse(p._replace(query=urlencode(kept), fragment="")).rstrip("/")
+    except Exception:
+        return url
+
+
+@router.get("/sources/health")
+def sources_health(org_id: int, limit: int = 50):
+    """Per-domain scrape health for the org.
+
+    Groups `scrape_targets` rows by host and reports success/failure counts,
+    average chunk yield, last-error, and per-domain freshness. Drives the
+    'source health' panel.
+    """
+    db = NocodbClient()
+    try:
+        rows = db._get_paginated("scrape_targets", params={
+            "where": f"(org_id,eq,{int(org_id)})",
+            "limit": 5000,
+        })
+    except Exception:
+        _log.warning("sources/health: scrape_targets fetch failed  org=%d", org_id, exc_info=True)
+        rows = []
+
+    by_domain: dict[str, dict] = {}
+    for r in rows:
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        host = _domain_of(url) or "unknown"
+        d = by_domain.setdefault(host, {
+            "domain": host,
+            "targets": 0,
+            "active_targets": 0,
+            "ok": 0,
+            "errors": 0,
+            "rejected": 0,
+            "never_scraped": 0,
+            "consecutive_failures_total": 0,
+            "chunks_total": 0,
+            "last_scraped_at": None,
+            "last_error": None,
+            "errors_recent": [],
+        })
+        d["targets"] += 1
+        if int(r.get("active") or 0):
+            d["active_targets"] += 1
+        status = (r.get("status") or "").strip()
+        if status == "ok":
+            d["ok"] += 1
+        elif status == "error":
+            d["errors"] += 1
+            err = (r.get("last_scrape_error") or "").strip()
+            if err:
+                d["errors_recent"].append({"url": url, "error": err[:160]})
+        elif status == "rejected":
+            d["rejected"] += 1
+        elif not status:
+            d["never_scraped"] += 1
+        d["consecutive_failures_total"] += int(r.get("consecutive_failures") or 0)
+        d["chunks_total"] += int(r.get("chunk_count") or 0)
+        ts = r.get("last_scraped_at")
+        if ts and (d["last_scraped_at"] is None or str(ts) > str(d["last_scraped_at"])):
+            d["last_scraped_at"] = ts
+        err = (r.get("last_scrape_error") or "").strip()
+        if err and (d["last_error"] is None or status == "error"):
+            d["last_error"] = err[:240]
+
+    out = []
+    for d in by_domain.values():
+        d["errors_recent"] = d["errors_recent"][:5]
+        finished = d["ok"] + d["errors"]
+        d["success_rate"] = round(d["ok"] / finished, 3) if finished else None
+        out.append(d)
+
+    out.sort(key=lambda x: (-(x.get("targets") or 0), x.get("domain") or ""))
+    return {
+        "org_id": org_id,
+        "domains": out[: max(1, min(int(limit), 500))],
+        "total_domains": len(by_domain),
+        "total_targets": sum(d["targets"] for d in by_domain.values()),
+    }
+
+
+class ScrapeBumpRequest(BaseModel):
+    org_id: int
+    query: str
+    limit: int = 10
+
+
+@router.post("/scrape-targets/bump")
+def scrape_targets_bump(body: ScrapeBumpRequest):
+    """Activity-aware priority bump: when the user starts asking about a
+    topic, find pending scrape_targets whose URL or name contains any
+    keyword from the query and flip their `next_crawl_at` to now so the
+    next dispatch cycle picks them up.
+    """
+    q = (body.query or "").strip().lower()
+    if not q:
+        return {"status": "noop", "matched": 0}
+
+    import re
+    tokens = [t for t in re.findall(r"[a-z0-9]{3,}", q) if t not in {"the", "and", "for", "with"}][:6]
+    if not tokens:
+        return {"status": "noop", "matched": 0}
+
+    db = NocodbClient()
+    try:
+        rows = db._get_paginated("scrape_targets", params={
+            "where": f"(org_id,eq,{int(body.org_id)})~and(active,eq,1)",
+            "limit": 1000,
+        })
+    except Exception:
+        return {"status": "error", "matched": 0}
+
+    matched = 0
+    cap = max(1, min(int(body.limit), 50))
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for r in rows:
+        if matched >= cap:
+            break
+        hay = ((r.get("url") or "") + " " + (r.get("name") or "")).lower()
+        if any(t in hay for t in tokens):
+            try:
+                db._patch("scrape_targets", r["Id"], {
+                    "Id": r["Id"],
+                    "next_crawl_at": now_iso,
+                })
+                matched += 1
+            except Exception:
+                _log.debug("scrape bump patch failed  id=%s", r.get("Id"), exc_info=True)
+    return {"status": "ok", "matched": matched, "tokens": tokens}
+
+
 @router.get("/discovery/suggestions")
 def discovery_suggestions_list(org_id: int, status: str | None = "pending", limit: int = 50):
     limit = min(max(1, limit), 500)
@@ -99,6 +256,121 @@ def discovery_suggestion_reject(suggested_id: int, org_id: int, reason: str | No
     except Exception:
         return {"status": "failed", "error": "patch_failed"}
     return {"status": "ok", "suggested_id": suggested_id}
+
+
+# ── New suggestion API (matches frontend paths) ───────────────────────────────
+#
+# These wrap the existing /discovery/suggestions endpoints with the shapes the
+# Enrichment UI calls. Keeping the older paths around for any cron / curl
+# users; the bodies dispatch to the same logic.
+
+class SuggestionDecisionBody(BaseModel):
+    decision: str  # "approve" | "reject"
+    reason: str | None = None
+
+
+@router.get("/suggestions/pending")
+def suggestions_pending(org_id: int, limit: int = 50):
+    """Pending suggestions (the Enrichment inbox). Sourced from
+    ``suggested_scrape_targets`` where status='pending'.
+
+    Includes rows seeded by the harvest runner (look for ``query`` starting
+    with ``harvest:`` or ``reason`` containing 'harvest run #N') so a single
+    inbox surfaces both flows.
+
+    Returns the UI-shaped ``{suggestions: [...]}`` payload used by Live, plus
+    the legacy ``{status, rows}`` keys for any older caller still wired to
+    the discovery endpoint shape."""
+    legacy = discovery_suggestions_list(org_id=org_id, status="pending", limit=limit)
+    rows = legacy.get("rows") or []
+    suggestions = [_suggestion_for_ui(r) for r in rows]
+    return {
+        "status": "ok",
+        "suggestions": suggestions,
+        # Legacy keys kept for any existing caller.
+        "rows": rows,
+    }
+
+
+def _suggestion_for_ui(row: dict) -> dict:
+    """Map a suggested_scrape_targets row to the shape the Live UI expects.
+
+    The UI's ``EnrichmentSuggestion`` type wants ``{id, kind, title, summary,
+    created_at, source, status, evidence_count}``; the DB row gives us
+    ``{Id, url, title, query, relevance, score, reason, status, CreatedAt}``.
+    """
+    # `score` (0-100 relevance) and `evidence_count` (number of supporting
+    # docs) are different signals — don't fake one from the other. Keep
+    # score as a real field; leave evidence_count out so the UI shows '—'
+    # instead of a misleading number.
+    return {
+        "id": str(row.get("Id")),
+        "kind": "scrape_target",
+        "title": row.get("title") or row.get("url"),
+        "summary": row.get("reason") or row.get("query") or "",
+        "created_at": row.get("CreatedAt") or "",
+        "source": _suggestion_source_tag(row),
+        "status": row.get("status") or "pending",
+        "score": row.get("score"),
+    }
+
+
+@router.get("/suggestions/preview/{suggested_id}")
+def suggestion_preview(suggested_id: int, org_id: int):
+    """Suggestion detail. Returns the row plus a normalised preview snippet
+    derived from existing columns — the UI doesn't need a full HEAD/GET cycle
+    here; it just wants something to show next to the approve/reject buttons.
+    """
+    client = NocodbClient()
+    row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, org_id=org_id)
+    if not row:
+        return {"status": "not_found", "row": None, "preview": None}
+    preview = {
+        "url": row.get("url"),
+        "title": row.get("title") or row.get("url"),
+        "reason": row.get("reason"),
+        "query": row.get("query"),
+        "relevance": row.get("relevance"),
+        "score": row.get("score"),
+        "status": row.get("status"),
+        "source": _suggestion_source_tag(row),
+    }
+    return {"status": "ok", "row": row, "preview": preview}
+
+
+@router.post("/suggestions/{suggested_id}/decision")
+def suggestion_decision(suggested_id: int, body: SuggestionDecisionBody, org_id: int):
+    decision = (body.decision or "").strip().lower()
+    if decision == "approve":
+        return discovery_suggestion_approve(suggested_id, org_id=org_id)
+    if decision == "reject":
+        return discovery_suggestion_reject(suggested_id, org_id=org_id, reason=body.reason)
+    if decision == "defer":
+        # No queue side-effects — just shelve the row so it stops showing in
+        # the pending inbox until a human revisits it.
+        client = NocodbClient()
+        try:
+            client._patch(NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, {
+                "Id": suggested_id,
+                "status": "deferred",
+                "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        except Exception:
+            return {"status": "failed", "error": "patch_failed"}
+        return {"status": "ok", "suggested_id": suggested_id, "decision": "defer"}
+    return {"status": "failed", "error": "decision must be 'approve', 'reject', or 'defer'"}
+
+
+def _suggestion_source_tag(row: dict) -> str:
+    """Identify whether this suggestion came from harvest, the discover_agent,
+    or a manual user submission — useful for the Enrichment UI badge."""
+    q = str(row.get("query") or "")
+    reason = str(row.get("reason") or "")
+    if q.startswith("harvest:") or "harvest run" in reason:
+        return "harvest"
+    if q == "manual_entry" or "user-submitted" in reason:
+        return "manual"
+    return "discover_agent"
 
 
 # ── Manual seed entry (bypasses discovery, goes straight to pathfinder) ───────

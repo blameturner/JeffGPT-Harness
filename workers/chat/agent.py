@@ -14,7 +14,7 @@ from tools.planner import generate_plan
 from workers.base import BaseAgent, ChatResult, _get_summary_event, SUMMARY_WAIT_TIMEOUT
 from tools.search.queries import generate_broad_queries, generate_llm_queries
 from workers.chat.config import chat_style_prompt, chat_max_tokens, chat_temperature
-from workers.chat.history import maybe_summarise, extract_conversation_topics
+from workers.chat.history import maybe_summarise, extract_conversation_topics, load_chat_history
 from workers.chat.payload import build_chat_payload
 from workers.chat.search_phase import SearchPhaseResult
 from workers.chat.rag_phase import submit_rag_future, collect_rag, cancel_rag
@@ -102,10 +102,10 @@ class ChatAgent(BaseAgent):
                     _log.info("chat conv=%s  waited for background summary — ready", conversation_id)
                 else:
                     _log.warning("chat conv=%s  background summary wait timed out after %ds — proceeding without", conversation_id, SUMMARY_WAIT_TIMEOUT)
-            history = [
-                {"role": m["role"], "content": m["content"]}
-                for m in self.db.list_messages(conversation_id, org_id=self.org_id)
-            ]
+            # Bounded summary-aware load: caps at ~120 recent messages but
+            # always pulls the rolling [Conversation summary] row even if it
+            # falls outside that window. See workers/chat/history.py.
+            history = load_chat_history(self.db, conversation_id, self.org_id)
         _span("load_convo_ms", _t)
         set_model_usage_context(
             org_id=self.org_id,

@@ -44,6 +44,108 @@ def _redact_secret(row: dict) -> dict:
 
 
 # ============================================================
+# Unified connectors view (apis + smtp)
+# ============================================================
+#
+# The Connectors UI tab shows one combined list across kinds. IDs are
+# namespaced (`api-{N}`, `smtp-{N}`) so the per-row endpoints can
+# dispatch back to the right table without ambiguity.
+
+def _split_connector_id(connector_id: str) -> tuple[str, int]:
+    if "-" not in connector_id:
+        raise HTTPException(status_code=400, detail="connector id must be 'api-N' or 'smtp-N'")
+    kind, _, raw = connector_id.partition("-")
+    if kind not in ("api", "smtp"):
+        raise HTTPException(status_code=400, detail=f"unknown connector kind '{kind}'")
+    try:
+        numeric = int(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="connector id suffix must be int")
+    return kind, numeric
+
+
+@router.get("")
+def list_connectors(org_id: int = 1, limit: int = 200):
+    """Unified list across `api_connections` + `smtp_accounts`.
+
+    Response shape matches the Connectors UI: each row exposes a
+    namespaced `id` (`api-N`/`smtp-N`), `kind`, and a normalised
+    `status`. `last_call_at` and `error_count_24h` are placeholder
+    nulls/zeros until a call-log table is added.
+    """
+    c = _client()
+    org = resolve_org_id(org_id)
+    out: list[dict] = []
+
+    if API_TABLE in c.tables:
+        rows = c._get_paginated(
+            API_TABLE,
+            params={"where": f"(org_id,eq,{org})", "limit": limit},
+        )
+        for r in rows:
+            out.append({
+                "id": f"api-{r['Id']}",
+                "name": r.get("name"),
+                "kind": "api",
+                "status": r.get("verification_status") or "unverified",
+                "last_call_at": r.get("verified_at"),
+                "error_count_24h": 0,
+            })
+
+    if SMTP_TABLE in c.tables:
+        rows = c._get_paginated(
+            SMTP_TABLE,
+            params={"where": f"(org_id,eq,{org})", "limit": limit},
+        )
+        for r in rows:
+            out.append({
+                "id": f"smtp-{r['Id']}",
+                "name": r.get("name"),
+                "kind": "smtp",
+                "status": r.get("verification_status") or "unverified",
+                "last_call_at": r.get("verified_at"),
+                "error_count_24h": 0,
+            })
+
+    return {"connectors": out, "count": len(out)}
+
+
+@router.get("/{connector_id}/calls")
+def list_connector_calls(connector_id: str, limit: int = 50):
+    """Recent call log for a connector.
+
+    Currently returns an empty list — there is no call-log table yet.
+    The shape (`{calls: [{id, ts, endpoint, duration_ms, status_code,
+    ok, error}]}`) is fixed so the UI table renders.
+    """
+    _split_connector_id(connector_id)  # validate format
+    return {"calls": [], "count": 0, "limit": limit}
+
+
+@router.post("/{connector_id}/test")
+def test_connector(connector_id: str):
+    """Generic connector test dispatcher. Routes to inspect (api) or
+    test_smtp (smtp) based on the namespaced id."""
+    kind, numeric = _split_connector_id(connector_id)
+    if kind == "api":
+        try:
+            return api_registry.inspect_api(numeric)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            _log.error("inspect failed", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    # smtp
+    try:
+        return smtp_registry.test_smtp(numeric)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        _log.error("smtp test failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
 # APIs
 # ============================================================
 

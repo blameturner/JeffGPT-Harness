@@ -12,6 +12,64 @@ MAX_SINGLE_MESSAGE_CHARS = 2_000
 SUMMARISE_THRESHOLD_CHARS = 5_000
 SUMMARISE_THRESHOLD_MESSAGES = 6
 
+# Cap on rows pulled per turn from NocoDB. The summary message is fetched
+# separately when present so it survives the cap. Long-running conversations
+# routinely accumulate hundreds of messages; loading them all over HTTP for
+# every turn is the dominant pre-LLM stall.
+DEFAULT_RECENT_MESSAGE_LIMIT = 120
+
+
+def load_chat_history(db, conversation_id: int, org_id: int, recent_limit: int = DEFAULT_RECENT_MESSAGE_LIMIT) -> list[dict]:
+    """Load the message history for a chat turn, summary-aware.
+
+    Returns chronological-order messages capped at ``recent_limit``. If a
+    ``[Conversation summary]`` system row exists outside that window (because
+    summarisation patches the same row each turn, keeping its old
+    ``CreatedAt``), it is fetched separately and prepended so the LLM still
+    sees the rolling summary.
+    """
+    # Last N in reverse-chronological order; reverse to chronological.
+    try:
+        rows_desc = db._get_paginated("messages", params={
+            "where": f"(conversation_id,eq,{int(conversation_id)})~and(org_id,eq,{int(org_id)})",
+            "sort": "-CreatedAt",
+            "limit": int(recent_limit),
+        })
+    except Exception:
+        _log.warning("load_chat_history: paginated read failed conv=%s — falling back to list_messages", conversation_id, exc_info=True)
+        return db.list_messages(int(conversation_id), org_id=int(org_id))
+
+    recent = list(reversed(rows_desc))
+    history = [{"role": m["role"], "content": m["content"]} for m in recent if m.get("role")]
+
+    has_summary = any(
+        m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or "")
+        for m in history
+    )
+    if has_summary:
+        return history
+
+    # Look for an out-of-window summary row. Cheap one-off lookup with limit=1.
+    try:
+        rows = db._get("messages", params={
+            "where": (
+                f"(conversation_id,eq,{int(conversation_id)})"
+                f"~and(org_id,eq,{int(org_id)})"
+                f"~and(role,eq,system)"
+                f"~and(content,like,%[Conversation summary]%)"
+            ),
+            "sort": "-CreatedAt",
+            "limit": 1,
+        }).get("list", [])
+    except Exception:
+        _log.debug("load_chat_history: summary lookup failed conv=%s", conversation_id, exc_info=True)
+        rows = []
+
+    if rows:
+        s = rows[0]
+        history = [{"role": s.get("role") or "system", "content": s.get("content") or ""}] + history
+    return history
+
 
 def _truncate_message(msg: dict) -> dict:
     content = msg.get("content") or ""

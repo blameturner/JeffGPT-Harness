@@ -192,6 +192,59 @@ def list_runs(policy: str | None = None, status: str | None = None,
     return {"runs": rows, "count": len(rows)}
 
 
+_NON_TERMINAL_STATUSES = ("queued", "planning", "fetching", "extracting", "persisting")
+
+
+@router.get("/active")
+def active_runs(org_id: int | None = None, limit: int = 50):
+    """Runs that haven't reached a terminal state. The Live UI polls this
+    every few seconds while any are non-terminal."""
+    limit = max(1, min(int(limit), 200))
+    where_parts = ["(status,in," + ",".join(_NON_TERMINAL_STATUSES) + ")"]
+    if org_id:
+        where_parts.append(f"(org_id,eq,{int(org_id)})")
+    params = {"where": "~and".join(where_parts), "sort": "-CreatedAt", "limit": limit}
+    client = NocodbClient()
+    try:
+        rows = client._get(_TABLE, params=params).get("list", [])
+    except Exception:
+        raise HTTPException(status_code=500, detail="harvest_runs query failed")
+    return {"runs": rows, "count": len(rows)}
+
+
+@router.get("/runs/{run_id}/log")
+def get_run_log(run_id: int, tail: int = 100):
+    """Per-URL event tail for the Live drawer. Sourced from
+    artifacts_json["events"] which the runner maintains as a rolling
+    buffer (capped at 200 events)."""
+    tail = max(1, min(int(tail), 500))
+    client = NocodbClient()
+    try:
+        rows = client._get(_TABLE, params={"where": f"(Id,eq,{run_id})", "limit": 1}).get("list", [])
+    except Exception:
+        raise HTTPException(status_code=500, detail="harvest_runs query failed")
+    if not rows:
+        raise HTTPException(status_code=404, detail="run not found")
+    row = rows[0]
+    raw = row.get("artifacts_json") or "{}"
+    try:
+        arts = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (json.JSONDecodeError, TypeError):
+        arts = {}
+    events = arts.get("events") if isinstance(arts, dict) else []
+    if not isinstance(events, list):
+        events = []
+    return {
+        "run_id": run_id,
+        "status": row.get("status"),
+        "urls_planned": row.get("urls_planned") or 0,
+        "urls_fetched": row.get("urls_fetched") or 0,
+        "urls_persisted": row.get("urls_persisted") or 0,
+        "urls_failed": row.get("urls_failed") or 0,
+        "events": events[-tail:],
+    }
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: int):
     client = NocodbClient()

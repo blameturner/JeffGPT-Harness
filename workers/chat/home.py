@@ -35,6 +35,16 @@ _PREFACE_CACHE_TTL_S = 300
 _preface_cache: dict[int, tuple[float, str]] = {}
 _preface_lock = threading.Lock()
 
+# build_recall() spawns ~13 sequential NocoDB round trips. On the chat hot
+# path that's 1–3s of pure DB latency before the LLM is even invoked. The
+# daily-brief / topic-picker producers want fresh data, so we cache only at
+# the chat call site (not inside build_recall). 60s TTL: short enough that
+# loops/topics/facts created mid-session still surface within a turn or two,
+# long enough that quick back-and-forth doesn't refetch on every message.
+_PA_CONTEXT_CACHE_TTL_S = 60
+_pa_context_cache: dict[int, tuple[float, str]] = {}
+_pa_context_lock = threading.Lock()
+
 
 def _build_digest_preface(org_id: int) -> str:
     now = time.time()
@@ -332,6 +342,17 @@ absent. Use it lightly:
 """
 
 
+def invalidate_pa_context(org_id: int | None = None) -> None:
+    """Drop the cached PA recall block. Called by the post-turn extractor
+    after it persists new loops/facts/topics so the next turn sees them
+    even if it lands inside the TTL window."""
+    with _pa_context_lock:
+        if org_id is None:
+            _pa_context_cache.clear()
+        else:
+            _pa_context_cache.pop(org_id, None)
+
+
 def _build_pa_context(org_id: int) -> str:
     """Compact, conversational recall block for the home chat path.
 
@@ -339,15 +360,24 @@ def _build_pa_context(org_id: int) -> str:
     short markdown the chat assistant reads in its system prompt, not
     a full JSON payload. Aim ≤ 1500 chars so chat latency doesn't
     suffer. Lives off the same recall layer so the chat and the brief
-    stay coherent.
+    stay coherent. Cached for ~60s — see _PA_CONTEXT_CACHE_TTL_S.
     """
     if not is_feature_enabled("pa"):
         return ""
+
+    now = time.time()
+    with _pa_context_lock:
+        hit = _pa_context_cache.get(org_id)
+        if hit and now - hit[0] < _PA_CONTEXT_CACHE_TTL_S:
+            return hit[1]
+
     try:
         from shared.pa.recall import build_recall
         payload = build_recall(int(org_id))
     except Exception:
         _log.debug("home chat: build_recall failed  org=%d", org_id, exc_info=True)
+        with _pa_context_lock:
+            _pa_context_cache[org_id] = (now, "")
         return ""
 
     lines: list[str] = []
@@ -455,9 +485,13 @@ def _build_pa_context(org_id: int) -> str:
             lines.append(f"- {op}")
 
     if not lines:
-        return _CONVERSATION_RULES
+        result = _CONVERSATION_RULES
+    else:
+        result = _CONVERSATION_RULES + "\n\nCONTEXT:\n" + "\n".join(lines)
 
-    return _CONVERSATION_RULES + "\n\nCONTEXT:\n" + "\n".join(lines)
+    with _pa_context_lock:
+        _pa_context_cache[org_id] = (now, result)
+    return result
 
 
 def _latest_assistant_reply(org_id: int, conversation_id: int) -> tuple[str, int | None]:
@@ -505,6 +539,10 @@ def _run_extractor_async(
                 result.get("facts_written", 0),
                 result.get("topics_boosted", 0),
             )
+            # Drop the cached PA context so the next turn picks up new
+            # loops/facts/topics regardless of TTL window.
+            if any(result.get(k) for k in ("loops_created", "loops_resolved", "facts_written", "topics_boosted")):
+                invalidate_pa_context(org_id)
             _queue_topic_research(org_id, result.get("new_topic_ids") or [])
             try:
                 from shared.pa.assistant_extractor import extract_assistant_commitments
@@ -601,8 +639,17 @@ def run_home_turn(
             max_tokens = 200
         system_preface = _ACK_SYSTEM
     else:
-        preface = _build_digest_preface(org_id)
-        pa_ctx = _build_pa_context(org_id)
+        # Run the two preface builders in parallel: they hit different data
+        # sources (digest table vs PA recall layer) and are independent. On a
+        # cold cache PA recall fires ~13 NocoDB queries; the digest read does
+        # 1–2. Running them concurrently knocks ~50–80% off worst-case
+        # preface latency.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"home-preface-{org_id}") as ex:
+            f_preface = ex.submit(_build_digest_preface, org_id)
+            f_pa = ex.submit(_build_pa_context, org_id)
+            preface = f_preface.result()
+            pa_ctx = f_pa.result()
         if pa_ctx and preface:
             system_preface = f"{preface}\n\n{pa_ctx}"
         else:

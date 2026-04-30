@@ -33,11 +33,23 @@ def submit_rag_future(
 def collect_rag(
     rag_future: concurrent.futures.Future | None,
     rag_executor: concurrent.futures.ThreadPoolExecutor | None,
+    timeout: float = 8.0,
 ) -> str:
+    """Block on the RAG retrieval future and return its context string.
+
+    Default timeout is 8s — chat is interactive, a slow vector store should
+    degrade rather than stall the reply. Callers that genuinely need a long
+    window (offline producers) can pass a larger timeout. A timeout here
+    yields ``""`` so the LLM still answers, just without retrieved context.
+    """
     rag_context = ""
     if rag_future is not None:
         try:
-            rag_context = rag_future.result(timeout=45)
+            rag_context = rag_future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            _log.warning("RAG retrieval timed out after %ss — proceeding without context", timeout)
+            rag_future.cancel()
+            rag_context = ""
         except Exception:
             _log.error("RAG retrieval failed", exc_info=True)
             rag_context = ""

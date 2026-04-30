@@ -401,13 +401,17 @@ def stats_usage(org_id: int, period: str = "30d"):
                 c.pop("conversation_key", None)
                 c.pop("conversation_kind", None)
 
-    successful_runs = [r for r in runs if r.get("status") == "complete"]
+    # agent_runs has two writers that disagree on terminal-success spelling
+    # ("complete" via NocodbClient.create_run, "completed" via runtime.py).
+    # Count both as success so success_rate isn't misleadingly low.
+    _SUCCESS = {"complete", "completed"}
+    successful_runs = [r for r in runs if r.get("status") in _SUCCESS]
     by_agent: dict[str, dict] = {}
     for r in runs:
         name = r.get("agent_name") or "unknown"
         entry = by_agent.setdefault(name, {"agent_name": name, "runs": 0, "successful": 0, "total_steps": 0})
         entry["runs"] += 1
-        if r.get("status") == "complete":
+        if r.get("status") in _SUCCESS:
             entry["successful"] += 1
         entry["total_steps"] += int(r.get("steps") or 0)
     agent_runs_section = {
