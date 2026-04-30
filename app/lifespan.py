@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
         graph_resolve_entities_job,
     )
     from tools.pa.background import pa_topic_research_job
+    from tools.simulation.agent import run_simulation_job
     tool_queue = ToolJobQueue()
     # Priority tiers (lower = picked first):
     #   3 = graph_extract, research planner + agent
@@ -136,6 +137,10 @@ async def lifespan(app: FastAPI):
     tool_queue.register("pa_topic_research", HandlerConfig(
         handler=pa_topic_research_job,
         max_workers=1, priority_default=5, source="pa",
+    ))
+    tool_queue.register("simulation_run", HandlerConfig(
+        handler=run_simulation_job,
+        max_workers=1, priority_default=4, source="simulation",
     ))
     _set_instance(tool_queue)
     app.state.tool_queue = tool_queue

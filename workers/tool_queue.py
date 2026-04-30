@@ -846,6 +846,7 @@ class ToolJobQueue:
                     "summarise_page": 3,              # 15m — summariser LLM
                     "extract_relationships": 4,       # 20m — relationship extraction LLM
                     "discover_agent_run": 3,          # 15m — Chroma sample + LLM + SearXNG queries
+                    "simulation_run": 6,              # 30m — N persona turns + debrief LLM
                 }
                 timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
                 if now - started_ts > timeout:
