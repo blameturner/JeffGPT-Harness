@@ -1,26 +1,13 @@
-        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
-    for m in messages:
-        cid = m.get("conversation_id")
-        if not cid:
-            continue
-        c = convos.setdefault(cid, {"conversation_id": cid, "title": "", "message_count": 0, "total_tokens": 0, "last_active": ""})
-    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
-        ts = m.get("CreatedAt") or ""
-    for r in runs:
-            "tokens_input": entry["tokens_input"],
-        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
-    except Exception:
-        _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
-        rows = db._get_paginated("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
-    # so fetch by org_id and filter by date in Python on the way out.
 import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.routers.enrichment import build_enrichment_runtime_snapshot
 from infra.config import HUEY_CONSUMER_WORKERS, HUEY_ENABLED, HUEY_SQLITE_PATH
 from infra.huey_runtime import get_huey, is_huey_consumer_running
 from infra.nocodb_client import NocodbClient
-from app.routers.enrichment import build_enrichment_runtime_snapshot
 from workers.tool_queue import ToolJob
 
 _log = logging.getLogger("main.stats")
@@ -57,14 +44,8 @@ def _scheduler_status(request: Request) -> dict:
                 "discover_agent_dispatcher",
             }:
                 enrichment_jobs.append(payload)
-    next_run = None
-    for ej in agent_jobs:
-        if ej["next_run"] and (next_run is None or ej["next_run"] < next_run):
-            next_run = ej["next_run"]
-    next_enrichment_run = None
-    for ej in enrichment_jobs:
-        if ej["next_run"] and (next_enrichment_run is None or ej["next_run"] < next_enrichment_run):
-            next_enrichment_run = ej["next_run"]
+    next_run = min((j["next_run"] for j in agent_jobs if j.get("next_run")), default=None)
+    next_enrichment_run = min((j["next_run"] for j in enrichment_jobs if j.get("next_run")), default=None)
     return {
         "running": running,
         "next_run": next_run,
@@ -74,13 +55,50 @@ def _scheduler_status(request: Request) -> dict:
     }
 
 
+def _parse_dt(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        ts = value / 1000.0 if value > 1e12 else float(value)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    s = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _in_period(row: dict, start: datetime) -> bool:
+    dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
+    if dt is None:
+        return True
+    return dt >= start
+
+
+def _safe_get_paginated(db: NocodbClient, table: str, *, org_id: int, limit: int = 5000) -> list[dict]:
+    return db._get_paginated(table, params={"where": f"(org_id,eq,{org_id})", "limit": limit})
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    idx = int(len(sorted_vals) * pct)
+    idx = min(idx, len(sorted_vals) - 1)
+    return round(sorted_vals[idx], 2)
+
+
 @router.get("/ops/dashboard")
 def ops_dashboard(request: Request, org_id: int, limit: int = 20):
-    """Merged operational dashboard for frontend polling.
-
-    Combines queue status, Huey runtime, scheduler state, and recent org-scoped
-    enrichment rows/jobs in one response.
-    """
+    """Merged operational dashboard for frontend polling."""
     limit = min(max(1, limit), 100)
     db = NocodbClient()
 
@@ -91,31 +109,32 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
         recent_jobs = q.list_jobs(limit=limit, org_id=org_id, verbose=True)
     else:
         try:
-            rows = db._get("tool_jobs", params={
-                "where": f"(org_id,eq,{org_id})",
-                "sort": "-CreatedAt",
-                "limit": limit,
-            }).get("list", [])
+            rows = db._get(
+                "tool_jobs",
+                params={
+                    "where": f"(org_id,eq,{org_id})",
+                    "sort": "-CreatedAt",
+                    "limit": limit,
+                },
+            ).get("list", [])
             recent_jobs = [ToolJob.from_row(r).to_api(verbose=True) for r in rows]
         except Exception:
             _log.warning("ops/dashboard tool_jobs query failed  org_id=%d", org_id, exc_info=True)
 
     try:
-        discovery_rows = db._get_paginated("discovery", params={
-            "where": f"(org_id,eq,{org_id})",
-            "sort": "-CreatedAt",
-            "limit": limit,
-        })
+        discovery_rows = db._get_paginated(
+            "discovery",
+            params={"where": f"(org_id,eq,{org_id})", "sort": "-CreatedAt", "limit": limit},
+        )
     except Exception:
         _log.warning("ops/dashboard discovery query failed  org_id=%d", org_id, exc_info=True)
         discovery_rows = []
 
     try:
-        scrape_target_rows = db._get_paginated("scrape_targets", params={
-            "where": f"(org_id,eq,{org_id})",
-            "sort": "-CreatedAt",
-            "limit": limit,
-        })
+        scrape_target_rows = db._get_paginated(
+            "scrape_targets",
+            params={"where": f"(org_id,eq,{org_id})", "sort": "-CreatedAt", "limit": limit},
+        )
     except Exception:
         _log.warning("ops/dashboard scrape_targets query failed  org_id=%d", org_id, exc_info=True)
         scrape_target_rows = []
@@ -130,7 +149,6 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "cancel": "/tool-queue/jobs/{job_id}",
             "update_priority": "/tool-queue/jobs/{job_id}/priority",
             "events": "/tool-queue/events",
-            # Enrichment routes are mounted under `/enrichment`.
             "run_scraper": "/enrichment/scraper/start?org_id={org_id}",
             "run_pathfinder": "/enrichment/pathfinder/start?org_id={org_id}",
             "run_discover_agent": "/enrichment/discover-agent/start?org_id={org_id}",
@@ -141,7 +159,7 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "queued": sum(1 for j in active_jobs if j.get("status") == "queued"),
             "running": sum(1 for j in active_jobs if j.get("status") == "running"),
         },
-        "backoff": (queue_status.get("backoff") if isinstance(queue_status, dict) else None),
+        "backoff": queue_status.get("backoff") if isinstance(queue_status, dict) else None,
     }
 
     return {
@@ -154,31 +172,16 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
         },
         "scheduler": _scheduler_status(request),
         "pipeline": build_enrichment_runtime_snapshot(request, org_id, client=db),
-        "discovery": {
-            "count": len(discovery_rows),
-            "rows": discovery_rows,
-        },
-        "scrape_targets": {
-            "count": len(scrape_target_rows),
-            "rows": scrape_target_rows,
-        },
-        "queue_jobs": {
-            "count": len(recent_jobs),
-            "rows": recent_jobs,
-        },
+        "discovery": {"count": len(discovery_rows), "rows": discovery_rows},
+        "scrape_targets": {"count": len(scrape_target_rows), "rows": scrape_target_rows},
+        "queue_jobs": {"count": len(recent_jobs), "rows": recent_jobs},
         "queue_center": queue_center,
-        "active_summary": {
-            "active": len(active_jobs),
-            "queued": sum(1 for j in active_jobs if j.get("status") == "queued"),
-            "running": sum(1 for j in active_jobs if j.get("status") == "running"),
-            "org_id": org_id,
-        },
+        "active_summary": queue_center["active_summary"] | {"org_id": org_id},
     }
 
 
 @router.get("/stats/usage")
 def stats_usage(org_id: int, period: str = "30d"):
-    from datetime import datetime, timedelta, timezone
     try:
         db = NocodbClient()
     except Exception as e:
@@ -195,86 +198,70 @@ def stats_usage(org_id: int, period: str = "30d"):
     period_start = start.strftime("%Y-%m-%d")
     period_end = now.strftime("%Y-%m-%d")
 
-    def _parse_dt(value):
-        if value is None or value == "":
-            return None
-        if isinstance(value, (int, float)):
-            ts = value / 1000.0 if value > 1e12 else float(value)
-            try:
-                return datetime.fromtimestamp(ts, tz=timezone.utc)
-            except Exception:
-                return None
-        s = str(value).strip().replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(s)
-        except Exception:
-            try:
-                dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+    try:
+        messages = [r for r in _safe_get_paginated(db, "messages", org_id=org_id) if _in_period(r, start)]
+    except Exception:
+        _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
+        messages = []
 
     try:
-        rows = db._get_paginated("code_messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
-        code_messages = [r for r in rows if _within_period(r)]
+        code_messages = [r for r in _safe_get_paginated(db, "code_messages", org_id=org_id) if _in_period(r, start)]
     except Exception:
         _log.warning("stats/usage code_messages query failed  org=%d period=%s", org_id, period, exc_info=True)
         code_messages = []
 
-    def _within_period(row):
-        dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
-        if dt is None:
-            return True  # keep when timestamp is missing or unparseable
-        return dt >= start
-
-    # nocodb's where parser rejects gte filters on the CreatedAt system column in this version,
-    all_messages = messages + code_messages
-
-    total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in all_messages)
     try:
-    total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in all_messages)
-        messages = [r for r in rows if _within_period(r)]
+        runs = [r for r in _safe_get_paginated(db, "agent_runs", org_id=org_id) if _in_period(r, start)]
+    except Exception:
+        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
+        runs = []
+
+    all_messages = messages + code_messages
+    failed_runs = [r for r in runs if r.get("status") == "failed"]
+
+    total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in all_messages) + sum(
+        int(r.get("tokens_input") or 0) for r in runs
+    )
+    total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in all_messages) + sum(
+        int(r.get("tokens_output") or 0) for r in runs
+    )
     total_requests = len(all_messages) + len(runs)
     total_conversations = len({
         *(f"chat:{m.get('conversation_id')}" for m in messages if m.get("conversation_id")),
         *(f"code:{m.get('conversation_id')}" for m in code_messages if m.get("conversation_id")),
     })
-        messages = []
-
-    try:
-        rows = db._get_paginated("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
-    for m in all_messages:
-    except Exception:
-        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
-        runs = []
-
-    total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
-    total_tokens_in += sum(int(r.get("tokens_input") or 0) for r in runs)
-    total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in messages)
-    total_tokens_out += sum(int(r.get("tokens_output") or 0) for r in runs)
-    total_requests = len(messages) + len(runs)
-    total_conversations = len({m.get("conversation_id") for m in messages if m.get("conversation_id")})
-    failed_runs = [r for r in runs if r.get("status") == "failed"]
     total_errors = len(failed_runs)
 
-    by_model: dict = {}
-    for m in messages:
+    by_model: dict[str, dict] = {}
+    for m in all_messages:
         model = (m.get("model") or "unknown").strip() or "unknown"
-        entry = by_model.setdefault(model, {
-            "model_name": model, "requests": 0, "tokens_input": 0,
-            "tokens_output": 0, "durations": [], "error_count": 0,
-        })
+        entry = by_model.setdefault(
+            model,
+            {
+                "model_name": model,
+                "requests": 0,
+                "tokens_input": 0,
+                "tokens_output": 0,
+                "durations": [],
+                "error_count": 0,
+            },
+        )
         entry["requests"] += 1
         entry["tokens_input"] += int(m.get("tokens_input") or 0)
         entry["tokens_output"] += int(m.get("tokens_output") or 0)
     for r in runs:
         model = (r.get("model_name") or "unknown").strip() or "unknown"
-        entry = by_model.setdefault(model, {
-            "model_name": model, "requests": 0, "tokens_input": 0,
-            "tokens_output": 0, "durations": [], "error_count": 0,
-        })
+        entry = by_model.setdefault(
+            model,
+            {
+                "model_name": model,
+                "requests": 0,
+                "tokens_input": 0,
+                "tokens_output": 0,
+                "durations": [],
+                "error_count": 0,
+            },
+        )
         entry["requests"] += 1
         entry["tokens_input"] += int(r.get("tokens_input") or 0)
         entry["tokens_output"] += int(r.get("tokens_output") or 0)
@@ -284,77 +271,79 @@ def stats_usage(org_id: int, period: str = "30d"):
         if r.get("status") == "failed":
             entry["error_count"] += 1
 
-    def _percentile(sorted_vals: list[float], pct: float) -> float:
-        if not sorted_vals:
-            return 0.0
-        idx = int(len(sorted_vals) * pct)
-        idx = min(idx, len(sorted_vals) - 1)
-        return round(sorted_vals[idx], 2)
-
     by_model_list = []
     for entry in sorted(by_model.values(), key=lambda x: x["requests"], reverse=True):
+        durations = sorted(float(d) for d in entry["durations"])
         avg_tokens = (entry["tokens_input"] + entry["tokens_output"]) // max(entry["requests"], 1)
-        durations = sorted(entry["durations"])
         avg_dur = round(sum(durations) / len(durations), 2) if durations else 0.0
-        by_model_list.append({
-    for m in all_messages:
-            "requests": entry["requests"],
-            "tokens_input": entry["tokens_input"],
-            "tokens_output": entry["tokens_output"],
-            "avg_tokens_per_request": avg_tokens,
-            "avg_duration_seconds": avg_dur,
-            "p50_duration_seconds": _percentile(durations, 0.50),
-            "p95_duration_seconds": _percentile(durations, 0.95),
-            "p99_duration_seconds": _percentile(durations, 0.99),
-            "time_to_first_token_ms": 0,
-            "error_count": entry["error_count"],
-            "error_rate": round(entry["error_count"] / max(entry["requests"], 1), 4),
-        })
+        by_model_list.append(
+            {
+                "model_name": entry["model_name"],
+                "requests": entry["requests"],
+                "tokens_input": entry["tokens_input"],
+                "tokens_output": entry["tokens_output"],
+                "avg_tokens_per_request": avg_tokens,
+                "avg_duration_seconds": avg_dur,
+                "p50_duration_seconds": _percentile(durations, 0.50),
+                "p95_duration_seconds": _percentile(durations, 0.95),
+                "p99_duration_seconds": _percentile(durations, 0.99),
+                "time_to_first_token_ms": 0,
+                "error_count": entry["error_count"],
+                "error_rate": round(entry["error_count"] / max(entry["requests"], 1), 4),
+            }
+        )
 
-    by_day: dict = {}
-    for m in messages:
-        day = (m.get("CreatedAt") or "")[:10]
-        if not day:
+    by_day: dict[str, dict] = {}
+    for row in all_messages + runs:
+        dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
+        if dt is None:
             continue
+        day = dt.strftime("%Y-%m-%d")
         d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0, "errors": 0})
         d["requests"] += 1
-    for m in all_messages:
-        d["tokens_output"] += int(m.get("tokens_output") or 0)
-    for r in runs:
-        day = (r.get("CreatedAt") or "")[:10]
-        if not day:
-            continue
-        d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0, "errors": 0})
-        d["requests"] += 1
-        d["tokens_input"] += int(r.get("tokens_input") or 0)
-        d["tokens_output"] += int(r.get("tokens_output") or 0)
-        if r.get("status") == "failed":
+        d["tokens_input"] += int(row.get("tokens_input") or 0)
+        d["tokens_output"] += int(row.get("tokens_output") or 0)
+        if row in runs and row.get("status") == "failed":
             d["errors"] += 1
     by_day_list = sorted(by_day.values(), key=lambda x: x["date"])
 
+    by_hour: dict[tuple[int, int], dict] = {}
     for m in all_messages:
-    for m in messages:
-        ts = m.get("CreatedAt") or ""
-        if len(ts) < 13:
+        dt = _parse_dt(m.get("CreatedAt") or m.get("created_at"))
+        if dt is None:
             continue
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            key = (dt.hour, dt.isoweekday() % 7)  # 0=Sun
-            bucket = by_hour.setdefault(key, {"hour": dt.hour, "day_of_week": dt.isoweekday() % 7, "requests": 0})
-            bucket["requests"] += 1
+        key = (dt.hour, dt.isoweekday() % 7)
+        bucket = by_hour.setdefault(key, {"hour": dt.hour, "day_of_week": dt.isoweekday() % 7, "requests": 0})
+        bucket["requests"] += 1
+    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
+
+    by_style: dict[str, int] = {}
+    for m in messages:
+        style = (m.get("response_style") or "").strip() or "default"
+        by_style[style] = by_style.get(style, 0) + 1
+    by_style_list = [{"style": k, "requests": v} for k, v in sorted(by_style.items(), key=lambda x: -x[1])]
+
+    convos: dict[str, dict] = {}
+    for m in messages:
+        cid = m.get("conversation_id")
+        if not cid:
+            continue
         key = f"chat:{cid}"
-        c = convos.setdefault(key, {
-            "conversation_id": cid,
-            "conversation_key": key,
-            "conversation_kind": "chat",
-            "title": "",
-            "message_count": 0,
-            "total_tokens": 0,
-            "last_active": "",
-        })
+        c = convos.setdefault(
+            key,
+            {
+                "conversation_id": cid,
+                "conversation_key": key,
+                "conversation_kind": "chat",
+                "title": "",
+                "message_count": 0,
+                "total_tokens": 0,
+                "last_active": "",
+            },
+        )
         c["message_count"] += 1
         c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
-        ts = m.get("CreatedAt") or ""
+        ts = str(m.get("CreatedAt") or "")
         if ts > c["last_active"]:
             c["last_active"] = ts
     for m in code_messages:
@@ -362,77 +351,65 @@ def stats_usage(org_id: int, period: str = "30d"):
         if not cid:
             continue
         key = f"code:{cid}"
-        c = convos.setdefault(key, {
-            "conversation_id": cid,
-            "conversation_key": key,
-            "conversation_kind": "code",
-            "title": "",
-            "message_count": 0,
-            "total_tokens": 0,
-            "last_active": "",
-        })
-            continue
-    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
+        c = convos.setdefault(
+            key,
+            {
+                "conversation_id": cid,
+                "conversation_key": key,
+                "conversation_kind": "code",
+                "title": "",
+                "message_count": 0,
+                "total_tokens": 0,
+                "last_active": "",
+            },
+        )
+        c["message_count"] += 1
+        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
+        ts = str(m.get("CreatedAt") or "")
+        if ts > c["last_active"]:
+            c["last_active"] = ts
 
-    by_style: dict = {}
-    for m in messages:
-        style = (m.get("response_style") or "").strip() or "default"
-        by_style[style] = by_style.get(style, 0) + 1
-    by_style_list = [{"style": k, "requests": v} for k, v in sorted(by_style.items(), key=lambda x: -x[1])]
+    top_conversations = sorted(convos.values(), key=lambda x: x["message_count"], reverse=True)[:10]
+    if top_conversations:
+        try:
             chat_ids = [c["conversation_id"] for c in top_conversations if c.get("conversation_kind") == "chat"]
             code_ids = [c["conversation_id"] for c in top_conversations if c.get("conversation_kind") == "code"]
             title_map: dict[str, str] = {}
             if chat_ids:
-                conv_rows = db._get("conversations", params={
-                    "where": "~or".join(f"(Id,eq,{cid})" for cid in chat_ids),
-                    "limit": len(chat_ids),
-                }).get("list", [])
+                conv_rows = db._get(
+                    "conversations",
+                    params={"where": "~or".join(f"(Id,eq,{cid})" for cid in chat_ids), "limit": len(chat_ids)},
+                ).get("list", [])
                 for r in conv_rows:
-                    if int(r.get("org_id") or 0) != int(org_id):
-                        continue
-                    title_map[f"chat:{r['Id']}"] = r.get("title") or ""
+                    if int(r.get("org_id") or 0) == int(org_id):
+                        title_map[f"chat:{r['Id']}"] = r.get("title") or ""
             if code_ids:
-                conv_rows = db._get("code_conversations", params={
-                    "where": "~or".join(f"(Id,eq,{cid})" for cid in code_ids),
-                    "limit": len(code_ids),
-                }).get("list", [])
+                conv_rows = db._get(
+                    "code_conversations",
+                    params={"where": "~or".join(f"(Id,eq,{cid})" for cid in code_ids), "limit": len(code_ids)},
+                ).get("list", [])
                 for r in conv_rows:
-                    if int(r.get("org_id") or 0) != int(org_id):
-                        continue
-                    title_map[f"code:{r['Id']}"] = r.get("title") or ""
-            continue
-                c["title"] = title_map.get(c.get("conversation_key") or "", "")
-        c["message_count"] += 1
-        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
-        ts = m.get("CreatedAt") or ""
-    for c in top_conversations:
-        c.pop("conversation_key", None)
-        c.pop("conversation_kind", None)
-
-        if ts > c["last_active"]:
-            c["last_active"] = ts
-    top_conversations = sorted(convos.values(), key=lambda x: x["message_count"], reverse=True)[:10]
-    if top_conversations:
-        try:
-            conv_rows = db._get("conversations", params={
-                "where": "~or".join(f"(Id,eq,{c['conversation_id']})" for c in top_conversations),
-                "limit": 10,
-            }).get("list", [])
-            title_map = {r["Id"]: r.get("title") or "" for r in conv_rows}
+                    if int(r.get("org_id") or 0) == int(org_id):
+                        title_map[f"code:{r['Id']}"] = r.get("title") or ""
             for c in top_conversations:
-                c["title"] = title_map.get(c["conversation_id"], "")
+                c["title"] = title_map.get(c.get("conversation_key") or "", "")
+                c.pop("conversation_key", None)
+                c.pop("conversation_kind", None)
         except Exception:
-            pass
+            _log.debug("stats/usage title resolution failed  org=%d", org_id, exc_info=True)
+            for c in top_conversations:
+                c.pop("conversation_key", None)
+                c.pop("conversation_kind", None)
 
     successful_runs = [r for r in runs if r.get("status") == "complete"]
-    by_agent: dict = {}
+    by_agent: dict[str, dict] = {}
     for r in runs:
         name = r.get("agent_name") or "unknown"
-        a = by_agent.setdefault(name, {"agent_name": name, "runs": 0, "successful": 0, "total_steps": 0})
-        a["runs"] += 1
+        entry = by_agent.setdefault(name, {"agent_name": name, "runs": 0, "successful": 0, "total_steps": 0})
+        entry["runs"] += 1
         if r.get("status") == "complete":
-            a["successful"] += 1
-        a["total_steps"] += int(r.get("steps") or 0)
+            entry["successful"] += 1
+        entry["total_steps"] += int(r.get("steps") or 0)
     agent_runs_section = {
         "total_runs": len(runs),
         "successful": len(successful_runs),
@@ -469,6 +446,7 @@ def stats_usage(org_id: int, period: str = "30d"):
 @router.get("/graph/snapshot")
 def graph_snapshot(org_id: int, limit: int = 20):
     from infra.graph import get_graph
+
     try:
         g = get_graph(org_id)
     except Exception as e:
@@ -488,12 +466,14 @@ def graph_snapshot(org_id: int, limit: int = 20):
     for row in node_result.result_set:
         if not row or not row[0]:
             continue
-        nodes.append({
-            "id": row[0],
-            "label": row[0],
-            "type": (row[1] or "unknown").lower(),
-            "degree": int(row[2] or 0),
-        })
+        nodes.append(
+            {
+                "id": row[0],
+                "label": row[0],
+                "type": (row[1] or "unknown").lower(),
+                "degree": int(row[2] or 0),
+            }
+        )
 
     node_ids = {n["id"] for n in nodes}
     edges = []
@@ -532,6 +512,7 @@ def graph_snapshot(org_id: int, limit: int = 20):
 @router.get("/chroma/snapshot")
 def chroma_snapshot(org_id: int):
     from infra.memory import client
+
     try:
         cols = client.list_collections()
         prefix = f"org_{org_id}_"
