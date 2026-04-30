@@ -96,7 +96,6 @@ def list_policies() -> list[dict]:
             "persist_target": p.persist_target,
             "persist_mode": p.persist_mode,
             "max_pages": p.max_pages,
-            "max_cost_usd": p.max_cost_usd,
             "respect_robots": p.respect_robots,
             "walk_enabled": p.walk_enabled,
         })
