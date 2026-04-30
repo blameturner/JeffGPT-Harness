@@ -45,10 +45,22 @@ async def lifespan(app: FastAPI):
     from tools.seed_feedback.agent import seed_feedback_job
     from tools.corpus_maintenance.agent import corpus_maintenance_job
     from tools.insight.agent import insight_produce_job
-    from tools.graph_maintenance.agent import (
-        graph_maintenance_job,
-        graph_resolve_entities_job,
-    )
+    try:
+        from tools.graph_maintenance.agent import (
+            graph_maintenance_job,
+            graph_resolve_entities_job,
+        )
+        graph_maintenance_import_error = None
+    except Exception as e:
+        graph_maintenance_import_error = str(e)
+
+        def graph_resolve_entities_job(_payload=None):
+            return {"status": "disabled", "reason": "graph_maintenance_import_failed"}
+
+        def graph_maintenance_job(_payload=None):
+            return {"status": "disabled", "reason": "graph_maintenance_import_failed"}
+
+        _log.error("graph_maintenance import failed; handlers disabled", exc_info=True)
     from tools.pa.background import pa_topic_research_job
     from tools.simulation.agent import run_simulation_job
     tool_queue = ToolJobQueue()
@@ -134,6 +146,8 @@ async def lifespan(app: FastAPI):
         handler=graph_maintenance_job,
         max_workers=1, priority_default=5, source="graph_maintenance",
     ))
+    if graph_maintenance_import_error:
+        _log.warning("graph_maintenance handlers running in disabled mode: %s", graph_maintenance_import_error)
     tool_queue.register("pa_topic_research", HandlerConfig(
         handler=pa_topic_research_job,
         max_workers=1, priority_default=5, source="pa",
