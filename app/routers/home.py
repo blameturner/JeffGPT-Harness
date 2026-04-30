@@ -516,9 +516,42 @@ class MemoryAskRequest(BaseModel):
     max_tokens: int = 500
 
 
+def _discover_org_collections(org_id: int) -> list[str]:
+    """Return the unscoped names of every Chroma collection for the org.
+
+    Used when ``/memory/ask`` isn't given an explicit ``collections`` list:
+    we discover what actually exists for the org instead of hard-coding a
+    fixed bundle that may not include where the data lives (e.g. home chat
+    writes to ``chat_knowledge``, research jobs to ``research_knowledge``,
+    scraper to ``discovery`` — and the names drift over time)."""
+    try:
+        from infra.memory import client
+        prefix = f"org_{org_id}_"
+        out: list[str] = []
+        for c in client.list_collections():
+            name = c.name
+            if not name.startswith(prefix):
+                continue
+            try:
+                if c.count() <= 0:
+                    continue
+            except Exception:
+                pass
+            out.append(name[len(prefix):])
+        return out
+    except Exception:
+        _log.debug("discover_org_collections failed  org=%d", org_id, exc_info=True)
+        return []
+
+
+# Static fallback if discovery fails. Includes the collections every common
+# write path uses today: chat (rag/knowledge), research, scraper, digest.
 _DEFAULT_ASK_COLLECTIONS = [
-    "agent_outputs", "research", "research_knowledge",
-    "discovery", "chat_entity_mentions",
+    "agent_outputs",
+    "chat_knowledge",
+    "research", "research_knowledge",
+    "discovery", "discovery_summaries",
+    "chat_entity_mentions",
 ]
 
 
@@ -537,7 +570,13 @@ def memory_ask(body: MemoryAskRequest):
         raise HTTPException(status_code=400, detail="query is required")
 
     from infra.memory import recall
-    cols = [c for c in (body.collections or _DEFAULT_ASK_COLLECTIONS) if c]
+    if body.collections:
+        cols = [c for c in body.collections if c]
+    else:
+        # Auto-discover so we never search an empty default bundle when the
+        # org has data sitting in a collection that wasn't on the hard-coded
+        # list. Falls back to the static defaults if discovery returns empty.
+        cols = _discover_org_collections(body.org_id) or _DEFAULT_ASK_COLLECTIONS
     n = min(max(1, body.n_results), 20)
 
     bundles: list[dict] = []
@@ -688,6 +727,19 @@ class GraphAskRequest(BaseModel):
 
 
 def _graph_search_core(org_id: int, query: str, max_hops: int, edge_limit: int) -> dict:
+    """Match a free-text query against entity names and return their
+    weighted neighbourhood. Uses three escalating strategies so that on a
+    cold cache OR a graph populated only with isolated nodes we still
+    return something meaningful.
+
+    Strategy order:
+    1. Cached entity-name set + word/phrase match (fastest, but cold).
+    2. ``list_entities_for_resolution`` with ``min_degree=0`` so even
+       newly-extracted isolated nodes can match.
+    3. Direct Cypher CONTAINS against ``n.name`` — works even when neither
+       cache nor the resolution helper has anything to offer (e.g. graph
+       extraction wrote nodes but the cache hasn't refreshed).
+    """
     from shared.graph_recall import _load_entity_names, _match_entities
     try:
         known = _load_entity_names(org_id)
@@ -696,22 +748,50 @@ def _graph_search_core(org_id: int, query: str, max_hops: int, edge_limit: int) 
 
     matches = _match_entities(query, known) if known else []
 
-    # Substring fallback when fuzzy/word match returns nothing — handles the
-    # case where entity cache hasn't warmed yet or the user's query doesn't
-    # contain a known name verbatim.
     if not matches:
+        # Pass 2: substring/contains via list_entities_for_resolution. Drop
+        # min_degree to 0 so we don't silently filter out isolated entities
+        # that graph extraction has only just written.
         try:
             from infra.graph import list_entities_for_resolution
-            entries = list_entities_for_resolution(org_id, limit=200, min_degree=1, timeout_ms=4000)
+            entries = list_entities_for_resolution(org_id, limit=400, min_degree=0, timeout_ms=4000)
         except Exception:
             entries = []
         low = query.lower()
         for e in entries:
             n = (e.get("name") or "").strip()
-            if n and (n.lower() in low or low in n.lower()):
-                matches.append(n)
-                if len(matches) >= 5:
-                    break
+            if not n:
+                continue
+            n_low = n.lower()
+            if n_low in low or low in n_low:
+                if n not in matches:
+                    matches.append(n)
+                    if len(matches) >= 8:
+                        break
+
+    if not matches:
+        # Pass 3: Cypher CONTAINS — a direct query against the live graph.
+        # This is our last resort when the resolution helper is empty (e.g.
+        # cold cache + small graph). Uses the lowercased query as a single
+        # pattern; case-insensitive via ``toLower``.
+        try:
+            from infra.graph import get_graph
+            graph = get_graph(org_id)
+            tokens = [t for t in query.lower().split() if len(t) >= 3][:4]
+            if tokens:
+                # Match nodes whose name contains any token; cap to keep latency bounded.
+                where = " OR ".join(f"toLower(n.name) CONTAINS $t{i}" for i in range(len(tokens)))
+                params = {f"t{i}": t for i, t in enumerate(tokens)}
+                result = graph.query(
+                    f"MATCH (n) WHERE n.name IS NOT NULL AND ({where}) "
+                    "RETURN n.name LIMIT 8",
+                    params,
+                )
+                for row in (result.result_set if result else []):
+                    if row and row[0] and row[0] not in matches:
+                        matches.append(row[0])
+        except Exception:
+            _log.debug("graph search: cypher CONTAINS fallback failed  org=%d", org_id, exc_info=True)
 
     edges: list[dict] = []
     if matches:
@@ -725,6 +805,31 @@ def _graph_search_core(org_id: int, query: str, max_hops: int, edge_limit: int) 
         except Exception:
             _log.warning("graph search: neighbourhood failed  org=%d", org_id, exc_info=True)
             edges = []
+
+    # If we matched entities but they have no edges (isolated nodes), still
+    # surface them so the UI shows "we know about X" instead of empty.
+    if matches and not edges:
+        try:
+            from infra.graph import get_graph
+            graph = get_graph(org_id)
+            result = graph.query(
+                "MATCH (n) WHERE n.name IN $names "
+                "RETURN labels(n)[0], n.name LIMIT 20",
+                {"names": matches},
+            )
+            isolated = [
+                {"name": row[1], "type": row[0], "edges_in": 0, "edges_out": 0, "isolated": True}
+                for row in (result.result_set if result else []) if row and row[1]
+            ]
+        except Exception:
+            isolated = []
+        if isolated:
+            return {
+                "query": query,
+                "matched_entities": matches,
+                "entities": isolated,
+                "edges": [],
+            }
 
     entities: dict[str, dict] = {}
     for e in edges:
