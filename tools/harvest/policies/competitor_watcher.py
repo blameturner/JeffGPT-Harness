@@ -14,7 +14,9 @@ POLICY = register(HarvestPolicy(
     walk_max_depth=1,
     walk_max_pages=10,
     walk_same_host_only=True,
-    walk_link_class="article",
+    # walk_link_class="all" because most marketing sites use <section>/<div>
+    # rather than <article>; the url_pattern below is the real filter.
+    walk_link_class="all",
     walk_url_pattern=r"(pricing|product|features|blog|news|release|update)",
     extract_schema={
         "headline": "text",

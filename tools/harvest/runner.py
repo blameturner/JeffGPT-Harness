@@ -126,44 +126,59 @@ def _seeds_url_list(seed: str, params: dict) -> list[str]:
 
 
 def _seeds_topic_search(seed: str, params: dict, org_id: int, max_seeds: int) -> list[str]:
-    """Use the existing search orchestrator to find seed URLs for a topic."""
+    """Resolve seed URLs for a topic — searxng-only.
+
+    This used to call ``run_web_search`` from the orchestrator, which chains:
+    LLM query-generation → searxng → LLM rerank → parallel scrape → LLM
+    extract. Five steps, any of which returning empty (rerank dropping all,
+    scrape failing, extract returning nothing) makes harvest get zero seeds.
+    The runner is going to fetch + extract anyway — seeding only needs URLs.
+
+    We hit searxng directly with the user's query, plus a couple of
+    light reformulations if the first pass returns nothing. No LLM, no
+    scrape, no extract.
+    """
     if not seed:
         return []
     try:
-        from tools.search.orchestrator import run_web_search
-        from tools.search.intent import (
-            CHAT_INTENT_RESEARCH, INTENT_RESPONSE_TEMPLATE,
-            INTENT_ROUTE_CHAT, SEARCH_POLICY_FULL,
-        )
+        from tools.search.engine import searxng_search, _dedupe
     except Exception:
-        _log.warning("search orchestrator unavailable for topic_search")
+        _log.warning("searxng client unavailable for topic_search")
         return []
-    intent = {
-        "route": INTENT_ROUTE_CHAT,
-        "intent": CHAT_INTENT_RESEARCH,
-        "secondary_intent": None,
-        "entities": [seed],
-        "location_hint": None,
-        "time_sensitive": False,
-        "temporal_anchor": None,
-        "confidence": "high",
-        "search_policy": SEARCH_POLICY_FULL,
-        "response_template": INTENT_RESPONSE_TEMPLATE.get(CHAT_INTENT_RESEARCH, ""),
-    }
+
+    query = seed.strip()
+    raw: list[dict] = []
     try:
-        ctx, sources, conf = run_web_search(seed, org_id=org_id, intent_dict=intent)
+        raw = searxng_search(query, max_results=max(max_seeds, 10))
     except Exception as e:
-        _log.warning("topic_search web_search failed: %s", e)
+        _log.warning("topic_search searxng failed for %r: %s", query[:120], e)
+        raw = []
+
+    # Cheap fallbacks if the literal query returned nothing — cover the
+    # 'too narrow' case without invoking the LLM.
+    if not raw and " " in query:
+        # Try the first 3-5 keywords only.
+        head = " ".join(query.split()[:5])
+        if head and head != query:
+            try:
+                raw = searxng_search(head, max_results=max(max_seeds, 10))
+            except Exception:
+                pass
+
+    if not raw:
+        _log.info("topic_search returned 0 URLs query=%r", query[:120])
         return []
+
     out: list[str] = []
     seen: set[str] = set()
-    for s in (sources or []):
-        u = (s.get("url") or "").strip()
+    for r in _dedupe(raw):
+        u = (r.get("url") or "").strip()
         if u and u not in seen and u.startswith("http"):
             seen.add(u)
             out.append(u)
         if len(out) >= max_seeds:
             break
+    _log.info("topic_search resolved %d URLs query=%r", len(out), query[:120])
     return out
 
 

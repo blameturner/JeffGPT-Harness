@@ -15,7 +15,10 @@ POLICY = register(HarvestPolicy(
     walk_max_depth=1,
     walk_max_pages=3,
     walk_same_host_only=True,
-    walk_link_class="article",
+    # Profile pages live in many wrappers (<section>, <div role="main">,
+    # custom WC tags); 'article' would silently drop them. Tiny budget
+    # (3 pages) keeps a permissive walker safe here.
+    walk_link_class="all",
     extract_schema={
         "role": "text",
         "employer": "text",

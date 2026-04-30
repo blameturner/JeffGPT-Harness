@@ -14,7 +14,8 @@ POLICY = register(HarvestPolicy(
     walk_max_depth=2,
     walk_max_pages=200,
     walk_same_host_only=True,
-    walk_link_class="article",
+    # Job boards rarely use <article> — the url_pattern below is the filter.
+    walk_link_class="all",
     walk_url_pattern=r"(/jobs?/|/posting|/career)",
     extract_schema={
         "title": "text",

@@ -13,7 +13,11 @@ POLICY = register(HarvestPolicy(
     walk_max_depth=1,
     walk_max_pages=40,
     walk_same_host_only=True,
-    walk_link_class="article",
+    # HN/Reddit/SO don't tag thread links inside <article>/<main>, so the
+    # 'article' filter would drop everything. Pattern-match thread/comment
+    # URLs directly instead.
+    walk_link_class="all",
+    walk_url_pattern=r"(/comments/|/item\?id=|/questions/|/r/[^/]+/comments/|/posts/)",
     extract_schema={
         "question": "text",
         "top_answer": "text",
