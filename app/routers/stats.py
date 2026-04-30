@@ -1,3 +1,18 @@
+        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
+    for m in messages:
+        cid = m.get("conversation_id")
+        if not cid:
+            continue
+        c = convos.setdefault(cid, {"conversation_id": cid, "title": "", "message_count": 0, "total_tokens": 0, "last_active": ""})
+    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
+        ts = m.get("CreatedAt") or ""
+    for r in runs:
+            "tokens_input": entry["tokens_input"],
+        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
+    except Exception:
+        _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
+        rows = db._get_paginated("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
+    # so fetch by org_id and filter by date in Python on the way out.
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
@@ -201,21 +216,6 @@ def stats_usage(org_id: int, period: str = "30d"):
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
 
-    def _within_period(row):
-        dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
-        if dt is None:
-            return True  # keep when timestamp is missing or unparseable
-        return dt >= start
-
-    # nocodb's where parser rejects gte filters on the CreatedAt system column in this version,
-    # so fetch by org_id and filter by date in Python on the way out.
-    try:
-        rows = db._get_paginated("messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
-        messages = [r for r in rows if _within_period(r)]
-    except Exception:
-        _log.warning("stats/usage messages query failed  org=%d period=%s", org_id, period, exc_info=True)
-        messages = []
-
     try:
         rows = db._get_paginated("code_messages", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
         code_messages = [r for r in rows if _within_period(r)]
@@ -223,29 +223,44 @@ def stats_usage(org_id: int, period: str = "30d"):
         _log.warning("stats/usage code_messages query failed  org=%d period=%s", org_id, period, exc_info=True)
         code_messages = []
 
-    try:
-        rows = db._get_paginated("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
-        runs = [r for r in rows if _within_period(r)]
-    except Exception:
-        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
-        runs = []
+    def _within_period(row):
+        dt = _parse_dt(row.get("CreatedAt") or row.get("created_at"))
+        if dt is None:
+            return True  # keep when timestamp is missing or unparseable
+        return dt >= start
 
+    # nocodb's where parser rejects gte filters on the CreatedAt system column in this version,
     all_messages = messages + code_messages
 
     total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in all_messages)
-    total_tokens_in += sum(int(r.get("tokens_input") or 0) for r in runs)
+    try:
     total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in all_messages)
-    total_tokens_out += sum(int(r.get("tokens_output") or 0) for r in runs)
+        messages = [r for r in rows if _within_period(r)]
     total_requests = len(all_messages) + len(runs)
     total_conversations = len({
         *(f"chat:{m.get('conversation_id')}" for m in messages if m.get("conversation_id")),
         *(f"code:{m.get('conversation_id')}" for m in code_messages if m.get("conversation_id")),
     })
+        messages = []
+
+    try:
+        rows = db._get_paginated("agent_runs", params={"where": f"(org_id,eq,{org_id})", "limit": 5000})
+    for m in all_messages:
+    except Exception:
+        _log.warning("stats/usage agent_runs query failed  org=%d period=%s", org_id, period, exc_info=True)
+        runs = []
+
+    total_tokens_in = sum(int(m.get("tokens_input") or 0) for m in messages)
+    total_tokens_in += sum(int(r.get("tokens_input") or 0) for r in runs)
+    total_tokens_out = sum(int(m.get("tokens_output") or 0) for m in messages)
+    total_tokens_out += sum(int(r.get("tokens_output") or 0) for r in runs)
+    total_requests = len(messages) + len(runs)
+    total_conversations = len({m.get("conversation_id") for m in messages if m.get("conversation_id")})
     failed_runs = [r for r in runs if r.get("status") == "failed"]
     total_errors = len(failed_runs)
 
     by_model: dict = {}
-    for m in all_messages:
+    for m in messages:
         model = (m.get("model") or "unknown").strip() or "unknown"
         entry = by_model.setdefault(model, {
             "model_name": model, "requests": 0, "tokens_input": 0,
@@ -282,7 +297,7 @@ def stats_usage(org_id: int, period: str = "30d"):
         durations = sorted(entry["durations"])
         avg_dur = round(sum(durations) / len(durations), 2) if durations else 0.0
         by_model_list.append({
-            "model_name": entry["model_name"],
+    for m in all_messages:
             "requests": entry["requests"],
             "tokens_input": entry["tokens_input"],
             "tokens_output": entry["tokens_output"],
@@ -297,13 +312,13 @@ def stats_usage(org_id: int, period: str = "30d"):
         })
 
     by_day: dict = {}
-    for m in all_messages:
+    for m in messages:
         day = (m.get("CreatedAt") or "")[:10]
         if not day:
             continue
         d = by_day.setdefault(day, {"date": day, "requests": 0, "tokens_input": 0, "tokens_output": 0, "errors": 0})
         d["requests"] += 1
-        d["tokens_input"] += int(m.get("tokens_input") or 0)
+    for m in all_messages:
         d["tokens_output"] += int(m.get("tokens_output") or 0)
     for r in runs:
         day = (r.get("CreatedAt") or "")[:10]
@@ -317,8 +332,8 @@ def stats_usage(org_id: int, period: str = "30d"):
             d["errors"] += 1
     by_day_list = sorted(by_day.values(), key=lambda x: x["date"])
 
-    by_hour: dict = {}
     for m in all_messages:
+    for m in messages:
         ts = m.get("CreatedAt") or ""
         if len(ts) < 13:
             continue
@@ -327,21 +342,6 @@ def stats_usage(org_id: int, period: str = "30d"):
             key = (dt.hour, dt.isoweekday() % 7)  # 0=Sun
             bucket = by_hour.setdefault(key, {"hour": dt.hour, "day_of_week": dt.isoweekday() % 7, "requests": 0})
             bucket["requests"] += 1
-        except (ValueError, AttributeError):
-            continue
-    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
-
-    by_style: dict = {}
-    for m in all_messages:
-        style = (m.get("response_style") or "").strip() or "default"
-        by_style[style] = by_style.get(style, 0) + 1
-    by_style_list = [{"style": k, "requests": v} for k, v in sorted(by_style.items(), key=lambda x: -x[1])]
-
-    convos: dict = {}
-    for m in messages:
-        cid = m.get("conversation_id")
-        if not cid:
-            continue
         key = f"chat:{cid}"
         c = convos.setdefault(key, {
             "conversation_id": cid,
@@ -371,14 +371,14 @@ def stats_usage(org_id: int, period: str = "30d"):
             "total_tokens": 0,
             "last_active": "",
         })
-        c["message_count"] += 1
-        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
-        ts = m.get("CreatedAt") or ""
-        if ts > c["last_active"]:
-            c["last_active"] = ts
-    top_conversations = sorted(convos.values(), key=lambda x: x["message_count"], reverse=True)[:10]
-    if top_conversations:
-        try:
+            continue
+    by_hour_list = sorted(by_hour.values(), key=lambda x: (x["day_of_week"], x["hour"]))
+
+    by_style: dict = {}
+    for m in messages:
+        style = (m.get("response_style") or "").strip() or "default"
+        by_style[style] = by_style.get(style, 0) + 1
+    by_style_list = [{"style": k, "requests": v} for k, v in sorted(by_style.items(), key=lambda x: -x[1])]
             chat_ids = [c["conversation_id"] for c in top_conversations if c.get("conversation_kind") == "chat"]
             code_ids = [c["conversation_id"] for c in top_conversations if c.get("conversation_kind") == "code"]
             title_map: dict[str, str] = {}
@@ -400,14 +400,29 @@ def stats_usage(org_id: int, period: str = "30d"):
                     if int(r.get("org_id") or 0) != int(org_id):
                         continue
                     title_map[f"code:{r['Id']}"] = r.get("title") or ""
-            for c in top_conversations:
+            continue
                 c["title"] = title_map.get(c.get("conversation_key") or "", "")
-        except Exception:
-            pass
-
+        c["message_count"] += 1
+        c["total_tokens"] += int(m.get("tokens_input") or 0) + int(m.get("tokens_output") or 0)
+        ts = m.get("CreatedAt") or ""
     for c in top_conversations:
         c.pop("conversation_key", None)
         c.pop("conversation_kind", None)
+
+        if ts > c["last_active"]:
+            c["last_active"] = ts
+    top_conversations = sorted(convos.values(), key=lambda x: x["message_count"], reverse=True)[:10]
+    if top_conversations:
+        try:
+            conv_rows = db._get("conversations", params={
+                "where": "~or".join(f"(Id,eq,{c['conversation_id']})" for c in top_conversations),
+                "limit": 10,
+            }).get("list", [])
+            title_map = {r["Id"]: r.get("title") or "" for r in conv_rows}
+            for c in top_conversations:
+                c["title"] = title_map.get(c["conversation_id"], "")
+        except Exception:
+            pass
 
     successful_runs = [r for r in runs if r.get("status") == "complete"]
     by_agent: dict = {}

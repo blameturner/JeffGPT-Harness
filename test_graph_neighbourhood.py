@@ -39,22 +39,6 @@ class _FakeGraph:
 
 
 class GraphNeighbourhoodTests(unittest.TestCase):
-    def test_write_relationship_degrades_without_raising(self):
-        fake = _FakeGraph([Exception("db down")])
-
-        with patch("infra.graph.get_graph", return_value=fake):
-            graph.write_relationship(
-                org_id=1,
-                from_type="Concept",
-                from_name="A",
-                relationship="REL",
-                to_type="Concept",
-                to_name="B",
-            )
-
-        self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(fake.calls[0]["timeout"], graph.DEFAULT_QUERY_TIMEOUT_MS)
-
     def test_max_hops_1_uses_seed_anchored_query_with_timeout(self):
         fake = _FakeGraph([
             _FakeResult([

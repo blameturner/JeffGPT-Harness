@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
+
 from infra.config import NOCODB_TABLE_ASSISTANT_QUESTIONS, NOCODB_TABLE_CONVERSATIONS
 from infra.nocodb_client import NocodbClient
 from shared.pa.memory import (
@@ -241,6 +243,60 @@ def _matches_mute(text: str, mute_keys: list[str]) -> bool:
     return any(k.lower() in low for k in mute_keys if k)
 
 
+def _recent_rows_with_python_cutoff(
+    client: NocodbClient,
+    table: str,
+    *,
+    org_id: int,
+    cutoff: datetime,
+    extra_where: list[str] | None = None,
+    sort: str = "-CreatedAt",
+    limit: int = 500,
+) -> list[dict]:
+    """Fetch recent rows while tolerating NocoDB's flaky datetime `where` parsing.
+
+    Some deployments reject `CreatedAt,gt,<timestamp>` with HTTP 422 depending on
+    timestamp shape / server version. We still try the narrow query first for
+    efficiency, then fall back to an org-scoped query and apply the cutoff in
+    Python so recall never goes blank.
+    """
+    where_parts = [f"(org_id,eq,{org_id})", *(extra_where or [])]
+    cutoff_candidates = [
+        cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+        cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
+        cutoff.isoformat(),
+    ]
+    last_422: requests.HTTPError | None = None
+    for raw_cutoff in cutoff_candidates:
+        try:
+            return client._get_paginated(table, params={
+                "where": "~and".join([*where_parts, f"(CreatedAt,gt,{raw_cutoff})"]),
+                "sort": sort,
+                "limit": limit,
+            })
+        except requests.HTTPError as exc:
+            if getattr(exc.response, "status_code", None) != 422:
+                raise
+            last_422 = exc
+        except Exception:
+            raise
+
+    if last_422 is not None:
+        _log.info(
+            "recent_rows fallback to python cutoff  table=%s org=%d status=%s",
+            table,
+            org_id,
+            getattr(last_422.response, "status_code", "?"),
+        )
+
+    rows = client._get_paginated(table, params={
+        "where": "~and".join(where_parts),
+        "sort": sort,
+        "limit": limit,
+    })
+    return [r for r in rows if (_parse_iso(r.get("CreatedAt")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+
+
 # ── time context ──────────────────────────────────────────────────────────────
 
 def _build_time_context(client: NocodbClient, org_id: int, now: datetime) -> TimeContext:
@@ -284,13 +340,15 @@ def _build_tails(
     now: datetime,
 ) -> tuple[list[ConversationTail], ConversationTail | None]:
     cutoff = now - timedelta(hours=_YESTERDAY_TAIL_HOURS)
-    cutoff_iso = cutoff.isoformat()
     try:
-        msg_rows = client._get_paginated("messages", params={
-            "where": f"(org_id,eq,{org_id})~and(CreatedAt,gt,{cutoff_iso})",
-            "sort": "-CreatedAt",
-            "limit": 500,
-        })
+        msg_rows = _recent_rows_with_python_cutoff(
+            client,
+            "messages",
+            org_id=org_id,
+            cutoff=cutoff,
+            sort="-CreatedAt",
+            limit=500,
+        )
     except Exception:
         _log.warning("yesterday_tail: messages query failed  org=%d", org_id, exc_info=True)
         return [], None

@@ -378,7 +378,7 @@ def widget_graph(org_id: int, limit: int = 10):
     extractions.
     """
     try:
-        from infra.graph import get_graph, get_sparse_concepts, run_query
+        from infra.graph import get_graph, get_sparse_concepts
     except Exception:
         _log.warning("widget/graph: import failed", exc_info=True)
         return {"enabled": False, "message": "graph unavailable", "data": None}
@@ -386,15 +386,13 @@ def widget_graph(org_id: int, limit: int = 10):
     data: dict = {"top_entities": [], "sparse_concepts": [], "top_edges": []}
     try:
         graph = get_graph(org_id)
-        result = run_query(
-            graph,
+        result = graph.query(
             "MATCH (n) OPTIONAL MATCH (n)-[r]-() "
             "WITH n, count(r) AS deg, coalesce(n.aliases, []) AS aliases "
             "WHERE deg > 0 "
             "RETURN labels(n)[0], n.name, deg, aliases "
             "ORDER BY deg DESC LIMIT $limit",
             {"limit": int(limit)},
-            timeout_ms=2_000,
         )
         data["top_entities"] = [
             {"type": row[0], "name": row[1], "degree": row[2], "aliases": list(row[3] or [])}
@@ -410,15 +408,13 @@ def widget_graph(org_id: int, limit: int = 10):
 
     try:
         graph = get_graph(org_id)
-        result = run_query(
-            graph,
+        result = graph.query(
             "MATCH (a)-[r]->(b) "
             "RETURN a.name, type(r), b.name, "
             "  coalesce(r.hits,1) AS hits, coalesce(r.weight,1.0) AS weight, "
             "  r.last_seen AS last_seen "
             "ORDER BY hits DESC, weight DESC LIMIT $limit",
             {"limit": int(limit)},
-            timeout_ms=2_000,
         )
         data["top_edges"] = [
             {

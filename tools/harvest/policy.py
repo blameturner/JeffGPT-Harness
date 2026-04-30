@@ -7,8 +7,13 @@ imports in ``tools/harvest/__init__.py``.
 """
 from __future__ import annotations
 
+import importlib
+import logging
+import pkgutil
 from dataclasses import dataclass, field
 from typing import Literal
+
+_log = logging.getLogger("harvest.policy")
 
 
 SeedStrategy = Literal[
@@ -82,12 +87,36 @@ def register(policy: HarvestPolicy) -> HarvestPolicy:
     return policy
 
 
+def ensure_policies_loaded() -> None:
+    """Import every policy module and re-register its exported `POLICY` object.
+
+    The API router imports `tools.harvest.policy` directly, so relying only on
+    `tools.harvest.__init__` side effects leaves `/harvest/policies` empty until
+    some later startup path happens to import the package. This bootstrap keeps
+    the registry correct on first use.
+    """
+    package = importlib.import_module("tools.harvest.policies")
+    for modinfo in pkgutil.iter_modules(package.__path__):
+        if modinfo.name.startswith("_"):
+            continue
+        module_name = f"{package.__name__}.{modinfo.name}"
+        try:
+            module = importlib.import_module(module_name)
+            policy = getattr(module, "POLICY", None)
+            if isinstance(policy, HarvestPolicy):
+                REGISTRY[policy.name] = policy
+        except Exception:
+            _log.warning("policy import failed  module=%s", module_name, exc_info=True)
+
+
 def get_policy(name: str) -> HarvestPolicy | None:
+    ensure_policies_loaded()
     return REGISTRY.get(name)
 
 
 def list_policies() -> list[dict]:
     """Catalog form for the API."""
+    ensure_policies_loaded()
     out = []
     for p in REGISTRY.values():
         out.append({

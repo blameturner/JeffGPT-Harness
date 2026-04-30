@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 from infra.config import (
     NOCODB_TABLE_PA_OPEN_LOOPS,
     NOCODB_TABLE_PA_WARM_TOPICS,
@@ -49,16 +51,54 @@ def _parse_iso(raw):
     return ts
 
 
+def _recent_rows_with_python_cutoff(
+    client: NocodbClient,
+    table: str,
+    *,
+    org_id: int,
+    cutoff: datetime,
+    extra_where: list[str] | None = None,
+    limit: int,
+) -> list[dict]:
+    where_parts = [f"(org_id,eq,{org_id})", *(extra_where or [])]
+    cutoff_candidates = [
+        cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+        cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
+        cutoff.isoformat(),
+    ]
+    for raw_cutoff in cutoff_candidates:
+        try:
+            return client._get_paginated(table, params={
+                "where": "~and".join([*where_parts, f"(CreatedAt,gt,{raw_cutoff})"]),
+                "sort": "-CreatedAt",
+                "limit": limit,
+            })
+        except requests.HTTPError as exc:
+            if getattr(exc.response, "status_code", None) != 422:
+                raise
+        except Exception:
+            raise
+    rows = client._get_paginated(table, params={
+        "where": "~and".join(where_parts),
+        "sort": "-CreatedAt",
+        "limit": limit,
+    })
+    cutoff_floor = datetime.min.replace(tzinfo=timezone.utc)
+    return [r for r in rows if (_parse_iso(r.get("CreatedAt")) or cutoff_floor) >= cutoff]
+
+
 def _existing_plan_topics(client: NocodbClient, org_id: int) -> set[str]:
     if "research_plans" not in client.tables:
         return set()
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    cutoff_iso = cutoff.isoformat()
     try:
-        rows = client._get_paginated("research_plans", params={
-            "where": f"(org_id,eq,{org_id})~and(CreatedAt,gt,{cutoff_iso})",
-            "limit": 100,
-        })
+        rows = _recent_rows_with_python_cutoff(
+            client,
+            "research_plans",
+            org_id=org_id,
+            cutoff=cutoff,
+            limit=100,
+        )
     except Exception:
         return set()
     return {
@@ -106,16 +146,18 @@ def _candidate_decisions(client: NocodbClient, org_id: int, now: datetime) -> li
     if NOCODB_TABLE_PA_OPEN_LOOPS not in client.tables:
         return []
     cutoff = now - timedelta(hours=_RECENCY_HOURS)
-    cutoff_iso = cutoff.isoformat()
     try:
-        rows = client._get_paginated(NOCODB_TABLE_PA_OPEN_LOOPS, params={
-            "where": (
-                f"(org_id,eq,{org_id})~and(intent,eq,{LOOP_INTENT_DECISION})"
-                f"~and(status,eq,{LOOP_STATUS_OPEN})~and(CreatedAt,gt,{cutoff_iso})"
-            ),
-            "sort": "-CreatedAt",
-            "limit": 20,
-        })
+        rows = _recent_rows_with_python_cutoff(
+            client,
+            NOCODB_TABLE_PA_OPEN_LOOPS,
+            org_id=org_id,
+            cutoff=cutoff,
+            extra_where=[
+                f"(intent,eq,{LOOP_INTENT_DECISION})",
+                f"(status,eq,{LOOP_STATUS_OPEN})",
+            ],
+            limit=20,
+        )
     except Exception:
         return []
     return [(r.get("text") or "").strip() for r in rows if (r.get("text") or "").strip()]

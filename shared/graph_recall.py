@@ -33,11 +33,6 @@ _ENTITY_LIMIT = 1000
 _MAX_EDGES = 30
 _MAX_CHARS = 1200
 _QUERY_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}")
-_LOW_SIGNAL_SEEDS = {
-    "a", "an", "and", "any", "app", "bot", "code", "data", "dev",
-    "developer", "developers", "doc", "docs", "help", "home", "info",
-    "issue", "question", "system", "test", "the", "tool", "tools",
-}
 
 
 def _fetch_entity_names(org_id: int, timeout_ms: int) -> set[str]:
@@ -136,25 +131,6 @@ def _match_entities(text: str, known: set[str]) -> list[str]:
     return matched[:8]
 
 
-def _filter_graph_seeds(matches: list[str]) -> list[str]:
-    filtered: list[str] = []
-    seen: set[str] = set()
-    for raw in matches:
-        name = (raw or "").strip()
-        if not name:
-            continue
-        low = name.lower()
-        if low in _LOW_SIGNAL_SEEDS:
-            continue
-        if len(low) < 3 and " " not in low:
-            continue
-        if low in seen:
-            continue
-        seen.add(low)
-        filtered.append(name)
-    return filtered[:6]
-
-
 def build_graph_context(org_id: int, query_text: str) -> str:
     """Returns a compact 'Related graph facts:' block, or '' if no matches."""
     if not query_text or not query_text.strip():
@@ -167,7 +143,7 @@ def build_graph_context(org_id: int, query_text: str) -> str:
     if not known:
         return ""
 
-    matches = _filter_graph_seeds(_match_entities(query_text, known))
+    matches = _match_entities(query_text, known)
     if not matches:
         return ""
 

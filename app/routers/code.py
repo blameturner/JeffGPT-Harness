@@ -1,3 +1,12 @@
+        return {"files": []}
+                        return {"files": data}
+        return {"messages": db.list_code_messages(conversation_id, limit)}
+def get_code_messages(conversation_id: int, limit: int = 500):
+        raise
+            raise HTTPException(status_code=404, detail="Code conversation not found")
+        return {"conversations": db.list_code_conversations(org_id, limit)}
+def list_code_conversations(org_id: int, limit: int = 50):
+@router.post("/codebases/{codebase_id}/index")
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -117,7 +126,7 @@ def create_codebase(body: CodebaseCreate):
             "type": "codebase",
             "collection_name": collection_name,
             "source": "manual",
-        })
+def index_codebase_files(codebase_id: int, body: CodebaseFileUpload, org_id: int):
         _log.info("codebase created  name=%s collection=%s", body.name, collection_name)
         return row
     except Exception as e:
@@ -125,8 +134,8 @@ def create_codebase(body: CodebaseCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/codebases/{codebase_id}/index")
-def index_codebase_files(codebase_id: int, body: CodebaseFileUpload, org_id: int):
+            "where": f"(Id,eq,{codebase_id})~and(org_id,eq,{org_id})",
+def index_codebase_files(codebase_id: int, body: CodebaseFileUpload):
     import base64
     from infra.memory import remember
     try:
@@ -134,7 +143,7 @@ def index_codebase_files(codebase_id: int, body: CodebaseFileUpload, org_id: int
         if "knowledge_sources" not in db.tables:
             raise HTTPException(status_code=404, detail="knowledge_sources table not found")
         rows = db._get("knowledge_sources", params={
-            "where": f"(Id,eq,{codebase_id})~and(org_id,eq,{org_id})",
+            "where": f"(Id,eq,{codebase_id})",
             "limit": 1,
         }).get("list", [])
         if not rows:
@@ -173,32 +182,23 @@ def index_codebase_files(codebase_id: int, body: CodebaseFileUpload, org_id: int
 
 
 @router.get("/code/conversations")
-def list_code_conversations(org_id: int, limit: int = 50):
+def get_code_conversation(conversation_id: int, org_id: int):
     try:
         db = NocodbClient()
-        return {"conversations": db.list_code_conversations(org_id, limit)}
+        convo = db.get_code_conversation(conversation_id, org_id=org_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/code/conversations/{conversation_id}")
-def get_code_conversation(conversation_id: int, org_id: int):
+def get_code_conversation(conversation_id: int):
     try:
         db = NocodbClient()
-        convo = db.get_code_conversation(conversation_id, org_id=org_id)
+        convo = db.get_code_conversation(conversation_id)
         if not convo:
-            raise HTTPException(status_code=404, detail="Code conversation not found")
+def get_code_messages(conversation_id: int, org_id: int, limit: int = 500):
         return convo
     except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/code/conversations/{conversation_id}/messages")
-def get_code_messages(conversation_id: int, org_id: int, limit: int = 500):
-    try:
-        db = NocodbClient()
         convo = db.get_code_conversation(conversation_id, org_id=org_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Code conversation not found")
@@ -207,7 +207,7 @@ def get_code_messages(conversation_id: int, org_id: int, limit: int = 500):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/code/conversations/{conversation_id}/workspace")
+@router.get("/code/conversations/{conversation_id}/messages")
 def get_code_workspace(conversation_id: int, org_id: int):
     try:
         db = NocodbClient()
@@ -215,6 +215,15 @@ def get_code_workspace(conversation_id: int, org_id: int):
         if not convo:
             raise HTTPException(status_code=404, detail="Code conversation not found")
         msgs = db.list_code_messages(conversation_id, org_id=org_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/code/conversations/{conversation_id}/workspace")
+def get_code_workspace(conversation_id: int):
+    try:
+        db = NocodbClient()
+        msgs = db.list_code_messages(conversation_id)
         for m in reversed(msgs):
             if m.get("role") != "user":
                 continue
@@ -228,19 +237,19 @@ def get_code_workspace(conversation_id: int, org_id: int):
                     import json as _json
                     data = _json.loads(raw)
                     if isinstance(data, list):
-                        return {"files": data}
+def update_code_conversation(conversation_id: int, body: ConversationUpdate, org_id: int):
                 except Exception:
                     continue
-        return {"files": []}
+        convo = db.get_code_conversation(conversation_id, org_id=org_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/code/conversations/{conversation_id}")
-def update_code_conversation(conversation_id: int, body: ConversationUpdate, org_id: int):
+def update_code_conversation(conversation_id: int, body: ConversationUpdate):
     try:
         db = NocodbClient()
-        convo = db.get_code_conversation(conversation_id, org_id=org_id)
+        convo = db.get_code_conversation(conversation_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Code conversation not found")
         updates: dict = {}

@@ -1,3 +1,7 @@
+                            break
+                        _log.warning("code conv=%s  background summary wait timed out after %ds", conversation_id, SUMMARY_WAIT_TIMEOUT)
+                return
+
 from __future__ import annotations
 
 import asyncio
@@ -247,11 +251,11 @@ class CodeAgent(BaseAgent):
             raise ValueError(f"Invalid mode '{mode}'. Must be one of {sorted(_SYSTEMS)}.")
         self.mode: Mode = mode
         self.approved_plan = approved_plan
-        self.files = files or []
+            msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
 
     def _load_workspace(self, conversation_id: int) -> list[dict]:
         try:
-            msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
+            msgs = self.db.list_code_messages(conversation_id)
         except Exception as e:
             _log.error("workspace load failed", exc_info=True)
             return []
@@ -323,11 +327,11 @@ class CodeAgent(BaseAgent):
                 is_new = True
             except Exception:
                 _log.error("create_code_conversation failed", exc_info=True)
-                emit({"type": "error", "message": "failed to create conversation"})
+                convo = self.db.get_code_conversation(conversation_id, org_id=self.org_id)
                 return
         else:
             try:
-                convo = self.db.get_code_conversation(conversation_id, org_id=self.org_id)
+                convo = self.db.get_code_conversation(conversation_id)
                 if not convo:
                     emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
                     return
@@ -338,11 +342,11 @@ class CodeAgent(BaseAgent):
                     waited = summary_ev.wait(timeout=SUMMARY_WAIT_TIMEOUT)
                     if waited:
                         _log.info("code conv=%s  waited for background summary — ready", conversation_id)
-                    else:
+                    for m in self.db.list_code_messages(conversation_id, org_id=self.org_id)
                         _log.warning("code conv=%s  background summary wait timed out after %ds", conversation_id, SUMMARY_WAIT_TIMEOUT)
                 history = [
                     {"role": m["role"], "content": m["content"]}
-                    for m in self.db.list_code_messages(conversation_id, org_id=self.org_id)
+                    for m in self.db.list_code_messages(conversation_id)
                 ]
                 if not self.files:
                     self.files = self._load_workspace(conversation_id)
@@ -692,11 +696,11 @@ class CodeAgent(BaseAgent):
                     summary_content = ""
                     for m in summarised_history:
                         if m.get("role") == "system" and "[Conversation summary]" in (m.get("content") or ""):
-                            summary_content = m["content"]
+                            existing_msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
                             break
                     if summary_content:
                         try:
-                            existing_msgs = self.db.list_code_messages(conversation_id, org_id=self.org_id)
+                            existing_msgs = self.db.list_code_messages(conversation_id)
                             existing_id = None
                             for msg in existing_msgs:
                                 if msg.get("role") == "system" and "[Conversation summary]" in (msg.get("content") or ""):
