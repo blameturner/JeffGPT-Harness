@@ -326,6 +326,7 @@ def _monitor_loop(heartbeat_task: Callable[[], object]) -> None:
     """
     global _heartbeat_fired_at
     failures = 0
+    exhausted_logged = False  # rate-limit the "attempts exhausted" CRITICAL
 
     while not _monitor_stop.is_set():
         # Fire heartbeat. No lock: single assignment is GIL-atomic and we
@@ -347,7 +348,10 @@ def _monitor_loop(heartbeat_task: Callable[[], object]) -> None:
         ran = _heartbeat_ran_at
 
         if ran >= fired:
+            if failures > 0 or exhausted_logged:
+                _log.warning("HUEY consumer recovered (heartbeat ran successfully)")
             failures = 0
+            exhausted_logged = False
         else:
             failures += 1
             age = time.time() - fired
@@ -361,11 +365,15 @@ def _monitor_loop(heartbeat_task: Callable[[], object]) -> None:
                     _restart_consumer()
                 except Exception:
                     _log.error("huey consumer restart failed", exc_info=True)
-            else:
+            elif not exhausted_logged:
+                # Log the give-up message exactly once per failure streak,
+                # not every minute thereafter.
                 _log.critical(
-                    "HUEY: %d restart attempts exhausted. Manual intervention required.",
+                    "HUEY: %d restart attempts exhausted. Manual intervention required. "
+                    "Will continue monitoring; further alerts suppressed until recovery.",
                     _MAX_RESTART_ATTEMPTS,
                 )
+                exhausted_logged = True
 
         # Wait the rest of the interval before next probe
         remaining = max(0, _HEARTBEAT_INTERVAL_S - _HEARTBEAT_TIMEOUT_S)

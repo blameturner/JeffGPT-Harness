@@ -524,8 +524,22 @@ class ToolJobQueue:
 
             if job.depends_on:
                 dep = self.get_job(job.depends_on)
-                if not dep or dep.status != "completed":
-                    dep_status = dep.status if dep else "not_found"
+                dep_status = dep.status if dep else "not_found"
+                # Hard-fail if the dependency itself failed or vanished — without
+                # this guard the job re-claims, re-checks, and unclaims forever
+                # (every poll interval), pegging NocoDB and never making progress.
+                if dep_status in {"failed", "cancelled", "not_found"}:
+                    _log.warning(
+                        "queue %s: job %s dependency %s is %s — failing dependent job",
+                        worker_id, job.job_id[:12], job.depends_on[:12], dep_status,
+                    )
+                    job.status = "failed"
+                    job.error = f"dependency {job.depends_on} ended with status={dep_status}"[:500]
+                    job.completed_at = datetime.now(timezone.utc).isoformat()
+                    self._persist_update(job)
+                    continue
+                if dep_status != "completed":
+                    # Still in flight — release the claim and let another poll cycle re-check.
                     _log.debug("queue %s: job %s waiting on dependency %s (status=%s)",
                                worker_id, job.job_id[:12], job.depends_on[:12], dep_status)
                     self._unclaim(job)
@@ -628,10 +642,17 @@ class ToolJobQueue:
             try:
                 from shared.models import model_usage_scope
 
+                # Log the safe-to-show identity fields from the payload so a
+                # `result_status=not_found` line can be diagnosed without
+                # digging through NocoDB. Other payload values are not logged
+                # (they may carry user content or oversized strings).
+                _identity_fields = ("plan_id", "kind", "conversation_id", "org_id", "insight_id")
+                _identity = {k: (job.payload or {}).get(k)
+                             for k in _identity_fields if k in (job.payload or {})}
                 _log.info(
-                    "queue %s: HANDLER START  job=%s  type=%s  attempt=%d/%d  payload_keys=%s",
+                    "queue %s: HANDLER START  job=%s  type=%s  attempt=%d/%d  payload=%s  payload_keys=%s",
                     worker_id, job.job_id[:12], job.type, attempts, max_attempts,
-                    sorted((job.payload or {}).keys()),
+                    _identity, sorted((job.payload or {}).keys()),
                 )
                 handler_t0 = time.time()
                 with model_usage_scope(org_id=job.org_id, source=f"tool_queue:{job.type}"):
@@ -642,10 +663,22 @@ class ToolJobQueue:
                     worker_id, job.job_id[:12], job.type, handler_elapsed,
                     (result or {}).get("status") if isinstance(result, dict) else "<non-dict>",
                 )
-                result = result or {}
-                status_val = str((result.get("status") if isinstance(result, dict) else "") or "").lower()
+
+                # Normalise non-dict returns to a failure rather than silently
+                # "completing" — a handler that returned a string error or None
+                # was previously treated as success and the row was marked
+                # completed with empty result, which masked real bugs.
+                if not isinstance(result, dict):
+                    coerced = {"status": "failed", "error": f"handler returned non-dict: {type(result).__name__}={str(result)[:200]}"}
+                    _log.warning(
+                        "queue %s: handler returned non-dict for job=%s type=%s — coercing to failure",
+                        worker_id, job.job_id[:12], job.type,
+                    )
+                    result = coerced
+
+                status_val = str(result.get("status") or "").lower()
                 if status_val in {"failed", "error"}:
-                    last_result = result if isinstance(result, dict) else {}
+                    last_result = result
                     job.error = str(last_result.get("reason") or last_result.get("error") or status_val)[:500]
                     if attempts < max_attempts:
                         delay = _retry_backoff_s(job.type, attempts)
@@ -660,7 +693,7 @@ class ToolJobQueue:
                     job.result = last_result
                 else:
                     job.status = "completed"
-                    job.result = result if isinstance(result, dict) else {}
+                    job.result = result
                     break
             except Exception as e:
                 job.error = str(e)[:500]
@@ -674,6 +707,24 @@ class ToolJobQueue:
                         break
                     continue
                 job.status = "failed"
+            except BaseException as be:
+                # SystemExit / KeyboardInterrupt / GeneratorExit must not leave
+                # the row stuck at status=running. Mark failed, persist, then
+                # re-raise so the interpreter can shut down. The stale reaper
+                # would clean this up eventually but we lose hours of latency.
+                _log.critical(
+                    "queue %s: handler raised BaseException for job=%s type=%s — marking failed and re-raising",
+                    worker_id, job.job_id[:12], job.type, exc_info=True,
+                )
+                job.error = f"BaseException: {type(be).__name__}: {str(be)[:300]}"
+                job.status = "failed"
+                job.result = {"status": "failed", "error": job.error}
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+                try:
+                    self._persist_update(job)
+                except Exception:
+                    pass
+                raise
 
         if job.status not in {"completed", "failed"}:
             job.status = "failed"
