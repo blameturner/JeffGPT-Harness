@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from app.lifespan import lifespan
-from app.routers import agents, agents_admin, chat, code, connectors, health, home, stats, tool_queue, enrichment
+from app.routers import agents, agents_admin, chat, code, connectors, harvest, health, home, stats, tool_queue, enrichment
 from services.browser.main import app as browser_app
 from services.sandbox.main import app as sandbox_app
 
@@ -17,6 +17,7 @@ app.include_router(home.router)
 app.include_router(stats.router)
 app.include_router(tool_queue.router)
 app.include_router(enrichment.router, prefix="/enrichment", tags=["enrichment"])
+app.include_router(harvest.router, tags=["harvest"])
 
 app.mount("/browser", browser_app)
 app.mount("/sandbox", sandbox_app)

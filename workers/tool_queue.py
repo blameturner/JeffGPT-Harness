@@ -836,6 +836,11 @@ class ToolJobQueue:
                     # row never reaches "completed".
                     "research_review": research_agent_dynamic_mult,
                     "research_op": research_agent_dynamic_mult,
+                    # Harvest jobs run a per-URL fetch+extract loop bounded
+                    # by policy.timeout_total_s (≤2h). Use the same long
+                    # multiplier so the reaper does not reset them mid-walk.
+                    "harvest_run": research_agent_dynamic_mult,
+                    "harvest_finalise": 4,
                     "scrape_page": 3,                 # 15m — fetch + chunk + embed
                     "pathfinder_extract": 3,          # 15m — fetch + link extract
                     "summarise_page": 3,              # 15m — summariser LLM

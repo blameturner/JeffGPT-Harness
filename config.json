@@ -156,6 +156,23 @@
       "dup_max_per_domain": 200,
       "dup_purge_chroma": true
     },
+    "harvest": {
+      "enabled": true,
+      "extractor_timeout_s": 600,
+      "default_rate_limit_per_host_s": 1.0,
+      "default_respect_robots": true,
+      "default_max_pages": 100,
+      "default_max_depth": 2,
+      "default_timeout_total_s": 3600,
+      "fetch_timeout_s": 30,
+      "max_body_bytes": 5242880,
+      "user_agent": "mst-harness/1.0 (+contact)",
+      "yield_every_n_urls": 10,
+      "yield_pause_s": 2,
+      "skip_graph_extract_on_persist": true,
+      "_comment": "yield_pause_s lets chat / higher-priority jobs preempt during long crawls. skip_graph_extract_on_persist=true avoids queueing one graph_extract per harvested URL (200-URL bulk would otherwise queue 200 LLM jobs).",
+      "host_policies": {}
+    },
     "pathfinder": {
       "enabled": true,
       "dispatch_interval_seconds": 2400,
@@ -281,7 +298,14 @@
         "research_agent": 2,
         "daily_digest": 1,
         "seed_feedback": 1,
-        "corpus_maintenance": 1
+        "corpus_maintenance": 1,
+        "harvest_run": 1,
+        "harvest_finalise": 1
+      },
+      "huey": {
+        "consumer_workers": 16,
+        "task_retries": 2,
+        "task_retry_delay_seconds": 5
       }
     }
   }

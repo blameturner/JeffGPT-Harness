@@ -74,6 +74,18 @@ async def lifespan(app: FastAPI):
         handler=run_research_op,
         max_workers=2, priority_default=3, source="research_op",
     ))
+
+    # Harvest pipeline — generic scraper/pathfinder-driven jobs.
+    # Importing the package self-registers all policies in tools.harvest.REGISTRY.
+    # max_workers=1 because each harvest already drives a long sequential
+    # per-URL LLM loop on a single local CPU model; running 2 concurrently
+    # just thrashes the model pool and starves chat / cron jobs (research,
+    # daily_digest, pa_topic_research) that share the same LLM slot.
+    from tools.harvest import run_harvest
+    tool_queue.register("harvest_run", HandlerConfig(
+        handler=lambda p: run_harvest(p["run_id"]),
+        max_workers=1, priority_default=4, source="harvest",
+    ))
     tool_queue.register("summarise_page", HandlerConfig(
         handler=summarise_page_job,
         max_workers=1, priority_default=4, source="summariser",

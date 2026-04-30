@@ -310,14 +310,18 @@ def _env_bool(name: str, default: bool) -> bool:
 
 HUEY_ENABLED = _env_bool("HUEY_ENABLED", True)
 HUEY_SQLITE_PATH = os.getenv("HUEY_SQLITE_PATH", "/app/data/huey_queue.db")
-# Huey runs every tool-queue handler. With 1 worker, a long research_agent
-# job blocks every other handler (research_op, research_review, scrape, etc.)
-# from making progress — they sit as "running" in NocoDB but their handler is
-# actually waiting in Huey's internal queue with no log output. Defaulting
-# to 3 lets a long synthesis run alongside ops and scrapers.
-HUEY_CONSUMER_WORKERS = int(os.getenv("HUEY_CONSUMER_WORKERS", "3"))
-HUEY_TASK_RETRIES = int(os.getenv("HUEY_TASK_RETRIES", "2"))
-HUEY_TASK_RETRY_DELAY_S = int(os.getenv("HUEY_TASK_RETRY_DELAY_S", "5"))
+
+# Huey tuning lives under features.tool_queue.huey in config.json. LLM
+# contention is already gated below this layer by shared/model_pool._PrioritySemaphore
+# (serialised per model role with priority hand-off to user requests), so
+# Python/IO-bound handlers (graph_resolve_entities, insight_produce, etc.)
+# don't need to wait behind LLM handlers for a worker slot. Default sized
+# to roughly match the number of registered job types so a saturated LLM
+# pool doesn't starve pure-Python work.
+_huey_cfg = (PLATFORM.get("features", {}).get("tool_queue", {}) or {}).get("huey", {}) or {}
+HUEY_CONSUMER_WORKERS = int(_huey_cfg.get("consumer_workers", 16))
+HUEY_TASK_RETRIES = int(_huey_cfg.get("task_retries", 2))
+HUEY_TASK_RETRY_DELAY_S = int(_huey_cfg.get("task_retry_delay_seconds", 5))
 
 NOCODB_TABLE_ORGANISATION = "organisation"
 NOCODB_TABLE_AGENT_RUNS = "agent_runs"

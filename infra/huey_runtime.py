@@ -100,7 +100,14 @@ _monitor_stop = threading.Event()
 # timestamps are safe to read/write without a lock. A concurrent restart
 # might briefly observe a stale value, which is acceptable for monitoring.
 _heartbeat_fired_at: float = 0.0   # last time the monitor enqueued a heartbeat
-_heartbeat_ran_at: float = 0.0     # last time a heartbeat task body executed
+_heartbeat_ran_at: float = 0.0     # last time a worker bumped liveness
+# Active-worker counter: incremented at the start of run_tool_job and
+# decremented at its end. Used by the watchdog to distinguish a wedged
+# consumer from one whose workers are simply all busy on long-running
+# tasks (research sections run with timeout=1800s — declaring those a
+# wedge would call graceful-stop on the very tasks we'd be misdiagnosing).
+_active_workers: int = 0
+_active_workers_lock = threading.Lock()
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -195,6 +202,8 @@ def get_huey_health() -> dict:
         "consumer_healthy": healthy,
         "heartbeat_last_fired_s_ago": round(now - fired, 1) if fired else None,
         "heartbeat_last_ran_s_ago": round(now - ran, 1) if ran else None,
+        "active_workers": _active_workers,
+        "max_workers": max(1, int(HUEY_CONSUMER_WORKERS or 1)),
     }
 
 
@@ -222,11 +231,24 @@ def _register_tasks(huey: SqliteHuey) -> None:
         retry_delay=max(0, int(HUEY_TASK_RETRY_DELAY_S or 0)),
     )
     def run_tool_job(job_id: str) -> dict:
-        from workers.tool_queue import get_tool_queue
-        q = get_tool_queue()
-        if q is None:
-            raise RuntimeError("tool queue not initialised")
-        return q.execute_claimed_job(job_id)
+        # Any worker reaching this point proves the consumer is consuming —
+        # so liveness piggybacks on real work and the heartbeat task only
+        # matters during idle periods. Two timestamp writes per job, no perf
+        # cost on the hot path.
+        global _active_workers, _heartbeat_ran_at
+        with _active_workers_lock:
+            _active_workers += 1
+        _heartbeat_ran_at = time.time()
+        try:
+            from workers.tool_queue import get_tool_queue
+            q = get_tool_queue()
+            if q is None:
+                raise RuntimeError("tool queue not initialised")
+            return q.execute_claimed_job(job_id)
+        finally:
+            _heartbeat_ran_at = time.time()
+            with _active_workers_lock:
+                _active_workers -= 1
 
     @huey.task()
     def heartbeat() -> str:
@@ -283,11 +305,46 @@ def _stop_consumer_locked() -> None:
 
 
 def _restart_consumer() -> None:
-    """Replace a wedged consumer in place. Acquires _lifecycle_lock."""
+    """Replace a wedged consumer.
+
+    Strategy: spawn the replacement first (so dispatch never sees a dead
+    thread on `is_huey_consumer_running()`), then tear down the old
+    consumer in a background thread with a NON-graceful stop. Graceful
+    stop blocks until in-flight workers finish — but the workers running
+    long sync handlers (e.g. 30-min research sections) are the very thing
+    we'd be misdiagnosing as wedged, so blocking on them turns recovery
+    into a self-deadlock. Letting the old consumer's workers finish in
+    the background is safe: SqliteHuey claims tasks atomically, so the
+    new and old consumers don't race for the same job.
+    """
     _log.warning("huey consumer restart triggered")
     with _lifecycle_lock:
-        _stop_consumer_locked()
+        old_consumer = _consumer
+        old_thread = _consumer_thread
         _spawn_consumer_locked()
+    if old_consumer is not None:
+        threading.Thread(
+            target=_reap_old_consumer,
+            args=(old_consumer, old_thread),
+            daemon=True,
+            name="huey-consumer-reaper",
+        ).start()
+
+
+def _reap_old_consumer(consumer: Consumer, thread: threading.Thread | None) -> None:
+    """Stop a replaced consumer without holding any lock or blocking on workers."""
+    try:
+        try:
+            consumer.stop(graceful=False)
+        except TypeError:
+            consumer.stop()
+    except RuntimeError as e:
+        if "before it is started" not in str(e):
+            _log.warning("huey old consumer stop error", exc_info=True)
+    except Exception:
+        _log.warning("huey old consumer stop error", exc_info=True)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5)
 
 
 def _start_health_monitor_locked() -> None:
@@ -352,13 +409,26 @@ def _monitor_loop(heartbeat_task: Callable[[], object]) -> None:
                 _log.warning("HUEY consumer recovered (heartbeat ran successfully)")
             failures = 0
             exhausted_logged = False
+        elif _active_workers >= max(1, int(HUEY_CONSUMER_WORKERS or 1)):
+            # Heartbeat queued behind a fully-busy worker pool. Workers are
+            # consuming — they're just on long-running tasks. Not a wedge;
+            # restarting here would graceful-stop those very tasks.
+            _log.info(
+                "huey heartbeat queued behind busy workers (%d/%d) — not a wedge",
+                _active_workers, max(1, int(HUEY_CONSUMER_WORKERS or 1)),
+            )
+            if failures > 0 or exhausted_logged:
+                _log.warning("HUEY consumer recovered (workers busy, heartbeat will catch up)")
+            failures = 0
+            exhausted_logged = False
         else:
             failures += 1
             age = time.time() - fired
             _log.critical(
                 "HUEY CONSUMER NOT CONSUMING — heartbeat fired %.0fs ago, never ran "
-                "(thread_alive=%s, failures=%d/%d).",
-                age, is_huey_consumer_running(), failures, _MAX_RESTART_ATTEMPTS,
+                "(thread_alive=%s, active_workers=%d, failures=%d/%d).",
+                age, is_huey_consumer_running(), _active_workers,
+                failures, _MAX_RESTART_ATTEMPTS,
             )
             if failures <= _MAX_RESTART_ATTEMPTS:
                 try:
