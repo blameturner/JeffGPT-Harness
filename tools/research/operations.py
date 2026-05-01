@@ -25,7 +25,7 @@ from tools.research.agent import (
     DEFAULT_DOC_TYPE,
     DEFAULT_REVIEWER_TIMEOUT_S,
     DEFAULT_SECTION_TIMEOUT_S,
-    _call_with_timeout,
+    _safe_call,
     _fetch_corpus,
     _infer_doc_type,
     _research_timeout,
@@ -221,7 +221,7 @@ For each non-supported claim emit a bullet:
 - [<status>] "<claim quoted from paper>" — <one-line evidence note + source URL>
 
 Supported claims may be summarised in aggregate at the top of Findings. Output raw Markdown only, no preamble."""
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_reviewer", prompt, temperature=0.1),
         timeout_s, "fact_check",
     )
@@ -388,7 +388,7 @@ EXISTING QUERIES:
 
 PAPER (excerpt):
 {paper[:8000]}"""
-        res = _call_with_timeout(
+        res = _safe_call(
             lambda: model_call("research_planner", prompt, temperature=0.3, max_tokens=400),
             300, "fresh_query_gen",
         )
@@ -475,7 +475,7 @@ PAPER:
 Output the reframed paper in full as raw Markdown. No preamble, no closing summary."""
     # Whole-paper rewrite — needs more output budget than the reviewer's
     # default 12k tokens for very long papers. 24k tokens covers ~17k words.
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_reviewer", prompt, temperature=0.25, max_tokens=24000),
         timeout_s, "reframe",
     )
@@ -522,7 +522,7 @@ Output the resized paper in full as raw Markdown."""
     # Resize emits the whole paper too; size budget to the target word count
     # (rough rule: 1 word ≈ 1.4 tokens) plus headroom.
     rs_max_tokens = max(4000, min(int(target_words * 1.6), 24000))
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_reviewer", prompt, temperature=0.25, max_tokens=rs_max_tokens),
         timeout_s, "resize",
     )
@@ -552,7 +552,7 @@ def _generic_artifact(plan_id: int, kind: str, prompt_builder, max_tokens: int =
     topic = plan.get("topic", "")
     prompt = prompt_builder(topic, paper)
     timeout_s = _research_timeout("section_timeout_s", DEFAULT_SECTION_TIMEOUT_S)
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call(role, prompt, temperature=0.3, max_tokens=max_tokens),
         timeout_s, kind,
     )
