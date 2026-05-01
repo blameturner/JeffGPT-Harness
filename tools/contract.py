@@ -9,6 +9,10 @@ class ToolName(str, Enum):
     WEB_SEARCH = "web_search"
     RAG_LOOKUP = "rag_lookup"
     URL_SCRAPER = "url_scraper"
+    FS_READ = "fs_read"
+    FS_WRITE = "fs_write"
+    FS_LIST = "fs_list"
+    FS_DELETE = "fs_delete"
 
 
 class ToolAction(BaseModel):

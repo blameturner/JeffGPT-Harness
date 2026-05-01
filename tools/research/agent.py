@@ -300,32 +300,90 @@ def _fetch_corpus(topic: str, queries: list[str], org_id: int) -> tuple[str, lis
     sources: list[dict] = []
     seen_urls: set[str] = set()
     _log.info("corpus FETCH START  topic=%r  n_queries=%d", topic[:80], len(queries))
-    for idx, q in enumerate(queries, start=1):
-        res = _safe_call(
-            lambda q=q: run_web_search(
-                q, org_id=org_id, intent_dict=intent,
-                extraction_function_name=extraction_function_name,
-            ),
-            timeout_s,
-            f"search[{idx}/{len(queries)}]:{q[:40]}",
-        )
-        if not res:
-            continue
-        try:
-            ctx, src, conf = res
-        except (TypeError, ValueError):
-            continue
-        if ctx:
-            blocks.append(f"--- Query: {q} (confidence={conf}) ---\n{ctx}")
-        for s in (src or []):
-            if not isinstance(s, dict):
+
+    # Run queries in parallel. The previous sequential loop multiplied
+    # per-query latency by N — with N=20 and a slow extractor, a single
+    # research run could spend 20×timeout on this stage. Cap concurrency
+    # at 4 to keep us from hammering searxng / the extraction model. The
+    # model_pool gate inside extraction calls already serialises against
+    # the chat path, so chat priority is unaffected.
+    from workers.tool_queue import (
+        report_progress, is_job_cancelled, JobCancelled,
+        current_job_id, bind_job_id,
+    )
+    import concurrent.futures
+    import threading
+    # Capture the parent contextvar — ThreadPool workers do NOT inherit it
+    # by default, so without bind_job_id() the report_progress and
+    # is_job_cancelled calls inside _one would be no-ops.
+    parent_job_id = current_job_id()
+    max_workers = min(4, max(1, len(queries)))
+    completed_count = [0]
+    completed_lock = threading.Lock()
+
+    def _one(idx_q):
+        idx, q = idx_q
+        with bind_job_id(parent_job_id):
+            if is_job_cancelled():
+                return idx, q, None
+            report_progress(f"search start [{idx}/{len(queries)}]: {q[:60]}")
+            res = _safe_call(
+                lambda q=q: run_web_search(
+                    q, org_id=org_id, intent_dict=intent,
+                    extraction_function_name=extraction_function_name,
+                ),
+                timeout_s,
+                f"search[{idx}/{len(queries)}]:{q[:40]}",
+            )
+            with completed_lock:
+                completed_count[0] += 1
+                done_n = completed_count[0]
+            report_progress(
+                f"search done [{done_n}/{len(queries)}]: {q[:60]}"
+            )
+            return idx, q, res
+
+    # Manual pool management (not `with`) so we can pass cancel_futures=True
+    # on shutdown — otherwise a JobCancelled raise inside the loop would
+    # block on every queued search to finish before propagating, wasting
+    # 10+ minutes of CPU after the user already terminated the job.
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="research-search",
+    )
+    try:
+        futures = [pool.submit(_one, item) for item in enumerate(queries, start=1)]
+        for fut in concurrent.futures.as_completed(futures):
+            if is_job_cancelled():
+                # Cancel every still-queued future; running ones finish.
+                for f in futures:
+                    f.cancel()
+                raise JobCancelled("cancelled mid-search")
+            try:
+                idx, q, res = fut.result()
+            except concurrent.futures.CancelledError:
                 continue
-            url = (s.get("url") or "").strip()
-            if url and url in seen_urls:
+            if not res:
                 continue
-            if url:
-                seen_urls.add(url)
-            sources.append(s)
+            try:
+                ctx, src, conf = res
+            except (TypeError, ValueError):
+                continue
+            if ctx:
+                blocks.append(f"--- Query: {q} (confidence={conf}) ---\n{ctx}")
+            for s in (src or []):
+                if not isinstance(s, dict):
+                    continue
+                url = (s.get("url") or "").strip()
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                sources.append(s)
+    finally:
+        # Don't wait for queued tasks on cancel/exception; cancel them so a
+        # JobCancelled raise propagates promptly instead of blocking on
+        # every remaining LLM call.
+        pool.shutdown(wait=False, cancel_futures=True)
     out_corpus = "\n\n".join(blocks)
 
     # Fallback: if the orchestrator's LLM rerank/extract chain returned
@@ -718,16 +776,20 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
       5. Assemble. Sections that failed are simply omitted; the paper still
          flows because each section was independent prose.
     """
+    from workers.tool_queue import report_progress as _rp
     revision_notes = revision_notes or {}
     spec = DOC_TYPES.get(doc_type) or DOC_TYPES[DEFAULT_DOC_TYPE]
 
     if not queries:
         raise RuntimeError("no queries on plan; cannot synthesise")
+    _rp(f"fetching corpus: {len(queries)} queries")
     corpus, sources = _fetch_corpus(topic, queries, org_id)
     if not corpus.strip():
         raise RuntimeError("no source material retrieved (web search failed for all queries)")
+    _rp(f"corpus ready: {len(sources)} sources, {len(corpus)} chars")
 
     # 1. Opener
+    _rp(f"writing opener: {spec['opener']}")
     opener = _write_section(
         topic=topic, doc_type=doc_type, section_title=spec["opener"],
         section_role=f"Establish the {spec['opener'].lower()} for the rest of the document.",
@@ -735,26 +797,83 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
         revision_note=revision_notes.get(spec["opener"]),
     ) or ""
 
-    # 2. Body — one section per sub_topic. Track which succeeded.
-    body_pieces: list[str] = []
+    # 2. Body — one section per sub_topic. Run in parallel: section writes
+    # are independent (each only reads `corpus` + the section's own role).
+    # Cap at 3 concurrent so we don't completely starve other research jobs
+    # of the t1_secondary slots; the model_pool semaphore handles the rest.
+    from workers.tool_queue import (
+        report_progress as _report,
+        is_job_cancelled as _cancelled,
+        JobCancelled as _Cancelled,
+        current_job_id as _current_job_id_get,
+        bind_job_id as _bind_job_id,
+    )
+    import concurrent.futures
+    import threading
+    body_pieces_ordered: list[str | None] = [None] * len(sub_topics or [])
     body_failed: list[str] = []
-    for sub in (sub_topics or []):
-        sec = _write_section(
-            topic=topic, doc_type=doc_type, section_title=sub,
-            section_role=f"Cover '{sub}' as a substantive body section of the document.",
-            corpus=corpus, hypotheses=hypotheses, target_words=700,
-            revision_note=revision_notes.get(sub),
+
+    section_done = [0]
+    section_lock = threading.Lock()
+    # Capture parent contextvar; thread-pool workers don't inherit it.
+    parent_job_id = _current_job_id_get()
+
+    def _write_body(idx_sub):
+        idx, sub = idx_sub
+        with _bind_job_id(parent_job_id):
+            if _cancelled():
+                return idx, sub, None
+            _report(f"section start [{idx + 1}/{len(sub_topics or [])}]: {sub[:80]}")
+            sec = _write_section(
+                topic=topic, doc_type=doc_type, section_title=sub,
+                section_role=f"Cover '{sub}' as a substantive body section of the document.",
+                corpus=corpus, hypotheses=hypotheses, target_words=700,
+                revision_note=revision_notes.get(sub),
+            )
+            with section_lock:
+                section_done[0] += 1
+                done_n = section_done[0]
+            _report(
+                f"section done [{done_n}/{len(sub_topics or [])}]: {sub[:80]}"
+                f" {'OK' if sec else 'EMPTY'}"
+            )
+            return idx, sub, sec
+
+    if sub_topics:
+        max_workers = min(3, len(sub_topics))
+        _report(f"writing body: {len(sub_topics)} sections (parallel x{max_workers})")
+        # Manual pool (not `with`) so cancel can stop queued sections
+        # promptly instead of waiting for every remaining LLM call.
+        pool_s = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="research-section",
         )
-        if sec:
-            body_pieces.append(sec)
-        else:
-            body_failed.append(sub)
+        try:
+            futures = [pool_s.submit(_write_body, item) for item in enumerate(sub_topics)]
+            for fut in concurrent.futures.as_completed(futures):
+                if _cancelled():
+                    for f in futures:
+                        f.cancel()
+                    raise _Cancelled("cancelled mid-body")
+                try:
+                    idx, sub, sec = fut.result()
+                except concurrent.futures.CancelledError:
+                    continue
+                if sec:
+                    body_pieces_ordered[idx] = sec
+                else:
+                    body_failed.append(sub)
+        finally:
+            pool_s.shutdown(wait=False, cancel_futures=True)
+    body_pieces = [p for p in body_pieces_ordered if p]
     body = "\n\n".join(body_pieces)
 
     # 3. Comparison (if schema provided) — never critical, fine if it drops
+    if schema:
+        _rp("writing comparison block")
     comparison = _write_comparison(topic, schema, corpus) or ""
 
     # 4. Closer (gets opener+body so it can synthesise the spine)
+    _rp(f"writing closer: {spec['closer']}")
     closer_corpus = corpus + "\n\n=== CURRENT BODY ===\n" + (opener + "\n\n" + body)[:8000]
     closer = _write_section(
         topic=topic, doc_type=doc_type, section_title=spec["closer"],
@@ -790,15 +909,18 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
         _log.warning("build_paper: closer section %r failed and will be omitted", spec["closer"])
 
     # 5. Takeaways + Recommendation (closing)
+    _rp("writing takeaways + recommendation")
     full_body = "\n\n".join(p for p in (opener, body, comparison, closer) if p)
     takeaways = _write_takeaways_and_recommendation(
         topic=topic, doc_type=doc_type, body_md=full_body,
     ) or ""
 
     # 6. Executive summary — last, so it summarises real content
+    _rp("writing executive summary")
     exec_summary = _write_executive_summary(
         topic=topic, doc_type=doc_type, body_md=full_body,
     ) or ""
+    _rp("paper assembled")
 
     # 7. Sources
     sources_md = _build_sources(sources)
@@ -837,8 +959,11 @@ def run_research_agent(plan_id: int) -> dict:
     if not get_feature("research", "agent_enabled", True):
         return {"status": "disabled", "error": "research_agent feature disabled"}
 
+    from workers.tool_queue import report_progress, is_job_cancelled, JobCancelled
+
     client = NocodbClient()
     try:
+        report_progress(f"loading plan {plan_id}")
         plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
         plan = plan_row.get("list", [])[0] if plan_row.get("list") else None
         if not plan:
@@ -856,7 +981,14 @@ def run_research_agent(plan_id: int) -> dict:
         planned_doc_type = schema.pop("_doc_type", None) if isinstance(schema, dict) else None
         doc_type = _infer_doc_type(topic, planned_doc_type=planned_doc_type)
 
+        report_progress(
+            f"plan loaded: {len(queries)} queries, {len(sub_topics)} sub-topics, doc_type={doc_type}"
+        )
+        if is_job_cancelled():
+            raise JobCancelled("cancelled before search")
+
         _patch_or_log(client, plan_id, {"status": "searching"}, "searching")
+        report_progress(f"searching: {len(queries)} queries → web search + extract")
 
         paper, _sources = _build_paper(
             topic=topic, doc_type=doc_type, queries=queries, schema=schema,

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from infra.config import MODELS, refresh_models
 from workers.chat.config import CHAT_DEFAULT_STYLE, list_chat_styles
-from workers.code.config import CODE_DEFAULT_STYLE, list_code_styles
+from workers.code.config import CODE_DEFAULT_MODE, CODE_DEFAULT_STYLE, list_code_modes, list_code_styles
 
 _log = logging.getLogger("main.health")
 
@@ -53,7 +53,12 @@ def get_styles(surface: str | None = None):
     if surface in (None, "chat"):
         out["chat"] = {"default": CHAT_DEFAULT_STYLE, "styles": list_chat_styles()}
     if surface in (None, "code"):
-        out["code"] = {"default": CODE_DEFAULT_STYLE, "styles": list_code_styles()}
+        out["code"] = {
+            "default": CODE_DEFAULT_STYLE,
+            "styles": list_code_styles(),
+            "default_mode": CODE_DEFAULT_MODE,
+            "modes": list_code_modes(),
+        }
     if not out:
         raise HTTPException(status_code=400, detail="surface must be 'chat' or 'code'")
     return out

@@ -710,6 +710,16 @@ class ChatAgent(BaseAgent):
         # post-turn summarising) is treated as one continuous active period.
         touch_chat_activity()
         def _post_turn_with_finalise() -> None:
+            # Inherit the chat thread's priority context so the post-turn
+            # extractor isn't gated by its own _block_while_chat_active
+            # (which sees is_chat_active() == True until end_chat_turn fires
+            # at the bottom of this function). contextvars don't auto-
+            # propagate to spawned threads, so set it explicitly here.
+            try:
+                from shared.model_pool import _user_priority_ctx
+                _user_priority_ctx.set(True)
+            except Exception:
+                pass
             try:
                 _post_turn_work()
             finally:

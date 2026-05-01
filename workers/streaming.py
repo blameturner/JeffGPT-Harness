@@ -17,6 +17,17 @@ def stream_model_response(
     max_tokens: int,
     emit: Callable[[dict], None],
 ) -> tuple[list[str], dict, str]:
+    # This path is used by the chat agent (priority context = True) AND by
+    # background user-agents (no priority context). The gate's first check is
+    # ``user_priority_active()`` so the chat path is a no-op; background
+    # callers block until any active chat turn ends.
+    try:
+        from shared.model_pool import _block_while_chat_active
+        _block_while_chat_active("stream_model_response")
+    except Exception:
+        # Never let the gate's import or wait-loop crash an actual model call.
+        _log.debug("chat-active gate skipped (import/wait failed)", exc_info=True)
+
     payload = {
         "model": model,
         "messages": messages,

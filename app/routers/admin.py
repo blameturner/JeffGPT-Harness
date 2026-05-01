@@ -22,12 +22,41 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+
+
+# In-process TTL cache for /admin/runtime. The Console polls this every few
+# seconds from multiple panels; without coalescing we'd do a 500-row NocoDB
+# read per panel per second. 3 s is short enough to feel live, long enough
+# to collapse a burst of polls into a single read.
+_RUNTIME_CACHE_TTL_S = 3.0
+_runtime_cache: dict[Any, tuple[float, dict]] = {}
+_runtime_cache_lock = threading.Lock()
+
+
+def _runtime_cache_get(key) -> dict | None:
+    with _runtime_cache_lock:
+        hit = _runtime_cache.get(key)
+        if hit and (time.time() - hit[0]) < _RUNTIME_CACHE_TTL_S:
+            return hit[1]
+    return None
+
+
+def _runtime_cache_set(key, value: dict) -> None:
+    with _runtime_cache_lock:
+        _runtime_cache[key] = (time.time(), value)
+        # Cap entries — operators can switch orgs but we don't want unbounded growth.
+        if len(_runtime_cache) > 32:
+            oldest = sorted(_runtime_cache.items(), key=lambda kv: kv[1][0])[:8]
+            for k, _ in oldest:
+                _runtime_cache.pop(k, None)
 
 from infra.config import (
     PLATFORM,
@@ -249,7 +278,16 @@ def runtime(request: Request, org_id: int | None = None):
       * huey: consumer/health snapshot
       * queue: counts + idle gate
       * scheduler: running flag + per-job next_run map
+
+    Cached for ``_RUNTIME_CACHE_TTL_S`` seconds keyed on (org_id) — the
+    Console polls this from multiple panels and tabs; without the cache
+    each poll triggers a 500-row NocoDB read. Per-org cache so org A's
+    poll doesn't return org B's snapshot.
     """
+    cache_key = ("runtime", int(org_id) if org_id is not None else 0)
+    cached = _runtime_cache_get(cache_key)
+    if cached is not None:
+        return cached
     client = NocodbClient()
     rows = _fetch_recent_jobs(client)
     if org_id is not None:
@@ -321,16 +359,64 @@ def runtime(request: Request, org_id: int | None = None):
         ],
     }
 
-    return {
+    payload = {
         "subsystems": subsystems,
         "huey": huey_block,
         "queue": queue_status,
         "scheduler": sched_block,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
+    _runtime_cache_set(cache_key, payload)
+    return payload
 
 
 # ── config read/write ─────────────────────────────────────────────────────
+
+@router.get("/chat-active")
+def chat_active_status():
+    """Snapshot of the chat-active gate. Surfaces ``count`` and how long the
+    oldest active turn has been live so the user can spot a leaked counter
+    (count > 0 with no real chat happening) and click reset."""
+    from workers.tool_queue import chat_active_state
+    return chat_active_state()
+
+
+class ChatActiveReset(BaseModel):
+    reason: str = "manual reset from admin UI"
+
+
+@router.post("/chat-active/reset")
+def chat_active_reset(body: ChatActiveReset | None = None):
+    """Force the chat-active counter to zero. Use when the gate is wedged
+    after a chat handler crashed without decrementing — symptom is every
+    background worker stuck at ``_block_while_chat_active`` and no LLM
+    progress despite jobs marked running."""
+    from workers.tool_queue import reset_chat_active
+    reason = (body.reason if body else "manual") or "manual"
+    prev = reset_chat_active(reason=reason)
+    return {"reset": True, "previous_count": prev, "reason": reason}
+
+
+class ToolJobCancelRequest(BaseModel):
+    reason: str = "user terminated"
+
+
+@router.post("/tool-jobs/{job_id}/cancel")
+def admin_cancel_tool_job(job_id: str, body: ToolJobCancelRequest | None = None):
+    """Cooperative cancel for a running tool job. The handler is expected
+    to honour ``ToolJobQueue.is_cancelled(job_id)`` between phases and abort
+    cleanly; an LLM call already in flight runs to completion (we never
+    kill threads). Use this when a job is stuck or no longer wanted."""
+    from workers.tool_queue import get_tool_queue
+    q = get_tool_queue()
+    if q is None:
+        raise HTTPException(status_code=503, detail="tool queue not initialised")
+    reason = (body.reason if body else "user terminated") or "user terminated"
+    ok = q.cancel_running(job_id, reason=reason)
+    if not ok:
+        raise HTTPException(status_code=404, detail="job not found or not cancellable")
+    return {"cancelled": True, "job_id": job_id, "reason": reason}
+
 
 @router.get("/config")
 def list_config():

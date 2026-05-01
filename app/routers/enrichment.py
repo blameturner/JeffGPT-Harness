@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from infra.config import NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, get_feature
@@ -483,6 +483,66 @@ def research_create_plan(req: ResearchRequest):
     from tools.research.research_planner import create_research_plan
     result = create_research_plan(req.topic, req.org_id)
     return {"status": result.get("status"), **result}
+
+
+@router.delete("/research/plans/{plan_id}")
+def research_delete_plan(plan_id: int, org_id: int | None = None):
+    """Hard-delete a research plan + cancel any running tool_jobs that
+    reference it. The Chroma corpus and any insight rows linked to the
+    plan are LEFT in place — that work is durable and could be useful
+    even if the plan itself is gone. Caller can fan-out separately if
+    they want a deeper purge.
+    """
+    from infra.nocodb_client import NocodbClient
+    from workers.tool_queue import get_tool_queue
+
+    client = NocodbClient()
+    rows = client._get("research_plans", params={
+        "where": f"(Id,eq,{plan_id})",
+        "limit": 1,
+    }).get("list", [])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"plan {plan_id} not found")
+    row = rows[0]
+    if org_id is not None and int(row.get("org_id") or 0) != int(org_id):
+        raise HTTPException(status_code=403, detail="plan belongs to a different org")
+
+    # Best-effort: cancel any tool_jobs that target this plan_id. We don't
+    # block on the results — research_agent / research_planner handlers
+    # check is_cancelled() between phases and abort cleanly.
+    cancelled_jobs: list[str] = []
+    try:
+        q = get_tool_queue()
+        if q is not None:
+            tool_rows = client._get_paginated("tool_jobs", params={
+                "where": "(type,in,research_agent,research_planner,research_review,research_op)"
+                         "~and(status,in,queued,running)",
+                "limit": 200,
+            })
+            import json as _json
+            for tr in tool_rows:
+                raw = tr.get("payload_json") or tr.get("payload") or "{}"
+                try:
+                    payload = _json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                if int(payload.get("plan_id") or 0) == int(plan_id):
+                    job_id = tr.get("job_id")
+                    if job_id and q.cancel_running(job_id, reason=f"plan {plan_id} deleted"):
+                        cancelled_jobs.append(job_id)
+    except Exception:
+        _log.warning("research_delete_plan: cancel tool_jobs failed  plan=%d", plan_id, exc_info=True)
+
+    try:
+        client._delete("research_plans", plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"delete failed: {e}")
+
+    return {
+        "status": "deleted",
+        "plan_id": plan_id,
+        "cancelled_jobs": cancelled_jobs,
+    }
 
 
 @router.post("/research/get-next")

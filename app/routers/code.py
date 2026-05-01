@@ -4,10 +4,10 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.routers.code_launch import start_code_job, stream_job_events_response
 from app.schemas import ConversationUpdate
 from infra.nocodb_client import NocodbClient
-from shared.jobs import STORE, run_in_background
-from workers.code.agent import CodeAgent
+from workers.code.config import CODE_MODES, resolve_code_mode
 
 _log = logging.getLogger("main.code")
 
@@ -29,6 +29,8 @@ class CodeRequest(BaseModel):
     search_enabled: bool = False
     temperature: float = 0.2
     max_tokens: int = 8192
+    project_id: int | None = None
+    interactive_fs: bool = False
 
 
 class CodebaseCreate(BaseModel):
@@ -43,40 +45,34 @@ class CodebaseFileUpload(BaseModel):
 
 @router.post("/code")
 def code(request: CodeRequest):
+    resolved_mode = resolve_code_mode(request.mode)
+    if resolved_mode not in CODE_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid mode '{request.mode}'")
     _log.info(
         "POST /code  model=%s org=%d mode=%s conv=%s",
         request.model,
         request.org_id,
-        request.mode,
+        resolved_mode,
         request.conversation_id,
     )
-    try:
-        agent = CodeAgent(
-            model=request.model,
-            org_id=request.org_id,
-            mode=request.mode,  # type: ignore[arg-type]
-            approved_plan=request.approved_plan,
-            files=request.files,
-            search_enabled=request.search_enabled,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    job = STORE.create()
-    run_in_background(
-        job,
-        lambda j: agent.run_job(
-            j,
-            user_message=request.message,
-            conversation_id=request.conversation_id,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            title=request.title,
-            codebase_collection=request.codebase_collection,
-            response_style=request.response_style,
-            knowledge_enabled=request.knowledge_enabled,
-        ),
+    return start_code_job(
+        org_id=request.org_id,
+        model=request.model,
+        message=request.message,
+        mode=resolved_mode,
+        approved_plan=request.approved_plan,
+        files=request.files,
+        conversation_id=request.conversation_id,
+        title=request.title,
+        codebase_collection=request.codebase_collection,
+        response_style=request.response_style,
+        knowledge_enabled=request.knowledge_enabled,
+        search_enabled=request.search_enabled,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        project_id=request.project_id,
+        interactive_fs=request.interactive_fs,
     )
-    return {"job_id": job.id}
 
 
 @router.get("/codebases")
@@ -240,6 +236,28 @@ def get_code_workspace(conversation_id: int, org_id: int | None = None):
         convo = db.get_code_conversation(conversation_id, org_id=org_id)
         if not convo:
             raise HTTPException(status_code=404, detail="Code conversation not found")
+        project_id = convo.get("project_id")
+        if project_id:
+            scope_org_id = int(convo.get("org_id") or 0) if org_id is None else org_id
+            project = db.get_project(int(project_id), org_id=scope_org_id)
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found for conversation")
+            files = db.list_project_files(project_id=int(project_id))
+            return {
+                "project_id": int(project_id),
+                "files": [
+                    {
+                        "path": f.get("path"),
+                        "kind": f.get("kind"),
+                        "size": f.get("size_bytes") or 0,
+                        "current_version": f.get("current_version_id"),
+                        "updated_at": f.get("UpdatedAt"),
+                        "pinned": bool(f.get("pinned")),
+                        "locked": bool(f.get("locked")),
+                    }
+                    for f in files
+                ],
+            }
         msgs = db.list_code_messages(conversation_id, org_id=org_id)
         for m in reversed(msgs):
             if m.get("role") != "user":
@@ -282,3 +300,9 @@ def update_code_conversation(conversation_id: int, body: ConversationUpdate, org
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/code/stream/{job_id}")
+def stream_code_job(job_id: str, cursor: int = 0):
+    return stream_job_events_response(job_id, cursor)
+

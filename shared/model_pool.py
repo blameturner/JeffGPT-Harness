@@ -126,6 +126,54 @@ def _yield_to_user_if_waiting(
         _log.info("background acquirer (%s) yielded %.1fs to user request", label, waited)
 
 
+_CHAT_GATE_TIMEOUT_S = 180.0
+_CHAT_GATE_POLL_S = 1.0
+
+
+def _block_while_chat_active(label: str) -> None:
+    """Background callers wait here until the active chat turn ends.
+
+    The previous-turn-only ``_user_requests_waiting`` event clears as
+    soon as the chat thread finishes acquiring its slot, so a Huey task
+    that arrives at the model pool 200 ms later sails through and steals
+    the next slot — exactly the symptom the user reported. This gate is
+    blunter: while *any* chat turn is streaming (``is_chat_active()``),
+    non-priority callers do not acquire model resources at all.
+
+    Caller is exempt when ``user_priority_active()`` is True — the chat
+    thread itself, every nested ``asyncio.run`` call, and any thread we
+    explicitly set the priority context on (e.g. the chat post-turn
+    extractor, the chat-driven web search) all bypass this gate. Only
+    truly background work (Huey-driven research, scraper, graph_extract,
+    digest, anything spun up outside a chat turn) is gated.
+
+    Caps at 3 minutes so a wedged chat turn can't deadlock the queue
+    forever — after that we let the background work proceed and rely
+    on the chat path to recover or fail.
+    """
+    if user_priority_active():
+        return
+    try:
+        from workers.tool_queue import is_chat_active
+    except Exception:
+        return
+    if not is_chat_active():
+        return
+    waited = 0.0
+    while is_chat_active() and waited < _CHAT_GATE_TIMEOUT_S:
+        # Re-check the priority context on each tick — a parent thread
+        # could have promoted us mid-wait by setting the contextvar.
+        if user_priority_active():
+            return
+        time.sleep(_CHAT_GATE_POLL_S)
+        waited += _CHAT_GATE_POLL_S
+    if waited > 0:
+        _log.info(
+            "background acquirer (%s) blocked %.1fs for active chat",
+            label, waited,
+        )
+
+
 def _sem_for(role: str) -> _PrioritySemaphore:
     with _role_sem_lock:
         sem = _role_semaphores.get(role)
@@ -163,6 +211,20 @@ def acquire_model(pool_name: str, priority: bool = False) -> Iterator[tuple[str 
     # Auto-promote to priority when the call stack is inside user_priority_scope().
     if not priority and user_priority_active():
         priority = True
+
+    # Hard gate: while a chat turn is streaming, non-priority callers block
+    # here BEFORE attempting slot acquisition. This is the fix for the case
+    # where a Huey-driven research agent's search step was acquiring slots
+    # while the chat thread was waiting for the same role. Skipped for
+    # priority callers (chat itself, post-turn extractor, chat-driven web
+    # search) — see _block_while_chat_active.
+    if not priority:
+        _block_while_chat_active(f"pool={pool_name}")
+        # Re-check promotion after the wait — the contextvar could have
+        # been set by an outer scope, or chat may have ended and we now
+        # qualify as the next-priority caller.
+        if user_priority_active():
+            priority = True
 
     pool = _POOLS.get(pool_name, ())
     if not pool:
@@ -277,6 +339,13 @@ def acquire_role(role: str, priority: bool = False) -> Iterator[tuple[str | None
     # Auto-promote to priority when the call stack is inside user_priority_scope().
     if not priority and user_priority_active():
         priority = True
+
+    # Hard gate: block non-priority background callers while a chat turn
+    # is streaming. See acquire_model for the rationale and exceptions.
+    if not priority:
+        _block_while_chat_active(f"role={role}")
+        if user_priority_active():
+            priority = True
 
     # Compute semaphore before the yield check so we can pass free-slot info.
     sem = _sem_for(role)

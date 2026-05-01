@@ -70,6 +70,14 @@ class Agent:
     def _call_model(self, messages: list[dict]) -> dict:
         url = self._get_model_url()
 
+        # User-agents run in Huey workers — pause this call while a chat
+        # turn is streaming. No-op when the chat priority context is set.
+        try:
+            from shared.model_pool import _block_while_chat_active
+            _block_while_chat_active("user_agent._call_model")
+        except Exception:
+            pass
+
         response = requests.post(
             f"{url}/v1/chat/completions",
             json={
@@ -108,6 +116,12 @@ class Agent:
 
         final_usage: dict = {}
         final_model: str = model
+        # Same chat-active gate as _call_model; safe no-op for chat path.
+        try:
+            from shared.model_pool import _block_while_chat_active
+            _block_while_chat_active("user_agent._call_model_streaming")
+        except Exception:
+            pass
         try:
             with requests.post(
                 f"{url}/v1/chat/completions",

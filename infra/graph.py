@@ -173,64 +173,108 @@ def get_connections(org_id: int, node_name: str) -> list[dict]:
     ]
 
 
-def get_weighted_neighbourhood(
-    org_id: int,
-    seed_names: list[str],
-    max_hops: int = 2,
-    edge_limit: int = 80,
-) -> list[dict]:
-    """Weighted expansion from one or more seed nodes.
+def _is_timeout_error(exc: BaseException) -> bool:
+    """FalkorDB raises redis.exceptions.ResponseError('Query timed out').
+    We don't want to import redis here just for the type, so match by name
+    + message."""
+    name = type(exc).__name__
+    if name in ("ResponseError", "RedisTimeoutError", "TimeoutError"):
+        return True
+    msg = str(exc).lower()
+    return "timed out" in msg or "timeout" in msg
 
-    Returns edges ordered by reinforcement strength (``hits`` then ``weight``).
-    Alias-aware: matches on either ``name`` or membership in ``aliases``.
+
+def _resolve_seed_names(graph, seeds: list[str], timeout_ms: int = 1500) -> list[str]:
+    """Map raw seed strings → canonical node names (alias-aware).
+
+    Cheap pre-pass: avoids putting an OR-on-alias predicate inside the
+    bigger neighbourhood traversal where the planner mishandles it. Caps
+    at 50 hits so a fuzzy match against a common phrase can't fan out.
+    Falls back to the input list on any error.
     """
-    if not seed_names:
-        return []
-    graph = get_graph(org_id)
-    seeds = [s for s in {str(n).strip() for n in seed_names} if s]
+    try:
+        result = run_query(
+            graph,
+            "MATCH (n) WHERE n.name IN $seeds "
+            "  OR any(alias IN coalesce(n.aliases, []) WHERE alias IN $seeds) "
+            "RETURN DISTINCT n.name LIMIT 50",
+            {"seeds": list(seeds)},
+            timeout_ms=int(timeout_ms),
+        )
+        return [row[0] for row in (result.result_set or []) if row and row[0]]
+    except Exception:
+        _log.debug("_resolve_seed_names: fall back to raw seeds", exc_info=True)
+        return list(seeds)
+
+
+def _fetch_one_hop(
+    graph,
+    seeds: list[str],
+    limit: int,
+    timeout_ms: int,
+) -> list[dict]:
+    """One-hop edges anchored at each seed by name.
+
+    Uses ``UNWIND $seeds AS sname / MATCH (a {name: sname})`` so the
+    planner does a per-seed indexed lookup instead of a global edge scan
+    + post-filter. That's the difference between bounded latency on a
+    hub like "AI" and a 30-second timeout.
+
+    Retries once with a smaller ``limit`` on timeout — if the cluster is
+    momentarily slow the smaller scan often succeeds.
+    """
     if not seeds:
         return []
 
-    if max_hops == 1:
-        pattern = "(a)-[r]-(b)"
-        edge_expr = "r"
-    else:
-        # 2-hop expansion: seed → direct → second-degree. Direct hops are
-        # emitted plus edges between neighbours themselves, giving a richer
-        # local subgraph for synthesis. `r` is a list here, so pick the
-        # terminal edge with last().
-        pattern = "(a)-[r*1..2]-(b)"
-        edge_expr = "last(r)"
+    query = (
+        "UNWIND $seeds AS sname "
+        "MATCH (a {name: sname})-[r]-(b) "
+        "RETURN a.name, labels(a)[0], type(r), b.name, labels(b)[0], "
+        "  coalesce(r.hits, 1) AS hits, coalesce(r.weight, 1.0) AS weight, "
+        "  r.last_seen AS last_seen, r.source_chunks AS chunks "
+        "ORDER BY hits DESC, weight DESC "
+        "LIMIT $limit"
+    )
+    params = {"seeds": list(seeds), "limit": int(limit)}
 
-    try:
-        result = graph.query(
-            "MATCH (seed) WHERE seed.name IN $seeds OR any(alias IN coalesce(seed.aliases, []) WHERE alias IN $seeds) "
-            f"MATCH {pattern} "
-            "WHERE a = seed OR b = seed "
-            f"WITH a, b, {edge_expr} AS edge "
-            "RETURN a.name, labels(a)[0], type(edge), b.name, labels(b)[0], "
-            "  coalesce(edge.hits, 1) AS hits, coalesce(edge.weight, 1.0) AS weight, "
-            "  edge.last_seen AS last_seen, edge.source_chunks AS chunks "
-            "ORDER BY hits DESC, weight DESC "
-            "LIMIT $limit",
-            {"seeds": seeds, "limit": int(edge_limit)},
-        )
-    except Exception:
-        _log.warning(
-            "get_weighted_neighbourhood failed  seeds=%s max_hops=%d",
-            seeds[:3], max_hops, exc_info=True,
-        )
-        return []
+    attempts: list[tuple[int, int]] = [(int(timeout_ms), int(limit))]
+    # If we have plenty of budget, plan a degraded retry. Otherwise just
+    # the one shot — the caller's outer fallback will pick up the slack.
+    if timeout_ms >= 4000 and limit > 20:
+        attempts.append((max(2000, timeout_ms // 2), max(20, limit // 4)))
 
+    last_exc: Exception | None = None
+    for attempt_timeout, attempt_limit in attempts:
+        params["limit"] = int(attempt_limit)
+        try:
+            result = run_query(graph, query, params, timeout_ms=attempt_timeout)
+            return _materialise_edges(result)
+        except Exception as e:
+            last_exc = e
+            if not _is_timeout_error(e):
+                # Non-timeout error: don't burn the budget retrying.
+                break
+            _log.warning(
+                "_fetch_one_hop timeout  seeds=%d limit=%d timeout_ms=%d — retrying smaller",
+                len(seeds), attempt_limit, attempt_timeout,
+            )
+
+    _log.warning(
+        "_fetch_one_hop gave up  seeds=%s last_error=%s",
+        seeds[:3], type(last_exc).__name__ if last_exc else "n/a",
+    )
+    return []
+
+
+def _materialise_edges(result) -> list[dict]:
+    """Common row → dict mapping for neighbourhood queries. Tolerates the
+    hits/weight/last_seen fields being missing on legacy edges."""
     out: list[dict] = []
-    seen: set[tuple] = set()
+    if result is None or not getattr(result, "result_set", None):
+        return out
     for row in result.result_set:
         if not row or not row[0] or not row[3]:
             continue
-        key = (str(row[0]), str(row[2]), str(row[3]))
-        if key in seen:
-            continue
-        seen.add(key)
         out.append({
             "from": row[0],
             "from_type": row[1],
@@ -242,6 +286,101 @@ def get_weighted_neighbourhood(
             "last_seen": row[7],
             "source_chunks": list(row[8] or []),
         })
+    return out
+
+
+def get_weighted_neighbourhood(
+    org_id: int,
+    seed_names: list[str],
+    max_hops: int = 2,
+    edge_limit: int = 80,
+    timeout_ms: int = 8000,
+) -> list[dict]:
+    """Weighted expansion from one or more seed nodes.
+
+    Returns edges ordered by reinforcement strength (``hits`` then ``weight``).
+    Alias-aware: matches on either ``name`` or membership in ``aliases``.
+
+    Resilience strategy (the previous query timed out on hub nodes):
+      1. Resolve seeds → canonical names in a cheap, bounded pre-pass so
+         the alias-OR predicate doesn't ride along inside the main scan.
+      2. Per-seed edge cap so one hub can't drown the others out of the
+         result set.
+      3. Anchored ``UNWIND $seeds / MATCH (a {name: sname})`` traversal
+         — indexed lookup per seed instead of a global edge scan with
+         a post-filter.
+      4. Hard ``timeout_ms`` on every Cypher call (default 8 s).
+      5. On 1-hop timeout: retry with smaller limit before giving up.
+      6. 2-hop is opportunistic — only tried if the 1-hop budget didn't
+         already exhaust the edge limit, AND it falls back cleanly to
+         the 1-hop result on its own timeout. We never escalate a 1-hop
+         success into a 2-hop failure.
+    """
+    if not seed_names:
+        return []
+    graph = get_graph(org_id)
+    raw = [s for s in {str(n).strip() for n in seed_names} if s]
+    if not raw:
+        return []
+
+    canonical = _resolve_seed_names(graph, raw, timeout_ms=1500) or raw
+    # Hard cap on seeds — a fuzzy match against a generic word (e.g. "ai")
+    # could otherwise resolve to 50 entities and turn each subsequent
+    # query into a fan-out.
+    canonical = canonical[:10]
+
+    # Per-seed cap so traversing a single hub doesn't fill the whole
+    # result set at the expense of the other seeds.
+    per_seed_cap = max(5, edge_limit // max(1, len(canonical)))
+    one_hop_limit = min(int(edge_limit), per_seed_cap * len(canonical))
+
+    edges = _fetch_one_hop(graph, canonical, one_hop_limit, timeout_ms=timeout_ms)
+
+    # 2-hop: opportunistic. Skip cleanly if 1-hop already filled, if the
+    # caller asked for 1-hop only, or if the 1-hop fetch failed (in which
+    # case there's no useful seed pool for the second hop anyway).
+    if max_hops > 1 and edges and len(edges) < edge_limit:
+        # Build a second-hop seed pool from the strongest 1-hop neighbours
+        # — strong edges → likely informative neighbourhood.
+        seen_seeds = set(canonical)
+        second_seeds: list[str] = []
+        for e in edges:
+            for nm in (e.get("to"), e.get("from")):
+                if nm and nm not in seen_seeds and nm not in second_seeds:
+                    second_seeds.append(nm)
+                if len(second_seeds) >= 8:
+                    break
+            if len(second_seeds) >= 8:
+                break
+
+        remaining = edge_limit - len(edges)
+        if second_seeds and remaining > 0:
+            extra = _fetch_one_hop(
+                graph,
+                second_seeds,
+                limit=remaining,
+                # Tighter budget for the optional hop. If it can't finish
+                # in 4s, drop it; the 1-hop result is already useful.
+                timeout_ms=min(int(timeout_ms), 4000),
+            )
+            edges.extend(extra)
+
+    # Dedupe (a 2-hop expansion can re-emit a 1-hop edge with reversed
+    # direction) and order by reinforcement strength + recency.
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for e in edges:
+        # Undirected dedupe key — `(min, rel, max)` collapses both
+        # orientations of the same edge.
+        a, b = str(e["from"]), str(e["to"])
+        key = (min(a, b), str(e["relationship"]), max(a, b))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+        if len(out) >= edge_limit:
+            break
+
     return out
 
 

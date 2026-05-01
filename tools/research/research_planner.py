@@ -674,24 +674,32 @@ def reap_stale_plans() -> dict:
 
     client = NocodbClient()
 
-    # Collect plan_ids referenced by any non-terminal tool_job_queue row.
+    # Collect plan_ids referenced by any non-terminal tool_jobs row.
+    # (Historical typo: this used to query "tool_job_queue" which doesn't
+    # exist — the canonical table is "tool_jobs". The payload column is
+    # "payload_json" not "payload"; we tolerate either.)
     active_plan_ids: set[int] = set()
     try:
-        tool_rows = client._get_paginated("tool_job_queue", params={
+        tool_rows = client._get_paginated("tool_jobs", params={
             "where": "(type,in,research_agent,research_planner)"
-                     "~and(status,in,queued,running,retry_scheduled)",
+                     "~and(status,in,queued,running)",
             "limit": 200,
         })
         for tr in tool_rows:
-            raw = tr.get("payload") or ""
+            raw = tr.get("payload_json") or tr.get("payload") or ""
             try:
-                pid = json.loads(raw).get("plan_id") if isinstance(raw, str) else raw.get("plan_id")
+                if isinstance(raw, str):
+                    pid = json.loads(raw).get("plan_id") if raw else None
+                elif isinstance(raw, dict):
+                    pid = raw.get("plan_id")
+                else:
+                    pid = None
                 if pid:
                     active_plan_ids.add(int(pid))
             except Exception:
                 continue
     except Exception:
-        _log.debug("reap: tool_job_queue scan skipped", exc_info=True)
+        _log.debug("reap: tool_jobs scan skipped", exc_info=True)
 
     reaped = 0
     for state in ("generating", "searching", "synthesizing"):

@@ -30,7 +30,104 @@ _DEFAULT_RETRY_BACKOFF_S = 5.0
 
 _last_chat_activity: float = 0.0
 _chat_active_count: int = 0  # number of currently-streaming chat turns
+_chat_turn_oldest_started_at: float = 0.0  # wall-clock of the OLDEST active turn
 _activity_lock = threading.Lock()
+
+# ContextVar set by the worker around each handler call. Lets handlers (and
+# anything they call) emit progress + check cancellation without needing
+# the job_id threaded through every function. Handlers retrieve the queue
+# from get_tool_queue() and call report_progress / is_job_cancelled.
+import contextvars
+_current_job_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_tool_job_id", default=None,
+)
+
+
+def report_progress(
+    message: str,
+    *,
+    kind: str = "",
+    step: int = 0,
+    total: int = 0,
+) -> None:
+    """Stamp a human-readable progress line on the currently-running tool
+    job. ``kind`` / ``step`` / ``total`` give the UI structured data to
+    render a real progress bar (e.g. ``kind='search', step=3, total=8``).
+    No-op outside a handler. Always logs regardless of DB success so the
+    live log stream still shows it."""
+    job_id = _current_job_id.get()
+    pretty = message
+    if step or total:
+        pretty = f"[{step or '?'}/{total or '?'}] {message}" if step or total else message
+    if not job_id:
+        _log.info("progress (no job): %s", pretty[:200])
+        return
+    _log.info("progress  job=%s  %s%s", job_id[:12],
+              f"{kind}: " if kind else "", pretty[:300])
+    try:
+        q = get_tool_queue()
+        if q is not None:
+            q.update_progress(job_id, message, kind=kind, step=step, total=total)
+    except Exception:
+        _log.debug("report_progress: queue update failed", exc_info=True)
+
+
+def is_job_cancelled() -> bool:
+    """Cooperative cancellation check. Long-running handlers should call
+    this between phases (e.g. between search queries, between section
+    writes) and abort cleanly when it returns True. No-op (returns False)
+    outside a tool-queue handler.
+    """
+    job_id = _current_job_id.get()
+    if not job_id:
+        return False
+    try:
+        q = get_tool_queue()
+        return bool(q is not None and q.is_cancelled(job_id))
+    except Exception:
+        return False
+
+
+def current_job_id() -> str | None:
+    """Returns the currently-running tool job's id, or None if not inside
+    a handler. Used by handlers that fan work out to thread pools — capture
+    this before submitting and re-set it inside each worker via
+    :func:`bind_job_id`, since contextvars don't propagate across threads."""
+    return _current_job_id.get()
+
+
+def bind_job_id(job_id: str | None):
+    """Context manager that sets the current job_id contextvar. Use inside
+    threads spawned from a handler so ``report_progress`` and
+    ``is_job_cancelled`` continue to work in the worker thread."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        if job_id is None:
+            yield
+            return
+        tok = _current_job_id.set(job_id)
+        try:
+            yield
+        finally:
+            _current_job_id.reset(tok)
+
+    return _cm()
+
+
+class JobCancelled(Exception):
+    """Raised by handlers (or the framework) when a running job is
+    cancelled cooperatively. Caught at the top of the dispatch loop and
+    turned into a ``status='cancelled'`` outcome."""
+    pass
+
+# A "chat turn" should never legitimately be active for longer than this.
+# If the counter is still elevated past this window, we assume the counter
+# leaked (chat thread crashed without decrementing) and treat the chat as
+# inactive — otherwise every background Huey worker is blocked forever at
+# _block_while_chat_active.
+_CHAT_TURN_STALE_S = 900.0   # 15 minutes
 
 
 def touch_chat_activity():
@@ -50,8 +147,10 @@ def begin_chat_turn() -> None:
     creeping in mid-stream and contending for the model backend.
 
     Pair every ``begin_chat_turn`` with exactly one ``end_chat_turn``."""
-    global _chat_active_count, _last_chat_activity
+    global _chat_active_count, _last_chat_activity, _chat_turn_oldest_started_at
     with _activity_lock:
+        if _chat_active_count == 0:
+            _chat_turn_oldest_started_at = time.time()
         _chat_active_count += 1
         _last_chat_activity = time.time()
 
@@ -60,16 +159,70 @@ def end_chat_turn() -> None:
     """Companion to :func:`begin_chat_turn`. The idle clock starts FROM HERE,
     not from when the turn began, so the configured idle window guarantees
     a real quiet period after the stream closes."""
-    global _chat_active_count, _last_chat_activity
+    global _chat_active_count, _last_chat_activity, _chat_turn_oldest_started_at
     with _activity_lock:
         _chat_active_count = max(0, _chat_active_count - 1)
         _last_chat_activity = time.time()
+        if _chat_active_count == 0:
+            _chat_turn_oldest_started_at = 0.0
+
+
+def reset_chat_active(reason: str = "manual") -> int:
+    """Force the chat-active counter to zero. Used by admin UI when the
+    counter leaked (e.g. a chat handler crashed without decrementing) and
+    every background worker is now blocked at the gate. Returns the count
+    that was discarded so the operator can confirm what was reset.
+    """
+    global _chat_active_count, _chat_turn_oldest_started_at, _last_chat_activity
+    with _activity_lock:
+        prev = _chat_active_count
+        _chat_active_count = 0
+        _chat_turn_oldest_started_at = 0.0
+        _last_chat_activity = time.time()
+    if prev:
+        _log.warning("reset_chat_active  prev=%d reason=%s", prev, reason)
+    return prev
+
+
+def chat_active_state() -> dict:
+    """Snapshot of the chat-active gate for the admin UI. Surfaces both the
+    counter and how long the oldest active turn has been live so the user
+    can spot a leaked counter (e.g. ``count=1`` for an hour with no chat
+    happening)."""
+    with _activity_lock:
+        count = _chat_active_count
+        started_at = _chat_turn_oldest_started_at
+        last_activity = _last_chat_activity
+    age_s = (time.time() - started_at) if started_at > 0 else 0
+    return {
+        "count": count,
+        "oldest_turn_age_seconds": int(age_s),
+        "stale_threshold_seconds": int(_CHAT_TURN_STALE_S),
+        "is_stale": bool(count > 0 and age_s > _CHAT_TURN_STALE_S),
+        "seconds_since_last_activity": (
+            None if last_activity == 0 else int(time.time() - last_activity)
+        ),
+    }
 
 
 def is_chat_active() -> bool:
-    """True when at least one chat turn is currently streaming."""
+    """True when at least one chat turn is currently streaming.
+
+    Returns False if the counter has been > 0 longer than
+    ``_CHAT_TURN_STALE_S`` — a chat turn legitimately can't last 15 minutes,
+    so a sustained elevated counter means the chat thread crashed without
+    decrementing. Without this guard a single leak would block every
+    background worker forever (the symptom we just hit). The counter is
+    NOT auto-cleared here — operators see the stale state via
+    :func:`chat_active_state` and can call :func:`reset_chat_active`.
+    """
     with _activity_lock:
-        return _chat_active_count > 0
+        if _chat_active_count <= 0:
+            return False
+        if _chat_turn_oldest_started_at <= 0:
+            return True
+        age = time.time() - _chat_turn_oldest_started_at
+        return age <= _CHAT_TURN_STALE_S
 
 
 def yield_to_chat(max_wait_s: float = 60.0, poll_s: float = 1.0) -> bool:
@@ -95,8 +248,17 @@ def yield_to_chat(max_wait_s: float = 60.0, poll_s: float = 1.0) -> bool:
 def seconds_since_chat() -> float:
     with _activity_lock:
         if _chat_active_count > 0:
-            # Treat live chat as zero-elapsed so the gate fires unconditionally.
-            return 0.0
+            # Honour the same staleness check as is_chat_active(): if the
+            # counter is elevated past the legitimate-turn window we treat
+            # the chat as inactive — otherwise the queue worker loop would
+            # also block forever on a leaked counter (it gates on
+            # `seconds_since_chat() < idle_gate`, not on is_chat_active()).
+            if (
+                _chat_turn_oldest_started_at <= 0
+                or (time.time() - _chat_turn_oldest_started_at) <= _CHAT_TURN_STALE_S
+            ):
+                return 0.0
+            # Stale: fall through and return real elapsed since last tick.
         if _last_chat_activity == 0:
             return float("inf")
         return time.time() - _last_chat_activity
@@ -187,6 +349,28 @@ class ToolJob:
     type: str
     status: str = "queued"
     priority: int = 3
+    # Free-form, human-readable progress message. Updated by handlers via
+    # ``report_progress(message, kind=…, step=…, total=…)``. Surfaces in
+    # queue UI so the user can see what each running job is actually doing.
+    progress: str = ""
+    progress_at: str = ""
+    # Structured fields paired with ``progress`` so the UI can draw a real
+    # progress bar instead of parsing the message. ``progress_kind`` is a
+    # short label for the current phase (``plan`` / ``search`` / ``synth``
+    # / ``review`` / ``publish``); ``progress_step`` / ``progress_total``
+    # are positive integers when known, 0 otherwise.
+    progress_kind: str = ""
+    progress_step: int = 0
+    progress_total: int = 0
+    # Free-form tags. Handlers can attach (`["paper", "client_acme"]`)
+    # to enable UI filtering. Survives across retries.
+    tags: list[str] = field(default_factory=list)
+    # Parent linkage for fan-out flows (e.g. research_planner → research_agent
+    # → graph_extract). Lets the UI render a tree and cancel-cascade.
+    parent_job_id: str = ""
+    # Set when the job has been moved to dead-letter after exceeding the
+    # configured failure budget. Reset on manual replay.
+    dead_lettered_at: str = ""
     source: str = ""
     org_id: int = 1
     payload: dict = field(default_factory=dict)
@@ -199,7 +383,12 @@ class ToolJob:
     nocodb_id: int | None = None
 
     def to_row(self) -> dict:
-        return {
+        # Conditionally include the new optional columns. Sending empty
+        # strings for timestamp columns can confuse NocoDB; sending an
+        # empty list/parent_id for unused fields is wasted bandwidth on
+        # every persist. Only emit when set so PATCH semantics leave the
+        # column alone for jobs that don't use these features.
+        row: dict[str, Any] = {
             "job_id": self.job_id,
             "type": self.type,
             "status": self.status,
@@ -214,6 +403,13 @@ class ToolJob:
             "completed_at": self.completed_at,
             "depends_on": self.depends_on,
         }
+        if self.dead_lettered_at:
+            row["dead_lettered_at"] = self.dead_lettered_at
+        if self.parent_job_id:
+            row["parent_job_id"] = self.parent_job_id
+        if self.tags:
+            row["tags"] = json.dumps(self.tags)
+        return row
 
     def _task_summary(self) -> str:
         meta = self.payload.get("metadata") or {}
@@ -248,6 +444,14 @@ class ToolJob:
             "completed_at": self.completed_at,
             "depends_on": self.depends_on,
             "task": self._task_summary() or None,
+            "progress": self.progress or None,
+            "progress_at": self.progress_at or None,
+            "progress_kind": self.progress_kind or None,
+            "progress_step": self.progress_step or None,
+            "progress_total": self.progress_total or None,
+            "tags": self.tags or None,
+            "parent_job_id": self.parent_job_id or None,
+            "dead_lettered_at": self.dead_lettered_at or None,
         }
         conversation_id = meta.get("conversation_id") or self.payload.get("conversation_id")
         url = meta.get("url") or self.payload.get("url") or self.payload.get("seed_url")
@@ -296,7 +500,31 @@ class ToolJob:
             completed_at=row.get("completed_at") or "",
             depends_on=row.get("depends_on") or "",
             nocodb_id=row.get("Id"),
+            progress=row.get("progress") or "",
+            progress_at=row.get("progress_at") or "",
+            progress_kind=row.get("progress_kind") or "",
+            progress_step=int(row.get("progress_step") or 0),
+            progress_total=int(row.get("progress_total") or 0),
+            tags=ToolJob._decode_tags(row.get("tags")),
+            parent_job_id=row.get("parent_job_id") or "",
+            dead_lettered_at=row.get("dead_lettered_at") or "",
         )
+
+    @staticmethod
+    def _decode_tags(raw) -> list[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [str(t) for t in raw if t]
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(t) for t in parsed if t]
+            except Exception:
+                # Fallback: comma-separated.
+                return [t.strip() for t in raw.split(",") if t.strip()]
+        return []
 
 
 class ToolJobQueue:
@@ -311,6 +539,14 @@ class ToolJobQueue:
         self._subscribers: list[list[dict]] = []
         self._sub_lock = threading.Lock()
         self._started_at: float = 0.0
+        # Per-type pause control. Operator can flip via /tool-queue/pause-type
+        # to halt a misbehaving handler kind without stopping everything.
+        self._paused_types: set[str] = set()
+        self._paused_types_lock = threading.Lock()
+        # Per-type rolling median duration for ETA estimates. Cap each list
+        # at 50 most recent durations; cheap to compute median.
+        self._duration_samples: dict[str, list[float]] = {}
+        self._duration_lock = threading.Lock()
 
     def register(self, job_type: str, config: HandlerConfig):
         self._handlers[job_type] = config
@@ -504,7 +740,28 @@ class ToolJobQueue:
             if where_parts:
                 params["where"] = "~and".join(where_parts)
             rows = db._get(NOCODB_TABLE, params=params).get("list", [])
-            return [ToolJob.from_row(r).to_api(verbose=verbose) for r in rows]
+            out: list[dict] = []
+            for r in rows:
+                job = ToolJob.from_row(r)
+                api = job.to_api(verbose=verbose)
+                # Annotate running jobs with an ETA estimate based on the
+                # rolling median duration for that type minus elapsed.
+                # Not present on jobs we have no samples for yet.
+                if job.status == "running" and job.started_at:
+                    median = self.median_duration_for(job.type)
+                    if median is not None:
+                        try:
+                            started = datetime.fromisoformat(job.started_at).timestamp()
+                            elapsed = max(0.0, time.time() - started)
+                            remaining = max(0.0, median - elapsed)
+                            api["median_duration_s"] = round(median, 1)
+                            api["elapsed_s"] = round(elapsed, 1)
+                            api["eta_seconds"] = int(remaining)
+                            api["over_median"] = elapsed > median * 1.5
+                        except Exception:
+                            pass
+                out.append(api)
+            return out
         except Exception:
             return []
 
@@ -529,6 +786,275 @@ class ToolJobQueue:
             return True
         except Exception:
             return False
+
+    def set_priority(self, job_id: str, priority: int) -> bool:
+        """Re-prioritise a queued job. Bounded 1–5."""
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return False
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(job_id,eq,{job_id})~and(status,eq,queued)",
+                "limit": 1,
+            }).get("list", [])
+            if not rows:
+                return False
+            noco_id = rows[0].get("Id")
+            db._patch(NOCODB_TABLE, noco_id, {
+                "Id": noco_id,
+                "priority": max(1, min(5, int(priority))),
+            })
+            ev = self._wake_events.get(rows[0].get("type") or "")
+            if ev:
+                ev.set()
+            return True
+        except Exception:
+            return False
+
+    def update_tags(self, job_id: str, *, add: list[str], remove: list[str]) -> bool:
+        """Add/remove tags on a job. Tags are JSON-encoded in NocoDB."""
+        try:
+            job = self.get_job(job_id)
+            if not job:
+                return False
+            current = set(job.tags or [])
+            for t in add or []:
+                if t:
+                    current.add(str(t))
+            for t in remove or []:
+                current.discard(str(t))
+            if not job.nocodb_id:
+                return False
+            self._db()._patch(NOCODB_TABLE, job.nocodb_id, {
+                "Id": job.nocodb_id,
+                "tags": json.dumps(sorted(current)),
+            })
+            return True
+        except Exception:
+            return False
+
+    def list_children(self, job_id: str, limit: int = 50) -> list["ToolJob"]:
+        """Jobs whose ``parent_job_id`` equals ``job_id``."""
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return []
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(parent_job_id,eq,{job_id})",
+                "limit": limit,
+            }).get("list", [])
+            return [ToolJob.from_row(r) for r in rows]
+        except Exception:
+            return []
+
+    def set_type_paused(self, job_type: str, paused: bool) -> None:
+        """Pause/resume a single job type. Worker poll loops honour this
+        and skip claim while paused; in-flight jobs are unaffected."""
+        with self._paused_types_lock:
+            if paused:
+                self._paused_types.add(job_type)
+            else:
+                self._paused_types.discard(job_type)
+        if not paused:
+            ev = self._wake_events.get(job_type)
+            if ev:
+                ev.set()
+
+    def list_paused_types(self) -> set[str]:
+        with self._paused_types_lock:
+            return set(self._paused_types)
+
+    def is_type_paused(self, job_type: str) -> bool:
+        with self._paused_types_lock:
+            return job_type in self._paused_types
+
+    def median_duration_for(self, job_type: str) -> float | None:
+        """Return the rolling-median completion duration in seconds for a
+        job type, or None if we have no samples yet. Used for ETA badges."""
+        with self._duration_lock:
+            samples = list(self._duration_samples.get(job_type) or [])
+        if not samples:
+            return None
+        samples.sort()
+        n = len(samples)
+        return samples[n // 2] if n % 2 == 1 else 0.5 * (samples[n // 2 - 1] + samples[n // 2])
+
+    def cancel_running(self, job_id: str, reason: str = "user terminated") -> bool:
+        """Cooperative cancel for an already-running job. Marks the row
+        ``status='cancelled'``; the running handler is expected to call
+        :func:`is_cancelled` between phases and abort cleanly when set.
+
+        Long-running LLM calls in flight when this fires keep going to
+        completion (we never kill threads); the abort takes effect at the
+        next phase boundary in the handler.
+        """
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return False
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(job_id,eq,{job_id})~and(status,in,queued,running)",
+                "limit": 1,
+            }).get("list", [])
+            if not rows:
+                return False
+            noco_id = rows[0].get("Id")
+            db._patch(NOCODB_TABLE, noco_id, {
+                "Id": noco_id,
+                "status": "cancelled",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": reason[:500],
+            })
+            # Force the cancellation cache to flip True for this job so any
+            # in-flight handler in the same process sees it on its next
+            # is_cancelled() check (within the 2s TTL window the cached
+            # False would otherwise dominate).
+            try:
+                self._cancel_cache()[job_id] = (time.time(), True)
+            except Exception:
+                pass
+            self._emit_event({"type": "job_cancelled", "job_id": job_id, "reason": reason})
+            _log.info("cancel_running  job=%s reason=%s", job_id, reason)
+            return True
+        except Exception:
+            _log.warning("cancel_running failed  job=%s", job_id, exc_info=True)
+            return False
+
+    # Per-process cache for the cancellation flag. The research agent (and
+    # other long-running handlers) call ``is_cancelled`` from inside tight
+    # loops — every search query, every section. Without a cache that's a
+    # NocoDB GET per iteration, multiplied by N concurrent jobs. A 2-second
+    # TTL is plenty: cancellation is user-initiated and a 2s delay between
+    # click and abort is fine, and cancel_running invalidates the cache
+    # immediately so a self-cancel still trips on the next check.
+    _CANCEL_CACHE_TTL_S = 2.0
+
+    def _cancel_cache(self) -> dict[str, tuple[float, bool]]:
+        # Lazily attached so old in-memory queues survive redeploys.
+        cache = getattr(self, "_cancel_cache_dict", None)
+        if cache is None:
+            cache = {}
+            self._cancel_cache_dict = cache  # type: ignore[attr-defined]
+        return cache
+
+    def is_cancelled(self, job_id: str) -> bool:
+        """Cheap check used by long-running handlers between phases. The
+        handler raises ``JobCancelled`` (or returns early) when this flips
+        True. Cached for ~2 s to avoid a NocoDB GET per loop iteration."""
+        cache = self._cancel_cache()
+        now = time.time()
+        hit = cache.get(job_id)
+        if hit and (now - hit[0]) < self._CANCEL_CACHE_TTL_S:
+            return hit[1]
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                cache[job_id] = (now, False)
+                return False
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(job_id,eq,{job_id})",
+                "limit": 1,
+                "fields": "status",
+            }).get("list", [])
+            cancelled = bool(rows and (rows[0].get("status") == "cancelled"))
+            cache[job_id] = (now, cancelled)
+            return cancelled
+        except Exception:
+            # Never let a transient DB hiccup signal cancellation.
+            return bool(hit and hit[1])
+
+    # Cache job_id → nocodb_id so update_progress doesn't do a GET-then-PATCH
+    # for every progress line; the row's PK doesn't change.
+    def _noco_id_for(self, job_id: str) -> int | None:
+        cache = getattr(self, "_noco_id_cache", None)
+        if cache is None:
+            cache = {}
+            self._noco_id_cache = cache  # type: ignore[attr-defined]
+        if job_id in cache:
+            return cache[job_id]
+        try:
+            db = self._db()
+            if NOCODB_TABLE not in db.tables:
+                return None
+            rows = db._get(NOCODB_TABLE, params={
+                "where": f"(job_id,eq,{job_id})",
+                "limit": 1,
+                "fields": "Id",
+            }).get("list", [])
+            if rows:
+                noco_id = int(rows[0].get("Id") or 0) or None
+                if noco_id:
+                    cache[job_id] = noco_id
+                return noco_id
+        except Exception:
+            pass
+        return None
+
+    # Per-job throttle on PATCH writes. The SSE event always fires (cheap),
+    # but two PATCHes within a 1.5s window collapse: handlers calling
+    # report_progress in tight loops won't hammer NocoDB. The final
+    # progress message in a burst is the one persisted (skipped writes
+    # happen during the burst; the next call after the window flushes).
+    _PROGRESS_THROTTLE_S = 1.5
+
+    def _last_progress_at(self) -> dict[str, float]:
+        cache = getattr(self, "_progress_throttle_cache", None)
+        if cache is None:
+            cache = {}
+            self._progress_throttle_cache = cache  # type: ignore[attr-defined]
+        return cache
+
+    def update_progress(
+        self,
+        job_id: str,
+        message: str,
+        *,
+        kind: str = "",
+        step: int = 0,
+        total: int = 0,
+    ) -> None:
+        """Stamp a human-readable progress message on the running job row.
+
+        Optional structured fields (``kind`` / ``step`` / ``total``) let the
+        UI render a real progress bar instead of parsing the text. Best-
+        effort write; SSE event always emits regardless of DB success.
+        The PATCH is single-call (cached PK lookup) and throttled per-job
+        so tight loops don't multiply database traffic.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        # Per-job PATCH throttle — emit SSE always, write to DB ≤ 1× per window.
+        throttle = self._last_progress_at()
+        now = time.time()
+        last = throttle.get(job_id, 0.0)
+        skip_db = (now - last) < self._PROGRESS_THROTTLE_S
+        if not skip_db:
+            throttle[job_id] = now
+        noco_id = self._noco_id_for(job_id) if not skip_db else None
+        patch: dict[str, Any] = {
+            "progress": message[:500],
+            "progress_at": ts,
+        }
+        if kind:
+            patch["progress_kind"] = kind[:60]
+        if step:
+            patch["progress_step"] = int(step)
+        if total:
+            patch["progress_total"] = int(total)
+        if noco_id is not None:
+            try:
+                self._db()._patch(NOCODB_TABLE, noco_id, {"Id": noco_id, **patch})
+            except Exception:
+                _log.debug("update_progress: nocodb patch failed  job=%s", job_id, exc_info=True)
+        # SSE event regardless of DB success — keeps the UI live.
+        self._emit_event({
+            "type": "job_progress",
+            "job_id": job_id,
+            "message": message[:500],
+            "kind": kind or None,
+            "step": int(step) if step else None,
+            "total": int(total) if total else None,
+            "ts": ts,
+        })
 
     def subscribe(self) -> collections.deque:
         buf: collections.deque = collections.deque()
@@ -559,6 +1085,11 @@ class ToolJobQueue:
 
             if self._stop.is_set():
                 break
+
+            # Per-type pause: operator wants this handler kind dormant.
+            # Skip claim entirely; in-flight jobs of this type continue.
+            if self.is_type_paused(job_type):
+                continue
 
             queued_head = self._peek_next_queued(job_type)
             head_bypass = bool(queued_head and _bypass_idle(queued_head))
@@ -721,8 +1252,20 @@ class ToolJobQueue:
                     _identity, sorted((job.payload or {}).keys()),
                 )
                 handler_t0 = time.time()
-                with model_usage_scope(org_id=job.org_id, source=f"tool_queue:{job.type}"):
-                    result = config.handler(job.payload)
+                # Set the contextvar so handlers can emit progress and
+                # check cancellation via report_progress() / is_job_cancelled()
+                # without having to thread the job_id through every call.
+                _job_token = _current_job_id.set(job.job_id)
+                try:
+                    with model_usage_scope(org_id=job.org_id, source=f"tool_queue:{job.type}"):
+                        result = config.handler(job.payload)
+                except JobCancelled as cancel_exc:
+                    result = {
+                        "status": "cancelled",
+                        "reason": str(cancel_exc) or "cancelled cooperatively",
+                    }
+                finally:
+                    _current_job_id.reset(_job_token)
                 handler_elapsed = round(time.time() - handler_t0, 1)
                 _log.info(
                     "queue %s: HANDLER RETURN  job=%s  type=%s  %.1fs  result_status=%s",
@@ -743,6 +1286,14 @@ class ToolJobQueue:
                     result = coerced
 
                 status_val = str(result.get("status") or "").lower()
+                if status_val == "cancelled":
+                    # Cooperative cancel: don't retry, don't mark failed —
+                    # the operator chose to stop this work. Persist as
+                    # cancelled with the supplied reason for visibility.
+                    job.status = "cancelled"
+                    job.result = result
+                    job.error = str(result.get("reason") or "cancelled")[:500]
+                    break
                 if status_val in {"failed", "error"}:
                     last_result = result
                     job.error = str(last_result.get("reason") or last_result.get("error") or status_val)[:500]
@@ -757,6 +1308,7 @@ class ToolJobQueue:
                         continue
                     job.status = "failed"
                     job.result = last_result
+                    job.dead_lettered_at = datetime.now(timezone.utc).isoformat()
                 else:
                     job.status = "completed"
                     job.result = result
@@ -773,6 +1325,7 @@ class ToolJobQueue:
                         break
                     continue
                 job.status = "failed"
+                job.dead_lettered_at = datetime.now(timezone.utc).isoformat()
             except BaseException as be:
                 # SystemExit / KeyboardInterrupt / GeneratorExit must not leave
                 # the row stuck at status=running. Mark failed, persist, then
@@ -792,7 +1345,7 @@ class ToolJobQueue:
                     pass
                 raise
 
-        if job.status not in {"completed", "failed"}:
+        if job.status not in {"completed", "failed", "cancelled"}:
             job.status = "failed"
         if not isinstance(job.result, dict):
             job.result = {}
@@ -803,11 +1356,26 @@ class ToolJobQueue:
         if job.status == "completed":
             _log.info("queue %s: COMPLETED  job=%s  type=%s  %.1fs attempts=%d",
                       worker_id, job.job_id[:12], job.type, elapsed, attempts)
+            # Sample duration for ETA estimates. Cap at 50 most recent.
+            with self._duration_lock:
+                samples = self._duration_samples.setdefault(job.type, [])
+                samples.append(float(elapsed))
+                if len(samples) > 50:
+                    del samples[: len(samples) - 50]
             self._emit_event({
                 "type": "job_completed",
                 "job_id": job.job_id,
                 "job_type": job.type,
                 "duration_s": elapsed,
+            })
+        elif job.status == "cancelled":
+            _log.warning("queue %s: CANCELLED  job=%s  type=%s  reason=%s  %.1fs",
+                         worker_id, job.job_id[:12], job.type, job.error, elapsed)
+            self._emit_event({
+                "type": "job_cancelled",
+                "job_id": job.job_id,
+                "job_type": job.type,
+                "reason": job.error[:200],
             })
         else:
             _log.error("queue %s: FAILED  job=%s  type=%s  error=%s  %.1fs attempts=%d",
@@ -873,6 +1441,14 @@ class ToolJobQueue:
                 research_agent_dynamic_mult = 8
                 research_planner_dynamic_mult = 4
 
+            # Per-type stale-timeout overrides from config — operators can
+            # extend a single type's window without code changes.
+            try:
+                from infra.config import get_feature
+                per_type_timeouts = get_feature("tool_queue", "stale_timeouts", {}) or {}
+            except Exception:
+                per_type_timeouts = {}
+
             rows = db._get_paginated(NOCODB_TABLE, params={
                 "where": "(status,eq,running)",
                 "limit": 100,
@@ -887,9 +1463,21 @@ class ToolJobQueue:
                     started_ts = datetime.fromisoformat(started).timestamp()
                 except Exception:
                     continue
-                # Jobs with multiple LLM calls + web scraping need longer stale windows
-                # than the 300s default, or they'll be reset mid-flight while the handler
-                # is still working.
+                # Heartbeat-aware staleness: a handler that stamped a
+                # progress message in the last few minutes is clearly making
+                # progress; the previous logic would reset it just because
+                # `started_at` was old. Prefer the latest of (started_at,
+                # progress_at) so long-running handlers (research_agent,
+                # harvest_run, etc.) only get reset when they truly stall.
+                progress_ts = 0.0
+                progress_at_raw = row.get("progress_at") or ""
+                if progress_at_raw:
+                    try:
+                        progress_ts = datetime.fromisoformat(progress_at_raw).timestamp()
+                    except Exception:
+                        progress_ts = 0.0
+                last_activity_ts = max(started_ts, progress_ts)
+
                 job_type = row.get("type") or ""
                 _STALE_MULTIPLIERS = {
                     "graph_extract": 4,               # 20m — LLM inference 7-16min
@@ -914,8 +1502,16 @@ class ToolJobQueue:
                     "discover_agent_run": 3,          # 15m — Chroma sample + LLM + SearXNG queries
                     "simulation_run": 6,              # 30m — N persona turns + debrief LLM
                 }
-                timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
-                if now - started_ts > timeout:
+                # Per-type config override wins over the multiplier table.
+                cfg_timeout = per_type_timeouts.get(job_type) if isinstance(per_type_timeouts, dict) else None
+                if isinstance(cfg_timeout, (int, float)) and cfg_timeout > 0:
+                    timeout = float(cfg_timeout)
+                else:
+                    timeout = JOB_QUEUE_STALE_TIMEOUT * _STALE_MULTIPLIERS.get(job_type, 1)
+                # Heartbeat-aware: stale window measured from latest activity
+                # (progress_at if newer than started_at), not just claim time.
+                stuck_for = now - last_activity_ts
+                if stuck_for > timeout:
                     noco_id = row.get("Id")
                     db._patch(NOCODB_TABLE, noco_id, {
                         "Id": noco_id,
@@ -925,9 +1521,10 @@ class ToolJobQueue:
                     })
                     if job_type:
                         reset_types.add(job_type)
-                    _log.warning("reset stale job %s (type=%s, stuck %.0fs, timeout=%.0fs)",
-                                 row.get("job_id"), row.get("type"),
-                                 now - started_ts, timeout)
+                    _log.warning(
+                        "reset stale job %s (type=%s, stuck %.0fs since last activity, timeout=%.0fs)",
+                        row.get("job_id"), row.get("type"), stuck_for, timeout,
+                    )
             for jt in reset_types:
                 ev = self._wake_events.get(jt)
                 if ev:

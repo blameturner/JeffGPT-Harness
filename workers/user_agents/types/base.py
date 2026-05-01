@@ -84,6 +84,13 @@ def call_model(ctx: RunContext, messages: list[dict]) -> tuple[str, dict]:
         "max_tokens": agent.get("max_tokens", 1500),
     }
     t0 = time.time()
+    # Pause background user-agent calls while a chat turn is live. Chat path
+    # has _user_priority_ctx set and skips immediately.
+    try:
+        from shared.model_pool import _block_while_chat_active
+        _block_while_chat_active("user_agent_base")
+    except Exception:
+        pass
     r = requests.post(f"{url}/v1/chat/completions", json=body, timeout=600)
     r.raise_for_status()
     data = r.json()

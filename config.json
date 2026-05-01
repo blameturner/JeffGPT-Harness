@@ -20,6 +20,19 @@
         "code": { "role": "t2_coder" }
       }
     },
+    "code_v2": {
+      "enabled": true,
+      "glossary_top_n": 12,
+      "models": {
+        "code_review":       { "role": "t2_coder", "temperature": 0.2, "max_tokens": 1500, "max_input_chars": 12000 },
+        "file_summary":      { "role": "t3_tool",  "temperature": 0.2, "max_tokens": 220,  "max_input_chars": 8000 },
+        "readme_maintain":   { "role": "t3_tool",  "temperature": 0.2, "max_tokens": 800,  "max_input_chars": 8000 },
+        "faq_maintain":      { "role": "t3_tool",  "temperature": 0.2, "max_tokens": 800,  "max_input_chars": 6000 },
+        "smart_paste":       { "role": "t3_tool",  "temperature": 0.0, "max_tokens": 200,  "max_input_chars": 4000 },
+        "playbook_generate": { "role": "t2_coder", "temperature": 0.2, "max_tokens": 1200, "max_input_chars": 4000 },
+        "spec_regen":        { "role": "t2_coder", "temperature": 0.2, "max_tokens": 2000, "max_input_chars": 8000 }
+      }
+    },
     "web_search": {
       "enabled": true,
       "standard_query_count_min": 2,

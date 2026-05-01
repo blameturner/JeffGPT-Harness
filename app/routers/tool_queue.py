@@ -105,6 +105,15 @@ def runtime_status(request: Request):
     }
 
 
+# Per-(org_id, limit) TTL cache for the heavy dashboard endpoint. The
+# Console polls this from multiple panels every 4 seconds; without the
+# cache simultaneous polls all hit NocoDB. 1.5 s feels live and collapses
+# bursts to one read.
+_DASHBOARD_CACHE_TTL_S = 1.5
+_dashboard_cache: dict[tuple, tuple[float, dict]] = {}
+_dashboard_cache_lock = threading.Lock()
+
+
 @router.get("/dashboard")
 def dashboard(
     request: Request,
@@ -113,9 +122,16 @@ def dashboard(
 ):
     q = _get_queue(request)
     limit = min(max(1, limit), 100)
+    cache_key = (org_id if org_id is not None else 0, limit)
+    now = time.time()
+    with _dashboard_cache_lock:
+        hit = _dashboard_cache.get(cache_key)
+        if hit and (now - hit[0]) < _DASHBOARD_CACHE_TTL_S:
+            return hit[1]
+
     recent_jobs = q.list_jobs(limit=limit, org_id=org_id, verbose=True)
     active_jobs = [j for j in recent_jobs if j["status"] in ("queued", "running")]
-    return {
+    payload = {
         "queue": q.status(),
         "runtime": {
             "tool_queue_ready": True,
@@ -130,6 +146,13 @@ def dashboard(
             "org_id": org_id,
         },
     }
+    with _dashboard_cache_lock:
+        _dashboard_cache[cache_key] = (now, payload)
+        if len(_dashboard_cache) > 16:
+            oldest = sorted(_dashboard_cache.items(), key=lambda kv: kv[1][0])[:4]
+            for k, _ in oldest:
+                _dashboard_cache.pop(k, None)
+    return payload
 
 
 @router.get("/jobs")
@@ -295,6 +318,221 @@ def cancel_job(job_id: str, request: Request):
     if not ok:
         raise HTTPException(status_code=404, detail="Job not found or not cancellable")
     return {"cancelled": True}
+
+
+class BulkAction(BaseModel):
+    job_ids: list[str]
+    action: str  # "cancel" | "retry" | "set_priority" | "tag" | "untag"
+    priority: int | None = None
+    tags: list[str] | None = None
+    reason: str | None = None
+
+
+@router.post("/bulk")
+def bulk_action(body: BulkAction, request: Request):
+    """Apply ``action`` to every ``job_id`` in one call. Returns per-id
+    outcome so the UI can show partial-success cleanly."""
+    q = _get_queue(request)
+    out: list[dict] = []
+    action = (body.action or "").strip().lower()
+    if action not in {"cancel", "retry", "set_priority", "tag", "untag"}:
+        raise HTTPException(status_code=400, detail=f"unknown action: {body.action}")
+    for jid in body.job_ids:
+        try:
+            if action == "cancel":
+                # cancel_running covers both queued and running
+                ok = q.cancel_running(jid, reason=body.reason or "bulk cancel")
+                out.append({"job_id": jid, "ok": ok})
+            elif action == "retry":
+                job = q.get_job(jid)
+                if not job:
+                    out.append({"job_id": jid, "ok": False, "error": "not found"})
+                    continue
+                if job.status in {"queued", "running"}:
+                    out.append({"job_id": jid, "ok": False, "error": f"job is {job.status}"})
+                    continue
+                new_id = q.submit(
+                    job.type, dict(job.payload or {}),
+                    source=f"{job.source or job.type}_bulkretry",
+                    org_id=job.org_id, priority=job.priority,
+                    depends_on=job.depends_on,
+                )
+                out.append({"job_id": jid, "ok": True, "new_job_id": new_id})
+            elif action == "set_priority":
+                if body.priority is None:
+                    out.append({"job_id": jid, "ok": False, "error": "priority required"})
+                    continue
+                ok = q.set_priority(jid, int(body.priority))
+                out.append({"job_id": jid, "ok": ok})
+            elif action == "tag" or action == "untag":
+                ok = q.update_tags(jid, add=body.tags or [] if action == "tag" else [],
+                                   remove=body.tags or [] if action == "untag" else [])
+                out.append({"job_id": jid, "ok": ok})
+        except Exception as e:
+            out.append({"job_id": jid, "ok": False, "error": str(e)[:200]})
+    return {"results": out}
+
+
+class ClearQueueRequest(BaseModel):
+    # Empty body = "clear queued only". Set to True to also cooperatively
+    # cancel everything currently running.
+    include_running: bool = False
+    job_type: str | None = None  # narrow to one type
+    org_id: int | None = None
+    reason: str = "queue cleared from console"
+
+
+@router.post("/clear")
+def clear_queue(body: ClearQueueRequest, request: Request):
+    """Clear queued jobs (and optionally running). Used as the queue's
+    "stop / clear all" button. Running jobs are cancelled cooperatively —
+    in-flight LLM calls finish, but no new phase work begins.
+    Returns counts so the UI can confirm what was cleared."""
+    q = _get_queue(request)
+    cancelled_queued = 0
+    cancelled_running = 0
+    statuses = ["queued"]
+    if body.include_running:
+        statuses.append("running")
+    for status in statuses:
+        try:
+            jobs = q.list_jobs(
+                job_type=body.job_type or "",
+                status=status,
+                limit=500,
+                org_id=body.org_id,
+            )
+        except Exception:
+            jobs = []
+        for j in jobs:
+            try:
+                if status == "queued":
+                    if q.cancel(j["job_id"]):
+                        cancelled_queued += 1
+                else:
+                    if q.cancel_running(j["job_id"], reason=body.reason):
+                        cancelled_running += 1
+            except Exception:
+                continue
+    return {
+        "cancelled_queued": cancelled_queued,
+        "cancelled_running": cancelled_running,
+        "scope": {"job_type": body.job_type, "org_id": body.org_id},
+    }
+
+
+class StopAllRequest(BaseModel):
+    pause: bool = True
+
+
+@router.post("/stop-all")
+def stop_all(body: StopAllRequest, request: Request):
+    """Pause every registered job type at once. Workers stop claiming new
+    jobs; in-flight work continues. Pair with ``/clear`` to also cancel
+    running jobs. Set ``pause=False`` to resume everything."""
+    q = _get_queue(request)
+    types = list(q._handlers.keys())
+    for t in types:
+        q.set_type_paused(t, bool(body.pause))
+    return {
+        "paused" if body.pause else "resumed": types,
+        "count": len(types),
+    }
+
+
+class TypePauseRequest(BaseModel):
+    job_type: str
+    paused: bool
+
+
+@router.post("/pause-type")
+def pause_type(body: TypePauseRequest, request: Request):
+    """Pause or resume a single job type. Workers for that type sleep in
+    their poll loop until resumed; in-flight jobs continue to completion.
+    Useful when one job kind is misbehaving without stopping everything."""
+    q = _get_queue(request)
+    q.set_type_paused(body.job_type, body.paused)
+    return {"job_type": body.job_type, "paused": body.paused}
+
+
+@router.get("/paused-types")
+def paused_types(request: Request):
+    q = _get_queue(request)
+    return {"paused": sorted(q.list_paused_types())}
+
+
+@router.get("/dag/{job_id}")
+def dag(job_id: str, request: Request, depth: int = 3):
+    """Return the dependency / parent-child neighbourhood of a job up to
+    ``depth`` hops in either direction. Powers the DAG drawer in the UI."""
+    q = _get_queue(request)
+    visited: set[str] = set()
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    def _add(jid: str, hops: int):
+        if not jid or jid in visited or hops < 0:
+            return
+        visited.add(jid)
+        job = q.get_job(jid)
+        if not job:
+            return
+        nodes[jid] = job.to_api(verbose=False)
+        if job.depends_on:
+            edges.append({"from": job.depends_on, "to": jid, "kind": "depends_on"})
+            _add(job.depends_on, hops - 1)
+        if job.parent_job_id:
+            edges.append({"from": job.parent_job_id, "to": jid, "kind": "parent"})
+            _add(job.parent_job_id, hops - 1)
+        # children (jobs whose parent_job_id == jid)
+        try:
+            for child in q.list_children(jid):
+                edges.append({"from": jid, "to": child.job_id, "kind": "child"})
+                _add(child.job_id, hops - 1)
+        except Exception:
+            pass
+
+    _add(job_id, max(1, min(int(depth), 5)))
+    return {"root": job_id, "nodes": list(nodes.values()), "edges": edges}
+
+
+@router.post("/jobs/{job_id}/replay")
+def replay_with_edits(job_id: str, request: Request, body: dict):
+    """Clone a completed/failed job into a new submission with optional
+    payload overrides. Useful for re-running research with a tweaked
+    topic or query list without losing the original record.
+    Body shape: ``{payload_overrides: {...}, priority?: int, tags?: [..]}``.
+    """
+    q = _get_queue(request)
+    job = q.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status in {"queued", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is {job.status} — cancel it first if you want to replay",
+        )
+    new_payload = dict(job.payload or {})
+    overrides = body.get("payload_overrides") if isinstance(body, dict) else None
+    if isinstance(overrides, dict):
+        new_payload.update(overrides)
+    try:
+        new_id = q.submit(
+            job.type, new_payload,
+            source=f"{job.source or job.type}_replay",
+            org_id=job.org_id,
+            priority=int(body.get("priority") or job.priority),
+            depends_on=job.depends_on,
+        )
+        # Tag the replay so the UI can show ancestry.
+        if body.get("tags"):
+            try:
+                q.update_tags(new_id, add=list(body.get("tags") or []), remove=[])
+            except Exception:
+                pass
+        return {"status": "queued", "previous_job_id": job_id, "job_id": new_id, "type": job.type}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"replay failed: {e}")
 
 
 def _event_stream(queue, disconnect: threading.Event):
