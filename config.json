@@ -283,11 +283,14 @@
     },
     "tool_queue": {
       "background_chat_idle_seconds": 1800,
+      "strict_background_gating": true,
+      "allow_force_bypass_idle": false,
+      "chat_turn_stale_seconds": 21600,
       "default_max_attempts": 3,
       "default_retry_backoff_seconds": 5,
       "queue_jumpers": {
-        "research_planner": true,
-        "research_agent": true,
+        "research_planner": false,
+        "research_agent": false,
         "summarise_page": false,
         "graph_extract": false,
         "scrape_page": false,

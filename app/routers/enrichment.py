@@ -205,7 +205,7 @@ def discovery_suggestions_list(org_id: int, status: str | None = "pending", limi
 @router.post("/discovery/suggestions/{suggested_id}/approve")
 def discovery_suggestion_approve(suggested_id: int, org_id: int):
     """User approves a suggested URL. Mark status=approved and enqueue
-    pathfinder_extract immediately (bypass idle gate — this is user-initiated)."""
+    pathfinder_extract for background processing."""
     client = NocodbClient()
     row = _get_single_row(client, NOCODB_TABLE_SUGGESTED_SCRAPE_TARGETS, suggested_id, org_id=org_id)
     if not row:
@@ -232,7 +232,7 @@ def discovery_suggestion_approve(suggested_id: int, org_id: int):
 
     job_id = tq.submit(
         "pathfinder_extract",
-        {"suggested_id": suggested_id, "org_id": org_id, "bypass_idle": True},
+        {"suggested_id": suggested_id, "org_id": org_id},
         source="discovery_suggestions_api",
         priority=3,
         org_id=org_id,
@@ -410,7 +410,7 @@ def pathfinder_discover(req: PathfinderRequest):
 
     job_id = tq.submit(
         "pathfinder_extract",
-        {"suggested_id": suggested_id, "org_id": req.org_id, "bypass_idle": True},
+        {"suggested_id": suggested_id, "org_id": req.org_id},
         source="pathfinder_api",
         priority=3,
         org_id=req.org_id,
@@ -443,7 +443,7 @@ def scrape_target_run_now(target_id: int, org_id: int):
 
     job_id = tq.submit(
         "scrape_page",
-        {"target_id": target_id, "org_id": org_id, "bypass_idle": True},
+        {"target_id": target_id, "org_id": org_id},
         source="scrape_target_api",
         priority=3,
         org_id=org_id,

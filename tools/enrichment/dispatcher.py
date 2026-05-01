@@ -14,6 +14,20 @@ from tools._org import count_inflight as _count_inflight, default_org_id as _def
 _log = logging.getLogger("enrichment.dispatcher")
 
 
+def _background_dispatch_allowed(tq) -> tuple[bool, str]:
+    try:
+        st = tq.status() if tq is not None else {}
+    except Exception:
+        st = {}
+    backoff = st.get("backoff") if isinstance(st, dict) else None
+    if not isinstance(backoff, dict):
+        return True, "unknown"
+    state = str(backoff.get("state") or "")
+    if state == "clear":
+        return True, state
+    return False, state or "waiting"
+
+
 def jumpstart_scraper(org_id: int | None = None) -> dict:
     """Enqueue one `scrape_page` job for the oldest due scrape_target."""
     if not is_feature_enabled("scraper"):
@@ -25,6 +39,9 @@ def jumpstart_scraper(org_id: int | None = None) -> dict:
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
+    allowed, reason = _background_dispatch_allowed(tq)
+    if not allowed:
+        return {"status": "gated", "reason": reason}
 
     client = NocodbClient()
     inflight = _count_inflight(client, "scrape_page")
@@ -82,6 +99,9 @@ def jumpstart_pathfinder(org_id: int | None = None) -> dict:
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
+    allowed, reason = _background_dispatch_allowed(tq)
+    if not allowed:
+        return {"status": "gated", "reason": reason}
 
     client = NocodbClient()
     inflight = _count_inflight(client, "pathfinder_extract")
@@ -127,6 +147,9 @@ def jumpstart_discover_agent(org_id: int | None = None) -> dict:
     tq = get_tool_queue()
     if not tq:
         return {"status": "no_queue"}
+    allowed, reason = _background_dispatch_allowed(tq)
+    if not allowed:
+        return {"status": "gated", "reason": reason}
 
     client = NocodbClient()
     inflight = _count_inflight(client, "discover_agent_run")

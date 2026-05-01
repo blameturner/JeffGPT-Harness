@@ -475,7 +475,7 @@ def patch_config_section(section: str, body: ConfigPatch):
 class TriggerRequest(BaseModel):
     payload: dict = {}
     org_id: int | None = None
-    bypass_idle: bool = True
+    bypass_idle: bool = False
     priority: int | None = None
 
 
@@ -511,7 +511,7 @@ def trigger_subsystem(subsystem_id: str, body: TriggerRequest | None = None):
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
     if body.bypass_idle:
-        payload["bypass_idle"] = True
+        payload["force_bypass_idle"] = True
     payload.setdefault("org_id", org_id)
 
     try:

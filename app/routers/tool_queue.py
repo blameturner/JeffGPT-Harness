@@ -249,7 +249,8 @@ def update_priority(job_id: str, body: PriorityUpdate, request: Request):
 @router.post("/jobs/{job_id}/run-now")
 def run_job_now(job_id: str, request: Request):
     """Force a queued job to run immediately: bumps priority to 1, flips
-    ``bypass_idle`` on the payload so chat-idle backoff doesn't hold it,
+    ``force_bypass_idle`` on the payload so chat-idle backoff can be bypassed
+    only when strict override is explicitly enabled,
     and wakes the worker thread for its type.
 
     Idempotent-ish: re-pressing on a job that's still queued just refreshes
@@ -268,7 +269,7 @@ def run_job_now(job_id: str, request: Request):
     try:
         db = q._db()
         payload = dict(job.payload or {})
-        payload["bypass_idle"] = True
+        payload["force_bypass_idle"] = True
         patch: dict = {
             "Id": job.nocodb_id,
             "priority": 1,
@@ -286,7 +287,7 @@ def run_job_now(job_id: str, request: Request):
             "job_id": job_id,
             "type": job.type,
             "priority": 1,
-            "bypass_idle": True,
+            "force_bypass_idle": True,
         }
     except Exception as e:
         _log.warning("run_job_now failed  job=%s", job_id, exc_info=True)

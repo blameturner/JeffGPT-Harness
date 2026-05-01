@@ -16,6 +16,26 @@ _scheduler: BackgroundScheduler | None = None
 AGENT_JOB_PREFIX = "agent_schedule_"
 
 
+def _background_allowed_now() -> tuple[bool, str, int]:
+    """Shared idle/backoff gate for scheduler-driven background producers."""
+    try:
+        from workers.tool_queue import is_chat_active, seconds_since_chat
+        from infra.config import get_feature
+        gate = float(get_feature("tool_queue", "background_chat_idle_seconds", 1800) or 1800)
+        if is_chat_active():
+            return False, "chat_active", int(gate)
+        idle = seconds_since_chat()
+        if idle == float("inf"):
+            return True, "clear", 0
+        remaining = int(max(0.0, gate - max(0.0, float(idle))))
+        if remaining > 0:
+            return False, "waiting_for_idle", remaining
+        return True, "clear", 0
+    except Exception:
+        # Fail-open for scheduler stability if gate probes are unavailable.
+        return True, "probe_error", 0
+
+
 def _fetch_agent_schedules() -> list[dict]:
     _log.debug("fetching agent_schedules from nocodb")
     try:
@@ -33,6 +53,14 @@ def _fetch_agent_schedules() -> list[dict]:
 
 
 def _run_agent_job(agent_name: str, org_id: int, task: str, product: str) -> None:
+    allowed, reason, remaining = _background_allowed_now()
+    if not allowed:
+        _log.info(
+            "scheduled agent gated  agent=%s org=%d reason=%s remaining=%ds",
+            agent_name, org_id, reason, remaining,
+        )
+        return
+
     def _call() -> None:
         _log.info("scheduled agent firing  agent=%s org=%d", agent_name, org_id)
         try:
@@ -176,6 +204,10 @@ def _pa_tick() -> None:
     """Periodic tick: enumerates orgs with a home conversation and calls
     ``run_pa_for_org`` for each. Failures are swallowed."""
     try:
+        allowed, reason, remaining = _background_allowed_now()
+        if not allowed:
+            _log.info("pa tick gated  reason=%s remaining=%ds", reason, remaining)
+            return
         from infra.config import is_feature_enabled
         if not is_feature_enabled("pa"):
             return
@@ -232,6 +264,10 @@ def _enumerate_home_orgs() -> list[int]:
 def _anchored_asks_tick() -> None:
     """5 min before each daily_brief slot; deterministic question producer."""
     try:
+        allowed, reason, remaining = _background_allowed_now()
+        if not allowed:
+            _log.info("anchored_asks tick gated  reason=%s remaining=%ds", reason, remaining)
+            return
         from infra.config import is_feature_enabled, get_feature
         if not is_feature_enabled("pa") or not get_feature("anchored_asks", "enabled", True):
             return
@@ -250,6 +286,10 @@ def _anchored_asks_tick() -> None:
 def _daily_brief_tick() -> None:
     """Long-form briefing producer. Picks a mode variant from time_context."""
     try:
+        allowed, reason, remaining = _background_allowed_now()
+        if not allowed:
+            _log.info("daily_brief tick gated  reason=%s remaining=%ds", reason, remaining)
+            return
         from infra.config import is_feature_enabled, get_feature
         if not is_feature_enabled("pa") or not get_feature("daily_brief", "enabled", True):
             return
@@ -268,6 +308,10 @@ def _daily_brief_tick() -> None:
 def _research_seeder_tick() -> None:
     """Nightly research kickoff. Seeds 1–2 plans for the morning brief."""
     try:
+        allowed, reason, remaining = _background_allowed_now()
+        if not allowed:
+            _log.info("research_seeder tick gated  reason=%s remaining=%ds", reason, remaining)
+            return
         from infra.config import is_feature_enabled, get_feature
         if not is_feature_enabled("pa") or not get_feature("research_seeder", "enabled", True):
             return

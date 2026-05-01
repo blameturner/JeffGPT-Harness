@@ -34,6 +34,7 @@ _last_chat_activity: float = 0.0
 _chat_active_count: int = 0  # number of currently-streaming chat turns
 _chat_turn_oldest_started_at: float = 0.0  # wall-clock of the OLDEST active turn
 _activity_lock = threading.Lock()
+_last_quiesce_at: float = 0.0
 
 # ContextVar set by the worker around each handler call. Lets handlers (and
 # anything they call) emit progress + check cancellation without needing
@@ -124,12 +125,36 @@ class JobCancelled(Exception):
     turned into a ``status='cancelled'`` outcome."""
     pass
 
-# A "chat turn" should never legitimately be active for longer than this.
-# If the counter is still elevated past this window, we assume the counter
-# leaked (chat thread crashed without decrementing) and treat the chat as
-# inactive — otherwise every background Huey worker is blocked forever at
-# _block_while_chat_active.
-_CHAT_TURN_STALE_S = 900.0   # 15 minutes
+# A stale threshold is still surfaced for operator diagnostics, but strict
+# mode no longer auto-opens the gate on staleness. Use /admin/chat-active/reset
+# if a counter leaks.
+_DEFAULT_CHAT_TURN_STALE_S = 21600.0  # 6 hours
+
+
+def _chat_turn_stale_s() -> float:
+    try:
+        from infra.config import get_feature
+        raw = get_feature("tool_queue", "chat_turn_stale_seconds", _DEFAULT_CHAT_TURN_STALE_S)
+        val = float(raw)
+        return val if val > 0 else _DEFAULT_CHAT_TURN_STALE_S
+    except Exception:
+        return _DEFAULT_CHAT_TURN_STALE_S
+
+
+def _strict_background_gating() -> bool:
+    try:
+        from infra.config import get_feature
+        return bool(get_feature("tool_queue", "strict_background_gating", True))
+    except Exception:
+        return True
+
+
+def _allow_force_bypass_idle() -> bool:
+    try:
+        from infra.config import get_feature
+        return bool(get_feature("tool_queue", "allow_force_bypass_idle", False))
+    except Exception:
+        return False
 
 
 def touch_chat_activity():
@@ -150,11 +175,51 @@ def begin_chat_turn() -> None:
 
     Pair every ``begin_chat_turn`` with exactly one ``end_chat_turn``."""
     global _chat_active_count, _last_chat_activity, _chat_turn_oldest_started_at
+    should_quiesce = False
     with _activity_lock:
         if _chat_active_count == 0:
             _chat_turn_oldest_started_at = time.time()
+            should_quiesce = True
         _chat_active_count += 1
         _last_chat_activity = time.time()
+    if should_quiesce and _strict_background_gating():
+        _request_background_quiesce("chat turn started")
+
+
+def _request_background_quiesce(reason: str) -> None:
+    """Best-effort cooperative cancellation of running background jobs.
+
+    Enforced only in strict mode and rate-limited to avoid churn on rapid
+    chat turn transitions.
+    """
+    global _last_quiesce_at
+    now = time.time()
+    with _activity_lock:
+        if (now - _last_quiesce_at) < 5.0:
+            return
+        _last_quiesce_at = now
+    q = get_tool_queue()
+    if q is None:
+        return
+    cancelled = 0
+    try:
+        running = q.list_jobs(status="running", limit=500, verbose=True)
+    except Exception:
+        running = []
+    for row in running:
+        source = str(row.get("source") or "")
+        if _is_interactive_source(source):
+            continue
+        jid = row.get("job_id")
+        if not jid:
+            continue
+        try:
+            if q.cancel_running(jid, reason=reason):
+                cancelled += 1
+        except Exception:
+            continue
+    if cancelled:
+        _log.warning("chat quiesce requested  reason=%s cancelled=%d", reason, cancelled)
 
 
 def end_chat_turn() -> None:
@@ -199,8 +264,8 @@ def chat_active_state() -> dict:
     return {
         "count": count,
         "oldest_turn_age_seconds": int(age_s),
-        "stale_threshold_seconds": int(_CHAT_TURN_STALE_S),
-        "is_stale": bool(count > 0 and age_s > _CHAT_TURN_STALE_S),
+        "stale_threshold_seconds": int(_chat_turn_stale_s()),
+        "is_stale": bool(count > 0 and age_s > _chat_turn_stale_s()),
         "seconds_since_last_activity": (
             None if last_activity == 0 else int(time.time() - last_activity)
         ),
@@ -210,21 +275,11 @@ def chat_active_state() -> dict:
 def is_chat_active() -> bool:
     """True when at least one chat turn is currently streaming.
 
-    Returns False if the counter has been > 0 longer than
-    ``_CHAT_TURN_STALE_S`` — a chat turn legitimately can't last 15 minutes,
-    so a sustained elevated counter means the chat thread crashed without
-    decrementing. Without this guard a single leak would block every
-    background worker forever (the symptom we just hit). The counter is
-    NOT auto-cleared here — operators see the stale state via
-    :func:`chat_active_state` and can call :func:`reset_chat_active`.
+    Strict gating: any positive active-turn count keeps chat active until
+    explicitly ended or reset by operator action.
     """
     with _activity_lock:
-        if _chat_active_count <= 0:
-            return False
-        if _chat_turn_oldest_started_at <= 0:
-            return True
-        age = time.time() - _chat_turn_oldest_started_at
-        return age <= _CHAT_TURN_STALE_S
+        return _chat_active_count > 0
 
 
 def yield_to_chat(max_wait_s: float = 60.0, poll_s: float = 1.0) -> bool:
@@ -250,17 +305,7 @@ def yield_to_chat(max_wait_s: float = 60.0, poll_s: float = 1.0) -> bool:
 def seconds_since_chat() -> float:
     with _activity_lock:
         if _chat_active_count > 0:
-            # Honour the same staleness check as is_chat_active(): if the
-            # counter is elevated past the legitimate-turn window we treat
-            # the chat as inactive — otherwise the queue worker loop would
-            # also block forever on a leaked counter (it gates on
-            # `seconds_since_chat() < idle_gate`, not on is_chat_active()).
-            if (
-                _chat_turn_oldest_started_at <= 0
-                or (time.time() - _chat_turn_oldest_started_at) <= _CHAT_TURN_STALE_S
-            ):
-                return 0.0
-            # Stale: fall through and return real elapsed since last tick.
+            return 0.0
         if _last_chat_activity == 0:
             return float("inf")
         return time.time() - _last_chat_activity
@@ -366,11 +411,16 @@ def _job_type_jumps_queue(job_type: str) -> bool:
 
 
 def _bypass_idle(job: "ToolJob") -> bool:
-    """Jobs that skip the background chat-idle gate: interactive chat/code jobs,
-    types configured as queue jumpers in config.json, and anything explicitly
-    requesting bypass via payload."""
+    """Jobs that skip the background chat-idle gate.
+
+    In strict mode, only interactive chat/code sources (and optional
+    force-bypass payloads when explicitly enabled) can bypass.
+    """
     if _is_interactive_source(job.source):
         return True
+    if _strict_background_gating():
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        return bool(payload.get("force_bypass_idle") and _allow_force_bypass_idle())
     if _job_type_jumps_queue(job.type):
         return True
     payload = job.payload if isinstance(job.payload, dict) else {}
