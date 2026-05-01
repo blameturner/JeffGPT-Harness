@@ -148,11 +148,16 @@ def ops_dashboard(request: Request, org_id: int, limit: int = 20):
             "retry": "/tool-queue/jobs/{job_id}/retry",
             "cancel": "/tool-queue/jobs/{job_id}",
             "update_priority": "/tool-queue/jobs/{job_id}/priority",
+            "restart_background": "/tool-queue/restart-background",
             "events": "/tool-queue/events",
             "run_scraper": "/enrichment/scraper/start?org_id={org_id}",
             "run_pathfinder": "/enrichment/pathfinder/start?org_id={org_id}",
             "run_discover_agent": "/enrichment/discover-agent/start?org_id={org_id}",
         },
+        "restart_background_prompt": (
+            "Start background processing now? This bypasses the 30-minute "
+            "interactive backoff and queued jobs may begin immediately."
+        ),
         "huey": _huey_status(),
         "active_summary": {
             "active": len(active_jobs),

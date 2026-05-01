@@ -803,7 +803,7 @@ def build_enrichment_runtime_snapshot(request: Request | None, org_id: int, clie
     return {
         "config": {
             "background_chat_idle_seconds": int(
-                get_feature("tool_queue", "background_chat_idle_seconds", 30) or 30
+                get_feature("tool_queue", "background_chat_idle_seconds", 1800) or 1800
             ),
             "scraper_dispatch_interval_seconds": int(
                 get_feature("scraper", "dispatch_interval_seconds", 60) or 60

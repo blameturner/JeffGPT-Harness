@@ -24,7 +24,7 @@ EXECUTORS: dict[ToolName, Executor] = {}
 # its full duration, or background jobs slip in mid-tool. Touch at the start of
 # every action, and run a low-frequency heartbeat during the await so long
 # searches/scrapes stay covered even if the tool itself forgets to touch.
-# 10s keeps us well inside the default 30s gate; raise/lower in lockstep if you
+# 10s keeps us well inside the default 30m gate; raise/lower in lockstep if you
 # change `features.tool_queue.background_chat_idle_seconds`.
 _CHAT_HEARTBEAT_S = 10.0
 

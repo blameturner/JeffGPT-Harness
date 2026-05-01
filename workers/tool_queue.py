@@ -24,7 +24,9 @@ NOCODB_TABLE = "tool_jobs"
 # regularly pauses 30+ seconds while the user reads/types, and the prior
 # value caused background work to resume mid-conversation, contending with
 # the chat model and dragging stream time from seconds to minutes.
-_DEFAULT_BACKGROUND_CHAT_IDLE_S = 120.0
+# Default idle window after an interactive turn before background queue workers
+# can claim non-bypass jobs. 30 minutes by default for strict isolation.
+_DEFAULT_BACKGROUND_CHAT_IDLE_S = 1800.0
 _DEFAULT_MAX_ATTEMPTS = 1
 _DEFAULT_RETRY_BACKOFF_S = 5.0
 
@@ -262,6 +264,47 @@ def seconds_since_chat() -> float:
         if _last_chat_activity == 0:
             return float("inf")
         return time.time() - _last_chat_activity
+
+
+def force_background_ready(reason: str = "manual restart") -> dict:
+    """Immediately open the background gate and wake all worker loops.
+
+    Used by an explicit operator action when the 30-minute idle window should
+    be bypassed and queued background work resumed right now.
+    """
+    global _chat_active_count, _chat_turn_oldest_started_at, _last_chat_activity
+    now = time.time()
+    with _activity_lock:
+        prev_count = _chat_active_count
+        prev_last = _last_chat_activity
+        _chat_active_count = 0
+        _chat_turn_oldest_started_at = 0.0
+        # 0 means seconds_since_chat() -> inf, which clears idle gating.
+        _last_chat_activity = 0.0
+
+    woke = 0
+    q = get_tool_queue()
+    if q is not None:
+        for ev in q._wake_events.values():
+            ev.set()
+            woke += 1
+
+    seconds_before = float("inf") if prev_last == 0 else max(0.0, now - prev_last)
+    _log.warning(
+        "force_background_ready  reason=%s prev_count=%d prev_seconds_since=%.1f woke=%d",
+        reason,
+        prev_count,
+        seconds_before,
+        woke,
+    )
+    return {
+        "reason": reason,
+        "previous_count": int(prev_count),
+        "previous_seconds_since_last_activity": (
+            None if prev_last == 0 else round(seconds_before, 1)
+        ),
+        "woke_worker_types": int(woke),
+    }
 
 
 def _background_idle_gate() -> float:

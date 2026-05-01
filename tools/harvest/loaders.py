@@ -19,6 +19,39 @@ _YOUTUBE_HOSTS = ("youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com")
 _YOUTUBE_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 
+def _cfg_int(key: str, default: int) -> int:
+    try:
+        from infra.config import get_feature
+        return int(get_feature("harvest", key, default) or default)
+    except Exception:
+        return default
+
+
+def _collate_pdf_pages(
+    pages: Iterable[str],
+    *,
+    max_pages: int,
+    max_chars: int,
+) -> tuple[str, bool, int]:
+    parts: list[str] = []
+    chars = 0
+    consumed = 0
+    truncated = False
+    for i, page_text in enumerate(pages):
+        if i >= max_pages or chars >= max_chars:
+            truncated = True
+            break
+        text = page_text or ""
+        remaining = max_chars - chars
+        if len(text) > remaining:
+            text = text[:remaining]
+            truncated = True
+        parts.append(text)
+        chars += len(text)
+        consumed += 1
+    return "\n\n".join(parts).strip(), truncated, consumed
+
+
 def detect_kind(url: str, content_type: str = "", body_head: str = "") -> str:
     """Return one of: html, pdf, rss, sitemap, json, csv, youtube, text."""
     u = (url or "").lower()
@@ -48,16 +81,58 @@ def detect_kind(url: str, content_type: str = "", body_head: str = "") -> str:
 # ── individual loaders ────────────────────────────────────────────────────
 
 def load_pdf(body_bytes: bytes) -> str:
-    """PDF → plain text. Soft-imports pdfminer."""
+    """PDF → plain text.
+
+    Extract incrementally page-by-page so long PDFs don't monopolize the
+    process for one monolithic parse. Between pages, cooperative background
+    tasks yield to active chat turns.
+    """
     if not body_bytes:
         return ""
+    max_pages = max(1, _cfg_int("pdf_max_pages", 20))
+    max_chars = max(1000, _cfg_int("pdf_max_chars", 20000))
+
+    def _yield_checkpoint() -> None:
+        try:
+            from workers.tool_queue import yield_to_chat
+            yield_to_chat(max_wait_s=30.0, poll_s=0.5)
+        except Exception:
+            return
+
+    try:
+        import pdfplumber  # type: ignore
+    except ImportError:
+        pdfplumber = None
+    try:
+        if pdfplumber is not None:
+            page_texts: list[str] = []
+            with pdfplumber.open(io.BytesIO(body_bytes)) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    if i >= max_pages:
+                        break
+                    page_texts.append(page.extract_text() or "")
+                    _yield_checkpoint()
+            text, truncated, consumed = _collate_pdf_pages(page_texts, max_pages=max_pages, max_chars=max_chars)
+            _log.info(
+                "pdf extracted incrementally pages=%d chars=%d truncated=%s",
+                consumed,
+                len(text),
+                truncated,
+            )
+            return text
+    except Exception as e:
+        _log.warning("pdfplumber parse failed: %s", e)
+
     try:
         from pdfminer.high_level import extract_text  # type: ignore
     except ImportError:
-        _log.warning("pdfminer not installed — PDF loader is a no-op")
+        _log.warning("pdfplumber/pdfminer not installed — PDF loader is a no-op")
         return ""
     try:
-        return extract_text(io.BytesIO(body_bytes)) or ""
+        text = extract_text(io.BytesIO(body_bytes)) or ""
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        return text
     except Exception as e:
         _log.warning("pdf parse failed: %s", e)
         return ""

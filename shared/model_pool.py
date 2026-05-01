@@ -126,7 +126,6 @@ def _yield_to_user_if_waiting(
         _log.info("background acquirer (%s) yielded %.1fs to user request", label, waited)
 
 
-_CHAT_GATE_TIMEOUT_S = 180.0
 _CHAT_GATE_POLL_S = 1.0
 
 
@@ -147,9 +146,8 @@ def _block_while_chat_active(label: str) -> None:
     truly background work (Huey-driven research, scraper, graph_extract,
     digest, anything spun up outside a chat turn) is gated.
 
-    Caps at 3 minutes so a wedged chat turn can't deadlock the queue
-    forever — after that we let the background work proceed and rely
-    on the chat path to recover or fail.
+    Strict mode: block until the active interactive turn ends (or until the
+    stale-turn guard in workers.tool_queue deems the turn leaked/stale).
     """
     if user_priority_active():
         return
@@ -160,13 +158,19 @@ def _block_while_chat_active(label: str) -> None:
     if not is_chat_active():
         return
     waited = 0.0
-    while is_chat_active() and waited < _CHAT_GATE_TIMEOUT_S:
+    while is_chat_active():
         # Re-check the priority context on each tick — a parent thread
         # could have promoted us mid-wait by setting the contextvar.
         if user_priority_active():
             return
         time.sleep(_CHAT_GATE_POLL_S)
         waited += _CHAT_GATE_POLL_S
+        if waited > 0 and int(waited) % 30 == 0:
+            _log.info(
+                "background acquirer (%s) still blocked %.1fs for active chat",
+                label,
+                waited,
+            )
     if waited > 0:
         _log.info(
             "background acquirer (%s) blocked %.1fs for active chat",

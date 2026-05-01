@@ -132,6 +132,27 @@ class CodeAgent(BaseAgent):
         knowledge_enabled: bool | None = None,
     ) -> None:
         from shared.jobs import STORE
+        from shared.model_pool import _user_priority_ctx
+        from shared.models import set_model_usage_context
+        from workers.tool_queue import begin_chat_turn
+
+        # Code turns are interactive work; mark priority + active-turn gate so
+        # background queue/model callers cannot compete until this turn ends.
+        _priority_token = _user_priority_ctx.set(True)
+        begin_chat_turn()
+        _turn_finalised = {"done": False}
+
+        def _finalise_turn() -> None:
+            if _turn_finalised["done"]:
+                return
+            _turn_finalised["done"] = True
+            try:
+                from workers.tool_queue import end_chat_turn
+                end_chat_turn()
+            except Exception:
+                _log.debug("code end_chat_turn failed", exc_info=True)
+
+        set_model_usage_context(org_id=self.org_id, source="code", conversation_id=conversation_id)
 
         if temperature is None:
             temperature = code_temperature(response_style)
@@ -207,6 +228,8 @@ class CodeAgent(BaseAgent):
 
         if self.project_id and not self.db.get_project(self.project_id, org_id=self.org_id):
             emit({"type": "error", "message": f"Project {self.project_id} not found"})
+            _finalise_turn()
+            _user_priority_ctx.reset(_priority_token)
             return
 
         if conversation_id is None:
@@ -225,6 +248,8 @@ class CodeAgent(BaseAgent):
             convo = self.db.get_code_conversation(conversation_id, org_id=self.org_id)
             if not convo:
                 emit({"type": "error", "message": f"Code conversation {conversation_id} not found"})
+                _finalise_turn()
+                _user_priority_ctx.reset(_priority_token)
                 return
             summary_ev = _get_summary_event(conversation_id)
             if not summary_ev.is_set():
@@ -243,6 +268,8 @@ class CodeAgent(BaseAgent):
                         "message": f"Conversation {conversation_id} is scoped to project {convo_project_id}",
                     }
                 )
+                _finalise_turn()
+                _user_priority_ctx.reset(_priority_token)
                 return
             if convo_project_id and not self.project_id:
                 self.project_id = int(convo_project_id)
@@ -350,6 +377,8 @@ class CodeAgent(BaseAgent):
             except Exception:
                 pass
             emit({"type": "error", "message": "model call failed"})
+            _finalise_turn()
+            _user_priority_ctx.reset(_priority_token)
             return
 
         output = "".join(chunks)
@@ -507,6 +536,9 @@ class CodeAgent(BaseAgent):
                     self.db.update_code_conversation(conversation_id, {"code_checklist": checklist_steps})
             except Exception:
                 _log.debug("plan checklist persist skipped", exc_info=True)
+
+        _finalise_turn()
+        _user_priority_ctx.reset(_priority_token)
 
     def run_streaming(
         self,

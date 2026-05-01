@@ -53,7 +53,19 @@ def _extract_pdf_text(url: str) -> str:
             _log.warning("pdf too large  url=%s bytes=%d", url, len(resp.content))
             return ""
         with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-            pages = [p.extract_text() or "" for p in pdf.pages]
+            pages = []
+            max_pages = 20
+            max_chars = PER_PAGE_CHAR_CAP
+            chars = 0
+            for i, p in enumerate(pdf.pages):
+                if i >= max_pages or chars >= max_chars:
+                    break
+                text = p.extract_text() or ""
+                remaining = max_chars - chars
+                if len(text) > remaining:
+                    text = text[:remaining]
+                pages.append(text)
+                chars += len(text)
         text = "\n\n".join(pages).strip()
         _log.info("pdf extracted  url=%s pages=%d chars=%d", url, len(pages), len(text))
         return text[:PER_PAGE_CHAR_CAP] if text else ""

@@ -137,6 +137,15 @@ def dashboard(
             "tool_queue_ready": True,
             "huey": _huey_status(),
         },
+        "controls": {
+            "restart_background": {
+                "endpoint": "/tool-queue/restart-background",
+                "confirm_prompt": (
+                    "Start background processing now? This bypasses the "
+                    "30-minute interactive backoff and queued jobs may begin immediately."
+                ),
+            }
+        },
         "scheduler": _scheduler_status(request),
         "recent_jobs": recent_jobs,
         "active_summary": {
@@ -425,6 +434,13 @@ class StopAllRequest(BaseModel):
     pause: bool = True
 
 
+class RestartBackgroundRequest(BaseModel):
+    # Explicit confirmation guard so a UI click can present a safety prompt
+    # before bypassing the 30-minute idle gate.
+    confirm: bool = False
+    reason: str = "manual background restart from queue UI"
+
+
 @router.post("/stop-all")
 def stop_all(body: StopAllRequest, request: Request):
     """Pause every registered job type at once. Workers stop claiming new
@@ -437,6 +453,36 @@ def stop_all(body: StopAllRequest, request: Request):
     return {
         "paused" if body.pause else "resumed": types,
         "count": len(types),
+    }
+
+
+@router.post("/restart-background")
+def restart_background(body: RestartBackgroundRequest, request: Request):
+    """Manually bypass the interactive idle backoff and wake workers now.
+
+    Requires an explicit confirm flag so UIs can gate this behind a prompt.
+    """
+    _get_queue(request)
+    confirm_prompt = (
+        "Start background processing now? This bypasses the 30-minute "
+        "interactive backoff and queued jobs may begin immediately."
+    )
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "confirmation_required",
+                "confirm_prompt": confirm_prompt,
+            },
+        )
+
+    from workers.tool_queue import force_background_ready
+
+    result = force_background_ready(reason=(body.reason or "manual restart").strip() or "manual restart")
+    return {
+        "status": "restarted",
+        "confirm_prompt": confirm_prompt,
+        **result,
     }
 
 

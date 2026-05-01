@@ -566,7 +566,7 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, dict]] = {
         "reap_interval_minutes":           {"type": "number", "min": 5, "max": 720, "step": 5},
     },
     "tool_queue": {
-        "background_chat_idle_seconds": {"type": "number", "min": 0, "max": 600, "step": 5},
+        "background_chat_idle_seconds": {"type": "number", "min": 0, "max": 7200, "step": 5},
         "default_max_attempts":         {"type": "number", "min": 1, "max": 5, "step": 1},
         "default_retry_backoff_seconds":{"type": "number", "min": 0, "max": 300, "step": 1},
     },

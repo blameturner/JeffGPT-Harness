@@ -24,6 +24,49 @@ router = APIRouter(prefix="/projects", tags=["projects-extra"])
 # 422 trying to coerce the literal segment to int.
 public_router = APIRouter(prefix="/projects", tags=["projects-public"])
 
+# ---------- Diagnostics ----------
+REQUIRED_TABLES = ("projects", "project_files", "project_file_versions")
+OPTIONAL_TABLES = (
+    "project_audit", "project_snapshots", "project_snapshot_files",
+    "project_lint_results", "project_symbols", "project_dependencies",
+    "project_share_tokens", "project_bookmarks", "project_saved_queries",
+    "project_recipes", "project_pins", "workspaces",
+    "project_pending_changes", "project_playbooks", "project_reviews",
+    "project_file_comments", "gitea_connections",
+)
+
+
+@public_router.get("/_diag")
+def projects_diag():
+    """Health check for the projects feature: feature flag + NocoDB table presence.
+
+    The UI calls this on the projects list page so users see a clear "missing
+    table" banner instead of a silent 500 when they click Create.
+    """
+    feature_enabled = is_feature_enabled("code_v2")
+    try:
+        db = NocodbClient()
+        present = set(db.tables.keys())
+        required_missing = [t for t in REQUIRED_TABLES if t not in present]
+        optional_missing = [t for t in OPTIONAL_TABLES if t not in present]
+        ready = feature_enabled and not required_missing
+        return {
+            "feature_enabled": feature_enabled,
+            "ready": ready,
+            "required_present": [t for t in REQUIRED_TABLES if t in present],
+            "required_missing": required_missing,
+            "optional_present": [t for t in OPTIONAL_TABLES if t in present],
+            "optional_missing": optional_missing,
+        }
+    except Exception as e:
+        return {
+            "feature_enabled": feature_enabled,
+            "ready": False,
+            "error": str(e),
+            "required_missing": list(REQUIRED_TABLES),
+            "optional_missing": list(OPTIONAL_TABLES),
+        }
+
 
 def _require_enabled() -> None:
     if not is_feature_enabled("code_v2"):
