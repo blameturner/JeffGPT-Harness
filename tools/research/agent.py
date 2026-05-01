@@ -35,7 +35,7 @@ from tools._org import resolve_org_id
 
 _log = logging.getLogger("research.agent")
 
-DEFAULT_WEB_SEARCH_PER_QUERY_TIMEOUT_S = 240
+DEFAULT_WEB_SEARCH_PER_QUERY_TIMEOUT_S = 120
 DEFAULT_DOC_TYPE_TIMEOUT_S = 300
 DEFAULT_SECTION_TIMEOUT_S = 1800
 DEFAULT_REVIEWER_TIMEOUT_S = 2400
@@ -191,6 +191,10 @@ DOC_TYPES = {
     },
 }
 DEFAULT_DOC_TYPE = "research_report"
+
+
+def _skip_doc_type_inference_basic() -> bool:
+    return bool(get_feature("research", "basic_skip_doc_type_inference", True))
 
 # Sections that are regenerated wholesale on every paper build/review pass —
 # the reviewer should not propose targeted revisions to these because they
@@ -977,9 +981,15 @@ def run_research_agent(plan_id: int) -> dict:
         iterations = plan.get("iterations", 0) or 0
         org_id = resolve_org_id(plan.get("org_id"))
 
-        # doc_type may have been stashed by an earlier run; otherwise infer.
+        # doc_type may have been stashed by an earlier run; basic flow can
+        # skip classification to avoid an extra model hop.
         planned_doc_type = schema.pop("_doc_type", None) if isinstance(schema, dict) else None
-        doc_type = _infer_doc_type(topic, planned_doc_type=planned_doc_type)
+        if planned_doc_type in DOC_TYPES:
+            doc_type = planned_doc_type
+        elif _skip_doc_type_inference_basic():
+            doc_type = DEFAULT_DOC_TYPE
+        else:
+            doc_type = _infer_doc_type(topic, planned_doc_type=planned_doc_type)
 
         report_progress(
             f"plan loaded: {len(queries)} queries, {len(sub_topics)} sub-topics, doc_type={doc_type}"
@@ -1099,7 +1109,12 @@ def review_research_paper(plan_id: int, user_instructions: str = "") -> dict:
             return {"status": "failed", "plan_id": plan_id, "error": "no paper to review"}
 
         planned_doc_type = schema.pop("_doc_type", None) if isinstance(schema, dict) else None
-        doc_type = _infer_doc_type(topic, planned_doc_type=planned_doc_type)
+        if planned_doc_type in DOC_TYPES:
+            doc_type = planned_doc_type
+        elif _skip_doc_type_inference_basic():
+            doc_type = DEFAULT_DOC_TYPE
+        else:
+            doc_type = _infer_doc_type(topic, planned_doc_type=planned_doc_type)
 
         _patch_or_log(client, plan_id, {"status": "reviewing"}, "reviewing")
 

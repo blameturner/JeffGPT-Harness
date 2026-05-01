@@ -715,9 +715,11 @@ class ToolJobQueue:
         for jt, threads in self._workers.items():
             workers[jt] = sum(1 for t in threads if t.is_alive())
 
-        idle = seconds_since_chat()
+        idle_raw = seconds_since_chat()
+        idle = idle_raw
         if idle == float("inf"):
             idle = -1  # no chat activity yet
+        idle_display = idle
 
         gate = _background_idle_gate()
         chat_live = is_chat_active()
@@ -727,6 +729,13 @@ class ToolJobQueue:
             backoff_state = "clear"
         else:
             backoff_state = "waiting_for_idle"
+        if idle_display >= 0 and idle_display > gate:
+            # UI countdowns often compute threshold-idle; clamp display to avoid
+            # negative values while preserving raw idle for diagnostics.
+            idle_display = gate
+        remaining_s = 0
+        if backoff_state == "waiting_for_idle":
+            remaining_s = max(0, int(round(gate - max(0.0, idle_raw))))
 
         return {
             "counts": counts,
@@ -734,8 +743,10 @@ class ToolJobQueue:
             "backoff": {
                 "state": backoff_state,
                 "chat_active": chat_live,
-                "idle_seconds": round(idle, 0),
+                "idle_seconds": round(idle_display, 0),
+                "idle_seconds_raw": round(idle, 0),
                 "threshold": gate,
+                "remaining_seconds": remaining_s,
             },
         }
 
@@ -1259,6 +1270,37 @@ class ToolJobQueue:
                 worker_id, job_id[:12], job.status,
             )
             return {"status": "skipped", "reason": f"status_{job.status}", "job_id": job_id}
+        if not _bypass_idle(job):
+            idle = seconds_since_chat()
+            gate = _background_idle_gate()
+            if idle < gate:
+                self._unclaim(job)
+                remaining_s = max(0, int(round(gate - max(0.0, idle))))
+                _log.info(
+                    "huey-pickup %s: DEFERRED  job=%s type=%s idle=%.0fs gate=%.0fs remaining=%ds",
+                    worker_id,
+                    job_id[:12],
+                    job.type,
+                    idle,
+                    gate,
+                    remaining_s,
+                )
+                self._emit_event({
+                    "type": "job_deferred_chat_active",
+                    "job_id": job.job_id,
+                    "job_type": job.type,
+                    "idle_seconds": round(idle, 1),
+                    "threshold_seconds": round(gate, 1),
+                    "remaining_seconds": remaining_s,
+                })
+                return {
+                    "status": "deferred",
+                    "reason": "chat_active",
+                    "job_id": job_id,
+                    "idle_seconds": round(idle, 1),
+                    "threshold": round(gate, 1),
+                    "remaining_seconds": remaining_s,
+                }
         config = self._handlers.get(job.type)
         if not config:
             _log.error(

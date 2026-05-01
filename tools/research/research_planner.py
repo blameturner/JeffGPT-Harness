@@ -9,10 +9,25 @@ from shared.models import model_call
 
 _log = logging.getLogger("research_planner")
 
-DEFAULT_MAX_QUERIES = 20
-DEFAULT_PLANNER_TIMEOUT_S = 3600
-DEFAULT_PLANNER_RETRY_ATTEMPTS = 5
-DEFAULT_PLANNER_RETRY_BACKOFF_S = 8
+DEFAULT_MAX_QUERIES = 8
+DEFAULT_PLANNER_TIMEOUT_S = 240
+DEFAULT_PLANNER_RETRY_ATTEMPTS = 2
+DEFAULT_PLANNER_RETRY_BACKOFF_S = 4
+
+
+def _emit_progress(progress_cb, message: str, *, kind: str = "plan", step: int = 0, total: int = 0) -> None:
+    if not callable(progress_cb):
+        return
+    try:
+        progress_cb(message, kind=kind, step=step, total=total)
+    except TypeError:
+        # Back-compat if caller passes a simple callable(message).
+        try:
+            progress_cb(message)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _fallback_plan(topic: str, max_queries: int) -> dict:
@@ -310,7 +325,7 @@ def _default_schema_for_topic(topic: str) -> dict:
     }
 
 
-def _generate_plan(topic: str, max_queries: int = DEFAULT_MAX_QUERIES) -> dict:
+def _generate_plan(topic: str, max_queries: int = DEFAULT_MAX_QUERIES, progress_cb=None) -> dict:
     min_queries = 10 if max_queries >= 10 else max_queries
     prompt = f"""You are a research planning engine.
 
@@ -352,6 +367,7 @@ Example shape (structure only, not content):
     timeout_s = _planner_timeout_s()
     attempts = _planner_retry_attempts()
     backoff_s = _planner_retry_backoff_s()
+    _emit_progress(progress_cb, f"planner configured: attempts={attempts}, timeout={timeout_s}s", step=1, total=4)
 
     def _run():
         return model_call("research_planner", prompt)
@@ -360,12 +376,14 @@ Example shape (structure only, not content):
     last_raw = ""
 
     for attempt in range(1, attempts + 1):
+        _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: model call", step=2, total=4)
         ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-plan")
         try:
             fut = ex.submit(_run)
             try:
                 result, _ = fut.result(timeout=timeout_s)
             except _futures.TimeoutError:
+                _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: timeout after {timeout_s}s")
                 last_error = f"planner timeout after {timeout_s}s"
                 _log.warning(
                     "planner timeout  attempt=%d/%d  topic=%s",
@@ -373,6 +391,7 @@ Example shape (structure only, not content):
                 )
                 continue
             except Exception as e:
+                _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: model error")
                 last_error = str(e)[:200]
                 _log.warning(
                     "plan generation failed  attempt=%d/%d  topic=%s  error=%s",
@@ -383,12 +402,14 @@ Example shape (structure only, not content):
             ex.shutdown(wait=False)
 
         if not result:
+            _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: empty model response")
             last_error = "empty model response"
             _log.warning(
                 "planner empty response  attempt=%d/%d  topic=%s",
                 attempt, attempts, topic[:40],
             )
         else:
+            _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: validating JSON", step=3, total=4)
             last_raw = result[:500]
             candidate = _extract_json_object(result)
             normalized = None
@@ -427,6 +448,7 @@ Example shape (structure only, not content):
                         normalized["_salvaged"] = True
 
             if normalized and "error" not in normalized:
+                _emit_progress(progress_cb, f"planner attempt {attempt}/{attempts}: plan ready", step=4, total=4)
                 return normalized
             if normalized and "error" in normalized:
                 last_error = str(normalized.get("error") or "invalid planner payload")
@@ -443,12 +465,14 @@ Example shape (structure only, not content):
             time.sleep(backoff_s)
 
     if get_feature("research", "planner_fallback_enabled", True):
+        _emit_progress(progress_cb, "planner model failed, using deterministic fallback", step=3, total=4)
         _log.warning(
             "planner failed %d attempts, using deterministic fallback  topic=%s  last_error=%s",
             attempts, topic[:60], last_error,
         )
         fb = _fallback_plan(topic, max_queries)
         if "error" not in fb:
+            _emit_progress(progress_cb, "planner fallback generated plan", step=4, total=4)
             return fb
 
     out = {"error": f"planner failed after {attempts} attempts: {last_error}"}
@@ -545,11 +569,12 @@ def run_research_planner_job(plan_id: int) -> dict:
     """Planner tool-queue handler: generate queries/schema for an existing row, then queue the agent."""
     from infra.nocodb_client import NocodbClient
     from workers.tool_queue import get_tool_queue
+    from workers.tool_queue import current_job_id, report_progress
 
     if not get_feature("research", "planner_enabled", True):
         return {"status": "disabled", "error": "research_planner feature disabled"}
 
-    max_queries = get_feature("research", "max_queries", DEFAULT_MAX_QUERIES)
+    max_queries = int(get_feature("research", "max_queries", DEFAULT_MAX_QUERIES) or DEFAULT_MAX_QUERIES)
 
     client = NocodbClient()
     plan_row = client._get("research_plans", params={"where": f"(Id,eq,{plan_id})", "limit": 1})
@@ -558,11 +583,14 @@ def run_research_planner_job(plan_id: int) -> dict:
         return {"status": "not_found", "plan_id": plan_id}
 
     topic = plan.get("topic", "")
+    from tools._org import resolve_org_id
+    org_id = resolve_org_id(plan.get("org_id"))
     if not topic:
         client._patch("research_plans", plan_id, {"status": "failed", "error_message": "no topic"})
         return {"status": "failed", "error": "no topic", "plan_id": plan_id}
 
-    generated = _generate_plan(topic, max_queries)
+    report_progress("planner phase: loaded plan", kind="plan", step=1, total=5)
+    generated = _generate_plan(topic, max_queries, progress_cb=report_progress)
     if "error" in generated:
         client._patch("research_plans", plan_id, {
             "status": "failed",
@@ -573,6 +601,7 @@ def run_research_planner_job(plan_id: int) -> dict:
     queries = (generated.get("queries") or [])[:max_queries]
 
     try:
+        report_progress("planner phase: saving queries/schema", kind="plan", step=4, total=5)
         client._patch("research_plans", plan_id, {
             "hypotheses": json.dumps(generated.get("hypotheses", [])),
             "sub_topics": json.dumps(generated.get("sub_topics", [])),
@@ -585,16 +614,50 @@ def run_research_planner_job(plan_id: int) -> dict:
         client._patch("research_plans", plan_id, {"status": "failed", "error_message": str(e)[:500]})
         return {"status": "failed", "error": str(e)[:200], "plan_id": plan_id}
 
-    # Run the agent inline in this same job — avoids a second queue hop where
-    # the agent job would sit pending behind unrelated work.
-    from tools.research.agent import run_research_agent
-    _log.info("Running research agent inline for plan_id %d (queries=%d)", plan_id, len(queries))
-    return run_research_agent(plan_id)
+    tq = get_tool_queue()
+    if not tq:
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": "tool_queue_unavailable",
+        })
+        return {"status": "failed", "error": "tool_queue_unavailable", "plan_id": plan_id}
+
+    # Queue the agent as a dependent job; planner job now ends after plan save.
+    planner_job_id = current_job_id() or ""
+    report_progress("planner phase: queueing research agent", kind="plan", step=5, total=5)
+    try:
+        agent_job_id = tq.submit(
+            "research_agent",
+            {"plan_id": plan_id, "org_id": org_id},
+            source="research_planner",
+            priority=3,
+            org_id=org_id,
+            depends_on=planner_job_id,
+        )
+    except Exception as e:
+        client._patch("research_plans", plan_id, {
+            "status": "failed",
+            "error_message": f"agent_queue_failed: {str(e)[:300]}",
+        })
+        return {"status": "failed", "error": f"agent_queue_failed: {str(e)[:200]}", "plan_id": plan_id}
+    _log.info(
+        "Queued research agent job %s for plan_id %d (depends_on=%s)",
+        agent_job_id,
+        plan_id,
+        planner_job_id[:12] or "-",
+    )
+    return {
+        "status": "queued",
+        "plan_id": plan_id,
+        "queries": len(queries),
+        "agent_job_id": agent_job_id,
+        "depends_on": planner_job_id or None,
+    }
 
 
 def start_research_plan(plan_id: int) -> dict:
     """Invoke a deferred (hidden) research plan: clear the hidden type and
-    queue the planner job that will generate queries and run the agent."""
+    queue the planner job that will generate queries/schema and queue agent."""
     from infra.nocodb_client import NocodbClient
     from workers.tool_queue import get_tool_queue
     from tools._org import resolve_org_id
