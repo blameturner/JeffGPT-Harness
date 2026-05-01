@@ -20,24 +20,83 @@ _log = logging.getLogger("tool_queue")
 NOCODB_TABLE = "tool_jobs"
 
 # Single chat-idle threshold for all background jobs. Interactive/bypass jobs
-# skip the gate entirely. Local CPU infra: keep this low (seconds, not minutes)
-# so background work runs seamlessly between chat turns.
-_DEFAULT_BACKGROUND_CHAT_IDLE_S = 30.0
+# skip the gate entirely. Bumped to 120s default: a back-and-forth chat
+# regularly pauses 30+ seconds while the user reads/types, and the prior
+# value caused background work to resume mid-conversation, contending with
+# the chat model and dragging stream time from seconds to minutes.
+_DEFAULT_BACKGROUND_CHAT_IDLE_S = 120.0
 _DEFAULT_MAX_ATTEMPTS = 1
 _DEFAULT_RETRY_BACKOFF_S = 5.0
 
 _last_chat_activity: float = 0.0
+_chat_active_count: int = 0  # number of currently-streaming chat turns
 _activity_lock = threading.Lock()
 
 
 def touch_chat_activity():
+    """Record a chat tick. Use this for momentary signals (search start, end
+    of stream, etc). Resets the idle clock; queue workers won't claim new
+    jobs for ``background_chat_idle_seconds`` after this."""
     global _last_chat_activity
     with _activity_lock:
         _last_chat_activity = time.time()
 
 
+def begin_chat_turn() -> None:
+    """Mark a chat turn as actively streaming. While the count is > 0, queue
+    workers MUST treat chat as live regardless of how long ago the last
+    ``touch_chat_activity`` call was — long LLM streams legitimately go
+    minutes between activity ticks and we don't want background jobs
+    creeping in mid-stream and contending for the model backend.
+
+    Pair every ``begin_chat_turn`` with exactly one ``end_chat_turn``."""
+    global _chat_active_count, _last_chat_activity
+    with _activity_lock:
+        _chat_active_count += 1
+        _last_chat_activity = time.time()
+
+
+def end_chat_turn() -> None:
+    """Companion to :func:`begin_chat_turn`. The idle clock starts FROM HERE,
+    not from when the turn began, so the configured idle window guarantees
+    a real quiet period after the stream closes."""
+    global _chat_active_count, _last_chat_activity
+    with _activity_lock:
+        _chat_active_count = max(0, _chat_active_count - 1)
+        _last_chat_activity = time.time()
+
+
+def is_chat_active() -> bool:
+    """True when at least one chat turn is currently streaming."""
+    with _activity_lock:
+        return _chat_active_count > 0
+
+
+def yield_to_chat(max_wait_s: float = 60.0, poll_s: float = 1.0) -> bool:
+    """Cooperative checkpoint for long-running background tasks.
+
+    Call this between phases (e.g. before each LLM call inside a research
+    plan, or between scrape batches). If a chat turn is active, blocks for
+    up to ``max_wait_s`` waiting for it to finish; returns True if it had
+    to wait, False if chat was already idle.
+
+    Tasks that respect this gate will pause mid-flight when the user
+    starts typing, freeing the model backend for the chat reply.
+    """
+    if not is_chat_active():
+        return False
+    waited = 0.0
+    while is_chat_active() and waited < max_wait_s:
+        time.sleep(poll_s)
+        waited += poll_s
+    return True
+
+
 def seconds_since_chat() -> float:
     with _activity_lock:
+        if _chat_active_count > 0:
+            # Treat live chat as zero-elapsed so the gate fires unconditionally.
+            return 0.0
         if _last_chat_activity == 0:
             return float("inf")
         return time.time() - _last_chat_activity
@@ -382,13 +441,20 @@ class ToolJobQueue:
             idle = -1  # no chat activity yet
 
         gate = _background_idle_gate()
-        backoff_state = "clear" if (idle < 0 or idle >= gate) else "waiting_for_idle"
+        chat_live = is_chat_active()
+        if chat_live:
+            backoff_state = "chat_active"
+        elif idle < 0 or idle >= gate:
+            backoff_state = "clear"
+        else:
+            backoff_state = "waiting_for_idle"
 
         return {
             "counts": counts,
             "workers": workers,
             "backoff": {
                 "state": backoff_state,
+                "chat_active": chat_live,
                 "idle_seconds": round(idle, 0),
                 "threshold": gate,
             },

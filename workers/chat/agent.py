@@ -66,9 +66,25 @@ class ChatAgent(BaseAgent):
                 _log.info("emit  type=%s %s", etype, event.get("phase") or event.get("summary", "")[:60] or "")
             STORE.append(job, event)
 
-        # signal active session so queue workers back off
-        from workers.tool_queue import touch_chat_activity
-        touch_chat_activity()
+        # signal active session so queue workers back off. begin_chat_turn
+        # is a HARD gate: while it's > 0 the queue won't claim *any*
+        # non-bypass job regardless of how long since the last activity
+        # tick (long LLM streams legitimately go minutes between events).
+        # The matching end_chat_turn fires inside _post_turn_work below so
+        # post-turn summarisation also counts as an active turn.
+        from workers.tool_queue import touch_chat_activity, begin_chat_turn
+        begin_chat_turn()
+        _turn_finalised = {"done": False}
+
+        def _finalise_turn() -> None:
+            if _turn_finalised["done"]:
+                return
+            _turn_finalised["done"] = True
+            try:
+                from workers.tool_queue import end_chat_turn
+                end_chat_turn()
+            except Exception:
+                _log.debug("end_chat_turn failed", exc_info=True)
 
         _turn_start = time.perf_counter()
         spans: dict[str, int] = {}
@@ -92,6 +108,7 @@ class ChatAgent(BaseAgent):
             convo = self.db.get_conversation(conversation_id, org_id=self.org_id)
             if not convo:
                 emit({"type": "error", "message": f"Conversation {conversation_id} not found"})
+                _finalise_turn()
                 return
             # must wait on prev turn's bg summary — else we'd read stale summary/topics from DB
             summary_ev = _get_summary_event(conversation_id)
@@ -205,6 +222,7 @@ class ChatAgent(BaseAgent):
                         "context_chars": 0,
                     })
                     cancel_rag(rag_future, rag_executor)
+                    _finalise_turn()
                     return
 
             if hints:
@@ -481,6 +499,7 @@ class ChatAgent(BaseAgent):
             except Exception:
                 _log.warning("status update to error failed  conv=%s", conversation_id)
             emit({"type": "error", "message": "model call failed"})
+            _finalise_turn()
             return
 
         duration = round(time.time() - start, 2)
@@ -690,7 +709,13 @@ class ChatAgent(BaseAgent):
         # have ticked past the backoff gate. This ensures the full window (LLM +
         # post-turn summarising) is treated as one continuous active period.
         touch_chat_activity()
-        threading.Thread(target=_post_turn_work, daemon=True).start()
+        def _post_turn_with_finalise() -> None:
+            try:
+                _post_turn_work()
+            finally:
+                _finalise_turn()
+
+        threading.Thread(target=_post_turn_with_finalise, daemon=True).start()
 
     def send_streaming(
         self,

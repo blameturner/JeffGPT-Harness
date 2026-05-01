@@ -1850,6 +1850,38 @@ def dashboard(request: Request, org_id: int) -> dict:
     return out
 
 
+# ---- chat caches: drop on demand ---------------------------------------------
+
+class CacheDropRequest(BaseModel):
+    org_id: int | None = None  # None = drop globally
+
+
+@router.post("/caches/drop")
+def caches_drop(body: CacheDropRequest):
+    """Drop the in-process caches that warm chat replies (PA recall, digest
+    preface, graph entity names). The next chat turn pays the full cold-load
+    cost and produces a fresh response. Useful after a manual NocoDB edit
+    that the post-turn extractor wouldn't have invalidated automatically.
+    """
+    dropped: list[str] = []
+    org_id = body.org_id
+    try:
+        from workers.chat.home import invalidate_pa_context, invalidate_digest_preface
+        invalidate_pa_context(org_id)
+        dropped.append("pa_context")
+        invalidate_digest_preface(org_id)
+        dropped.append("digest_preface")
+    except Exception:
+        _log.warning("caches_drop: chat caches", exc_info=True)
+    try:
+        from shared.graph_recall import invalidate_entity_cache
+        invalidate_entity_cache(org_id)
+        dropped.append("graph_entities")
+    except Exception:
+        _log.warning("caches_drop: graph_entities", exc_info=True)
+    return {"status": "ok", "dropped": dropped, "org_id": org_id}
+
+
 @router.get("/health")
 def home_health(request: Request, org_id: int = 1):
     """Full dependency check. Returns `ok: true` only if every required piece

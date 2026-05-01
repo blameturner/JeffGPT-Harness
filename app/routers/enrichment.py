@@ -793,15 +793,37 @@ def discovery_list(org_id: int, status: str | None = None, limit: int = 50):
 
 
 @router.get("/research-plans/list")
-def research_plans_list(org_id: int, status: str | None = None, limit: int = 50):
+def research_plans_list(org_id: int, status: str | None = None,
+                        limit: int = 50, include_hidden: bool = False,
+                        parent_insight_id: int | None = None):
+    """List research plans for the org.
+
+    Plans tagged ``type='pending insight'`` (auto-spawned follow-ups created
+    from an insight) are excluded by default — they clutter the main feed.
+    Pass ``include_hidden=true`` to surface them, or ``parent_insight_id=N``
+    to scope to a single insight (in which case hidden plans are always
+    included since that's the whole point of the view).
+    """
     limit = min(max(1, limit), 500)
     client = NocodbClient()
-    params: dict = {"limit": limit}
+    parts = [f"(org_id,eq,{org_id})"]
     if status:
-        params["where"] = f"(status,eq,{status})~and(org_id,eq,{org_id})"
-    else:
-        params["where"] = f"(org_id,eq,{org_id})"
+        parts.append(f"(status,eq,{status})")
+    if parent_insight_id is not None:
+        parts.append(f"(parent_insight_id,eq,{int(parent_insight_id)})")
+    # Fetch a generous slice so the post-filter for hidden rows still
+    # honours `limit` after exclusion. The list grows to ~hundreds, not
+    # tens of thousands, so this isn't expensive.
+    fetch_limit = limit if (include_hidden or parent_insight_id is not None) else min(500, limit * 3)
+    params: dict = {"limit": fetch_limit, "where": "~and".join(parts)}
     rows = client._get_paginated("research_plans", params=params)
+    if parent_insight_id is None and not include_hidden:
+        # Filter Python-side instead of via NocoDB's where clause:
+        # `(type,neq,X)` excludes rows where type IS NULL in some NocoDB
+        # builds (NULL semantics are inconsistent across versions). A
+        # post-filter is cheap and unambiguous.
+        rows = [r for r in rows if (r.get("type") or "") != "pending insight"]
+        rows = rows[:limit]
     return {"status": "ok", "rows": rows}
 
 

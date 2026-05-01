@@ -268,7 +268,7 @@
       }
     },
     "tool_queue": {
-      "background_chat_idle_seconds": 30,
+      "background_chat_idle_seconds": 120,
       "default_max_attempts": 3,
       "default_retry_backoff_seconds": 5,
       "queue_jumpers": {

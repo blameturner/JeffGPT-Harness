@@ -11,8 +11,10 @@ a big-model reviewer reads the paper and emits per-section revision
 instructions; the writer re-runs the affected sections with those
 instructions appended; the new paper replaces the old.
 
-There is no iterative critic loop. Every model call has a hard timeout,
-so a stuck model never wedges the run forever.
+There is no iterative critic loop. Model calls inherit the global httpx
+timeout from `shared.models` (default 2400s) and the model-pool slot
+queue serialises concurrent calls — research does not impose a tighter
+cap on top of that.
 """
 import concurrent.futures as _futures
 import json
@@ -229,41 +231,43 @@ def _patch_or_log(client, plan_id: int, patch: dict, label: str) -> None:
         )
 
 
-def _call_with_timeout(fn, timeout_s: float, label: str):
-    """Run ``fn`` in a worker thread with a hard timeout; log boundaries.
+def _safe_call(fn, _timeout_unused: float, label: str):
+    """Invoke a model/search function inline, log boundaries, swallow any
+    exception.
 
-    Logs INVOKE before submission and RETURN/TIMEOUT/ERROR on completion,
-    so a job stuck inside an LLM HTTP call is identifiable from the logs:
-    you'll see `INVOKE label=section:Background timeout=1800s` followed by
-    no return line until the model responds (or times out at the bound).
+    The earlier version of this helper wrapped `fn` in a `ThreadPoolExecutor`
+    with `fut.result(timeout=...)`. That timeout was tighter than
+    `model_call`'s own httpx timeout (set globally via `models.http_timeout_s`
+    in `config.json`, default 2400s) and would fire mid-stream — orphaning
+    the in-flight request and surfacing as 'all body sections failed' even
+    when the model was about to return. Nothing else in the codebase wraps
+    `model_call` like that, and nothing else hits these timeouts.
+
+    `model_call` and `run_web_search` already:
+      - acquire a slot from the model pool (queues if busy);
+      - bound a single HTTP call with the global httpx timeout;
+      - return `("", 0)` on any failure.
+
+    So this helper just runs `fn` inline. The legacy `timeout_s` argument is
+    accepted but ignored to keep the callsites unchanged — the surrounding
+    `_research_timeout(...)` lookups still work, they just no longer enforce
+    an outer cap.
     """
     import time as _time
-    _log.info("call %s INVOKE  timeout=%ds", label, int(timeout_s))
+    _log.info("call %s INVOKE", label)
     t0 = _time.time()
-    ex = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"research-{label[:24]}")
     try:
-        fut = ex.submit(fn)
-        try:
-            result = fut.result(timeout=timeout_s)
-            elapsed = round(_time.time() - t0, 1)
-            # Tuple from model_call is (text, tokens). Log a size hint without dumping content.
-            size_hint = ""
-            if isinstance(result, tuple) and result and isinstance(result[0], str):
-                size_hint = f"  out_chars={len(result[0])}"
-            elif isinstance(result, tuple) and len(result) >= 2:
-                size_hint = f"  out_meta={result[1]!r}"
-            _log.info("call %s RETURN  %.1fs%s", label, elapsed, size_hint)
-            return result
-        except _futures.TimeoutError:
-            elapsed = round(_time.time() - t0, 1)
-            _log.warning("call %s TIMEOUT  %.1fs (cap=%ds)", label, elapsed, int(timeout_s))
-            return None
-        except Exception as e:
-            elapsed = round(_time.time() - t0, 1)
-            _log.warning("call %s ERROR  %.1fs  err=%s", label, elapsed, str(e)[:200])
-            return None
-    finally:
-        ex.shutdown(wait=False)
+        result = fn()
+        elapsed = round(_time.time() - t0, 1)
+        size_hint = ""
+        if isinstance(result, tuple) and result and isinstance(result[0], str):
+            size_hint = f"  out_chars={len(result[0])}"
+        _log.info("call %s RETURN  %.1fs%s", label, elapsed, size_hint)
+        return result
+    except Exception as e:
+        elapsed = round(_time.time() - t0, 1)
+        _log.warning("call %s ERROR  %.1fs  err=%s", label, elapsed, str(e)[:200])
+        return None
 
 
 def _research_intent_dict(topic: str, entities: list[str] | None = None) -> dict:
@@ -297,7 +301,7 @@ def _fetch_corpus(topic: str, queries: list[str], org_id: int) -> tuple[str, lis
     seen_urls: set[str] = set()
     _log.info("corpus FETCH START  topic=%r  n_queries=%d", topic[:80], len(queries))
     for idx, q in enumerate(queries, start=1):
-        res = _call_with_timeout(
+        res = _safe_call(
             lambda q=q: run_web_search(
                 q, org_id=org_id, intent_dict=intent,
                 extraction_function_name=extraction_function_name,
@@ -323,11 +327,70 @@ def _fetch_corpus(topic: str, queries: list[str], org_id: int) -> tuple[str, lis
                 seen_urls.add(url)
             sources.append(s)
     out_corpus = "\n\n".join(blocks)
+
+    # Fallback: if the orchestrator's LLM rerank/extract chain returned
+    # nothing for every query (very common when the local extraction model
+    # is overloaded or searxng's reranker is too strict), salvage raw page
+    # text directly via searxng + scrape_page. Better to write from messy
+    # source text than to fail the whole research run.
+    if not out_corpus.strip():
+        _log.warning("corpus empty after extraction; falling back to raw scrape")
+        out_corpus, sources = _fetch_corpus_raw(topic, queries, sources)
+
     _log.info(
         "corpus FETCH DONE  topic=%r  blocks=%d  sources=%d  chars=%d",
-        topic[:80], len(blocks), len(sources), len(out_corpus),
+        topic[:80], len(blocks) or 1, len(sources), len(out_corpus),
     )
     return out_corpus, sources
+
+
+def _fetch_corpus_raw(topic: str, queries: list[str],
+                      prior_sources: list[dict]) -> tuple[str, list[dict]]:
+    """Last-resort corpus fetch: searxng URLs → raw scrape, no LLM in the loop.
+
+    Used when the full orchestrator returns nothing across all queries. The
+    output is messier (no per-page summarisation) but the section writer can
+    still synthesise from it.
+    """
+    try:
+        from tools.search.engine import searxng_search, _dedupe
+        from tools.search.scraping import scrape_page
+    except Exception:
+        _log.warning("raw corpus fallback unavailable (search/scrape import failed)")
+        return "", prior_sources
+
+    seen_urls: set[str] = {(s.get("url") or "").strip() for s in (prior_sources or []) if s}
+    raw_results: list[dict] = []
+    for q in queries[:3]:  # cap — if 3 queries don't yield anything, more won't help
+        try:
+            raw_results.extend(searxng_search(q, max_results=8))
+        except Exception:
+            continue
+    raw_results = _dedupe(raw_results)[:10]
+    if not raw_results:
+        return "", prior_sources
+
+    blocks: list[str] = []
+    new_sources: list[dict] = list(prior_sources or [])
+    for r in raw_results:
+        url = (r.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        try:
+            text = scrape_page(url, r.get("snippet", ""))
+        except Exception:
+            text = ""
+        if not text:
+            continue
+        title = r.get("title") or url
+        # Cap each page so the corpus stays in a reasonable LLM context budget.
+        blocks.append(f"--- {title} ({url}) ---\n{text[:4000]}")
+        new_sources.append(r)
+        if len(blocks) >= 6:
+            break
+
+    return "\n\n".join(blocks), new_sources
 
 
 # ── doc-type detection ──────────────────────────────────────────────────────
@@ -347,7 +410,7 @@ Rules:
 - If the request explicitly names the format ("write me a business plan", "give me a market analysis", "feasibility study", "research report", "comparison of X vs Y"), use that.
 - If the request is just a topic with no format hint, infer from intent ("which X should I use" → comparison; "everything about X" or "explain X" → deep_dive; vendor/category landscape → market_analysis).
 - Output ONLY the chosen type as a single lowercase word, nothing else."""
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_doc_type", prompt, temperature=0.1, max_tokens=60),
         timeout_s,
         "doc_type",
@@ -405,14 +468,16 @@ RULES:
 def _write_section(*, topic: str, doc_type: str, section_title: str, section_role: str,
                    corpus: str, hypotheses: list[str], target_words: int,
                    revision_note: str | None = None,
-                   attempts: int = 2) -> str | None:
-    """Write one section. Retries once with progressively smaller settings if
-    the first attempt times out, errors, or returns empty text.
+                   attempts: int = 3) -> str | None:
+    """Write one section with progressive shrinkage on failure.
 
-    The first attempt uses the full target_words and corpus[:30000]. The
-    retry shortens to ~2/3 length and 16000 chars of corpus and a tighter
-    output cap, which dramatically increases the chance of success on a
-    slow / context-constrained local model.
+    Attempt 1: full target_words, corpus[:30000], no max_tokens cap.
+    Attempt 2: ~2/3 target, corpus[:16000], max_tokens=3000.
+    Attempt 3: ~1/3 target, corpus[:8000],  max_tokens=1500.
+
+    The third attempt is a small-context, small-output 'last try' that
+    almost always fits inside an overloaded local model's window. Worth
+    the extra round-trip when the alternative is dropping the section.
     """
     timeout_s = _research_timeout("section_timeout_s", DEFAULT_SECTION_TIMEOUT_S)
     last_err = "unknown"
@@ -421,12 +486,20 @@ def _write_section(*, topic: str, doc_type: str, section_title: str, section_rol
             this_target = target_words
             this_corpus = corpus[:30000]
             this_max_tokens: int | None = None
-        else:
+        elif n == 2:
             this_target = max(400, (target_words * 2) // 3)
             this_corpus = corpus[:16000]
             this_max_tokens = 3000
             _log.warning(
                 "section %r retry %d/%d — shrinking (target=%d words, corpus=%d chars, max_tokens=%d)",
+                section_title[:40], n, attempts, this_target, len(this_corpus), this_max_tokens,
+            )
+        else:
+            this_target = max(250, target_words // 3)
+            this_corpus = corpus[:8000]
+            this_max_tokens = 1500
+            _log.warning(
+                "section %r LAST retry %d/%d — minimal (target=%d words, corpus=%d chars, max_tokens=%d)",
                 section_title[:40], n, attempts, this_target, len(this_corpus), this_max_tokens,
             )
         prompt = _section_prompt(
@@ -437,7 +510,7 @@ def _write_section(*, topic: str, doc_type: str, section_title: str, section_rol
         kwargs: dict = {"temperature": 0.3}
         if this_max_tokens:
             kwargs["max_tokens"] = this_max_tokens
-        res = _call_with_timeout(
+        res = _safe_call(
             lambda: model_call("research_section_writer", prompt, **kwargs),
             timeout_s,
             f"section[{n}/{attempts}]:{section_title[:30]}",
@@ -481,7 +554,7 @@ RULES:
 - No bullets. Prose only.
 - Cite the most important figures/claims with `[Source: URL]` drawn from the body.
 - Do not repeat the body verbatim — distil the headline findings, conclusions, and recommendation."""
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_section_writer", prompt, temperature=0.25),
         timeout_s,
         "exec_summary",
@@ -517,7 +590,7 @@ RULES:
 - Cells must be sourced from the material. Where a value is missing, write `—` (em dash). Never write "Information unavailable".
 - Below the table, add 1-2 sentences of prose flagging any cross-row pattern worth noticing. No bullets.
 - Output only the section. No preamble, no closing remarks."""
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_section_writer", prompt, temperature=0.2),
         timeout_s,
         "comparison",
@@ -547,7 +620,7 @@ OUTPUT:
 2. `## Recommendation` — 1 to 2 paragraphs of prose. Concrete guidance for the reader given the evidence. If evidence is genuinely insufficient for a recommendation, say so and explain what would be needed.
 
 Output the two sections one after the other in Markdown. No preamble, no outer bullets, no closing summary."""
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_section_writer", prompt, temperature=0.3),
         timeout_s,
         "takeaways",
@@ -597,6 +670,35 @@ def _build_sources(sources: list[dict]) -> str:
 
 
 # ── paper assembly ──────────────────────────────────────────────────────────
+
+def _build_generation_notes(*, body_failed: list[str], opener_ok: bool, opener_title: str,
+                            closer_ok: bool, closer_title: str,
+                            takeaways_ok: bool, exec_summary_ok: bool) -> str:
+    """Render a short transparency footer when one or more sections couldn't
+    be generated. Empty string when everything worked — the paper looks
+    clean by default."""
+    missing: list[str] = []
+    if not opener_ok:
+        missing.append(opener_title)
+    if not closer_ok:
+        missing.append(closer_title)
+    missing.extend(body_failed)
+    if not takeaways_ok:
+        missing.append("Takeaways")
+    if not exec_summary_ok:
+        missing.append("Executive Summary")
+    if not missing:
+        return ""
+    bullets = "\n".join(f"- {s}" for s in missing)
+    return (
+        "## Generation notes\n\n"
+        "_The local model could not produce the following section(s) on this "
+        "run. The rest of the paper is still based on the retrieved sources; "
+        "use **Review** or **Expand section** to regenerate when the model is "
+        "available._\n\n"
+        f"{bullets}"
+    )
+
 
 def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
                  hypotheses: list[str], sub_topics: list[str], org_id: int,
@@ -661,18 +763,19 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
         revision_note=revision_notes.get(spec["closer"]),
     ) or ""
 
-    # ── Sanity gate: don't save a junk paper ────────────────────────────
+    # ── Sanity gate: only refuse if NOTHING worked ────────────────────────
+    # Save what we have when the local model is patchy. Earlier the gate
+    # threw out the whole paper if all body sections failed, which lost the
+    # opener+closer+sources too — material that's still useful and was
+    # already paid for. Operator gets a transparent 'Generation notes'
+    # footer (added below) listing what dropped, plus a partial paper.
     n_body_total = len(sub_topics or [])
     n_body_ok = len(body_pieces)
-    if n_body_total > 0 and n_body_ok == 0:
+    nothing_worked = (not opener and not closer and n_body_ok == 0)
+    if nothing_worked:
         raise RuntimeError(
-            f"all {n_body_total} body sections failed — local model unavailable or overloaded; "
-            "no paper saved"
-        )
-    if not opener and not closer and n_body_ok < 2:
-        raise RuntimeError(
-            f"opener and closer both failed and only {n_body_ok} body section(s) succeeded — "
-            "insufficient content to assemble a paper"
+            f"synthesis produced no sections (sub_topics={n_body_total}, "
+            "opener+closer also failed) — local model unavailable or overloaded"
         )
 
     # Log what dropped so the user has visibility on partial success
@@ -700,8 +803,17 @@ def _build_paper(*, topic: str, doc_type: str, queries: list[str], schema: dict,
     # 7. Sources
     sources_md = _build_sources(sources)
 
+    # 8. Generation notes — surfaced only when something dropped, so a
+    # partial paper carries its own caveat instead of looking complete.
+    gen_notes = _build_generation_notes(
+        body_failed=body_failed,
+        opener_ok=bool(opener), opener_title=spec["opener"],
+        closer_ok=bool(closer), closer_title=spec["closer"],
+        takeaways_ok=bool(takeaways), exec_summary_ok=bool(exec_summary),
+    )
+
     parts = [f"# {topic}".strip()]
-    for piece in (exec_summary, opener, body, comparison, closer, takeaways, sources_md):
+    for piece in (exec_summary, opener, body, comparison, closer, takeaways, sources_md, gen_notes):
         if piece and piece.strip():
             parts.append(piece.strip())
     paper = "\n\n".join(parts)
@@ -985,7 +1097,7 @@ Rules:
 - Be specific in instructions: name the claim that's missing or weak, the angle to add, the citation to add or remove. Generic instructions ("expand more", "improve flow") are not allowed.
 - Output raw JSON only — no markdown fences, no preamble, no trailing prose."""
 
-    res = _call_with_timeout(
+    res = _safe_call(
         lambda: model_call("research_reviewer", prompt, temperature=0.2),
         timeout_s,
         "reviewer",
